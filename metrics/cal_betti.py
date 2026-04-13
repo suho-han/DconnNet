@@ -1,23 +1,28 @@
-import matplotlib
-
-matplotlib.use('Agg')
+import os
+import random
+import sys
 import time
+
+import matplotlib
+import skimage.measure
 import torch
 import torch.nn as nn
-import os
-# import visdom
-import skimage.measure
-import random
 from tqdm import tqdm as tqdm
-import sys
+
 from metrics.betti_compute import betti_number
+
+matplotlib.use('Agg')
+
+# import visdom
+
+
 # from TDFMain import *
 # from TDFMain_pytorch import *
 
 
 def getBetti(binaryPredict, masks):
     predict_betti_number_ls = []
-    groundtruth_betti_number_ls =[]
+    groundtruth_betti_number_ls = []
     betti_error_ls = []
     topo_size = 65
     gt_dmap = masks.cuda()
@@ -36,9 +41,9 @@ def getBetti(binaryPredict, masks):
             # likelihood = et_dmap[y:min(y + topo_size, gt_dmap.shape[0]),
             #              x:min(x + topo_size, gt_dmap.shape[1])]
             binary = binaryPredict[y:min(y + topo_size, gt_dmap.shape[0]),
-                         x:min(x + topo_size, gt_dmap.shape[1])]           
+                                   x:min(x + topo_size, gt_dmap.shape[1])]
             groundtruth = gt_dmap[y:min(y + topo_size, gt_dmap.shape[0]),
-                          x:min(x + topo_size, gt_dmap.shape[1])]
+                                  x:min(x + topo_size, gt_dmap.shape[1])]
             # for likelihoodMap in likelihoodMaps:
             #     likelihoodAll.append(likelihoodMap[y:min(y + topo_size, gt_dmap.shape[0]),
             #              x:min(x + topo_size, gt_dmap.shape[1])])
@@ -49,6 +54,7 @@ def getBetti(binaryPredict, masks):
             # print(predict_betti_number, groundtruth_betti_number)
             predict_betti_number_ls.append(predict_betti_number)
             groundtruth_betti_number_ls.append(groundtruth_betti_number)
-            betti_error_ls.append(abs(predict_betti_number-groundtruth_betti_number))
+            betti_error_ls.append(
+                abs(predict_betti_number-groundtruth_betti_number))
 
     return betti_error_ls

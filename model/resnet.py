@@ -5,8 +5,9 @@ Created on Wed Apr 10 09:57:49 2019
 @author: Fsl
 """
 
-import torch.nn as nn
 import math
+
+import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torchsummary
 
@@ -71,7 +72,8 @@ class Bottleneck(nn.Module):
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * Bottleneck.expansion, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(
+            planes, planes * Bottleneck.expansion, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * Bottleneck.expansion)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -102,24 +104,27 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000,deep_base=False,stem_width=32):
+    def __init__(self, block, layers, num_classes=1000, deep_base=False, stem_width=32):
         self.inplanes = stem_width*2 if deep_base else 64
-        
+
         super(ResNet, self).__init__()
         if deep_base:
-            self.conv1= nn.Sequential(
-                nn.Conv2d(3, stem_width, kernel_size=3, stride=2, padding=1, bias=False),
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(3, stem_width, kernel_size=3,
+                          stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(stem_width),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(stem_width, stem_width, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.Conv2d(stem_width, stem_width, kernel_size=3,
+                          stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(stem_width),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(stem_width, stem_width*2, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.Conv2d(stem_width, stem_width*2, kernel_size=3,
+                          stride=1, padding=1, bias=False),
             )
         else:
             self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
                                    bias=False)
-        
+
         self.bn1 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -194,10 +199,10 @@ def resnet34(pretrained=False, **kwargs):
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
     model_dict = model.state_dict()
 
-
     if pretrained:
-        pretrained_dict=model_zoo.load_url(model_urls['resnet34'])# Modify 'model_dir' according to your own path
-        print('Petrain Model Have been loaded!')
+        # Modify 'model_dir' according to your own path
+        pretrained_dict = model_zoo.load_url(model_urls['resnet34'])
+        print('Pretrain Model Have been loaded!')
         # pretrained_dict =  {k: v for k, v in pretrained_dict.items() if k in model_dict}
         # model_dict.update(pretrained_dict)
         model.load_state_dict(pretrained_dict)

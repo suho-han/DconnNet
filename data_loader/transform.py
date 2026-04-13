@@ -1,15 +1,15 @@
-import torch
-import random
-import PIL
-import numbers
-import numpy as np
-import torch.nn as nn
 import collections
+import numbers
+import random
+
 import matplotlib.pyplot as plt
+import numpy as np
+import PIL
+import torch
+import torch.nn as nn
 import torchvision.transforms as ts
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
-
 
 _pil_interpolation_to_str = {
     Image.NEAREST: 'PIL.Image.NEAREST',
@@ -20,8 +20,8 @@ _pil_interpolation_to_str = {
 
 
 def ISIC2018_transform(sample, train_type):
-    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'),\
-                   Image.fromarray(np.uint8(sample['label']), mode='L')
+    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'), \
+        Image.fromarray(np.uint8(sample['label']), mode='L')
 
     if train_type == 'train':
         image, label = randomcrop(size=(224, 300))(image, label)
@@ -37,8 +37,8 @@ def ISIC2018_transform(sample, train_type):
 
 
 def ISIC2018_transform_320(sample, train_type):
-    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'),\
-                   Image.fromarray(np.uint8(sample['label']), mode='L')
+    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'), \
+        Image.fromarray(np.uint8(sample['label']), mode='L')
 
     if train_type == 'train':
         image, label = randomcrop(size=(224, 320))(image, label)
@@ -51,11 +51,11 @@ def ISIC2018_transform_320(sample, train_type):
     label = ts.ToTensor()(label)
 
     return {'image': image, 'label': label}
-    
-    
+
+
 def ISIC2018_transform_newdata(sample, train_type):
-    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'),\
-                   Image.fromarray(np.uint8(sample['label']), mode='L')
+    image, label = Image.fromarray(np.uint8(sample['image']), mode='RGB'), \
+        Image.fromarray(np.uint8(sample['label']), mode='L')
 
     if train_type == 'train':
         # image, label = randomcrop(size=(224, 320))(image, label)
@@ -63,13 +63,13 @@ def ISIC2018_transform_newdata(sample, train_type):
     else:
         image = image
         label = label
-        
+
     image = ts.Compose([ts.ToTensor(),
                         ts.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))])(image)
     label = ts.ToTensor()(label)
 
     return {'image': image, 'label': label}
-    
+
 
 # these are founctional function for transform
 def randomflip_rotate(img, lab, p=0.5, degrees=0):
@@ -82,7 +82,8 @@ def randomflip_rotate(img, lab, p=0.5, degrees=0):
 
     if isinstance(degrees, numbers.Number):
         if degrees < 0:
-            raise ValueError("If degrees is a single number, it must be positive.")
+            raise ValueError(
+                "If degrees is a single number, it must be positive.")
         degrees = (-degrees, degrees)
     else:
         if len(degrees) != 2:
@@ -182,7 +183,8 @@ class resize(object):
     """
 
     def __init__(self, size, interpolation=Image.BILINEAR):
-        assert isinstance(size, int) or (isinstance(size, collections.Iterable) and len(size) == 2)
+        assert isinstance(size, int) or (isinstance(
+            size, collections.Iterable) and len(size) == 2)
         self.size = size
         self.interpolation = interpolation
 

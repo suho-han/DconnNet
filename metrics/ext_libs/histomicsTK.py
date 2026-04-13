@@ -2,34 +2,27 @@
 This is a module for svs files used for the analysis of histology images
 """
 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import histomicstk as htk
-
 import numpy as np
-
+import scipy as sp
+import skimage.color
 import skimage.feature
 import skimage.io
 import skimage.measure
-import skimage.color
+from PIL import Image
+from scipy import ndimage
+from skimage.feature import peak_local_max
 from skimage.filters import sobel
 from skimage.morphology import watershed
-from skimage.feature import peak_local_max
 from skimage.util.shape import view_as_windows
-
-import scipy as sp
-from scipy import ndimage
-
 from sklearn.feature_extraction import image
-from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = None
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-
-
-def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140, minimum_area=20):
-
+def compute_nuclei_centroids(matrix, min_nucleus_area=40, foreground_threshold=140, minimum_area=20):
     """
         A method for extracting a point cloud from an histopathology image where each point correspond
         to the centroid of a nucleus. This function is substantially copied from
@@ -52,7 +45,8 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     im_reference = matrix[:, :, :3]
 
     # get mean and stddev of reference image in lab space
-    mean_ref, std_ref = htk.preprocessing.color_conversion.lab_mean_std(im_reference)
+    mean_ref, std_ref = htk.preprocessing.color_conversion.lab_mean_std(
+        im_reference)
 
     # if sum(std_ref) < 0.65:
     #     foreground_threshold = 190
@@ -60,12 +54,13 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     if std_ref[1] < 0.1:
         foreground_threshold = 120
 
-
     # perform reinhard color normalization
-    im_nmzd = htk.preprocessing.color_normalization.reinhard(im_reference, mean_ref, std_ref)
+    im_nmzd = htk.preprocessing.color_normalization.reinhard(
+        im_reference, mean_ref, std_ref)
 
-    #identify hematoxylin and nuclei----------------
-    stainColorMap = {'hematoxylin': [0.65, 0.70, 0.29],'eosin':       [0.07, 0.99, 0.11],'dab':         [0.27, 0.57, 0.78],'null':        [0.0, 0.0, 0.0]}
+    # identify hematoxylin and nuclei----------------
+    stainColorMap = {'hematoxylin': [0.65, 0.70, 0.29], 'eosin':       [
+        0.07, 0.99, 0.11], 'dab':         [0.27, 0.57, 0.78], 'null':        [0.0, 0.0, 0.0]}
 
     # specify stains of input image
     stain_1 = 'hematoxylin'   # nuclei stain
@@ -78,14 +73,14 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
                   stainColorMap[stain_3]]).T
 
     # perform standard color deconvolution
-    im_stains = htk.preprocessing.color_deconvolution.color_deconvolution(im_nmzd, W).Stains
+    im_stains = htk.preprocessing.color_deconvolution.color_deconvolution(
+        im_nmzd, W).Stains
     im_nuclei_stain = im_stains[:, :, 0]
 
-    #identify image mask----------------
-
+    # identify image mask----------------
 
     im_fgnd_mask = sp.ndimage.morphology.binary_fill_holes(
-    im_nuclei_stain < foreground_threshold)
+        im_nuclei_stain < foreground_threshold)
 
     # run adaptive multi-scale LoG filter
     min_radius = 10
@@ -100,13 +95,12 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     # detect and segment nuclei using local maximum clustering
     local_max_search_radius = 10
 
-    #to prevent errors when we are processing patches
-    if(not (im_fgnd_mask.any() == True)):
+    # to prevent errors when we are processing patches
+    if (not (im_fgnd_mask.any() == True)):
         return []
 
     im_nuclei_seg_mask, seeds, maxima = htk.segmentation.nuclear.max_clustering(
         im_log_max, im_fgnd_mask, local_max_search_radius)
-
 
     im_nuclei_seg_mask = htk.segmentation.label.area_open(
         im_nuclei_seg_mask, min_nucleus_area).astype(np.int)
@@ -118,7 +112,7 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     labels = watershed(-distance, markers, mask=im_nuclei_seg_mask)
 
     objProps = skimage.measure.regionprops(labels)
-    #-----
+    # -----
 
     # #uncomment to show the selected nuclei
     # # Display results
@@ -138,8 +132,10 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     for i in range(len(objProps)):
         area = objProps[i].convex_area
         if area > minimum_area:
-            loc_center = ndimage.measurements.center_of_mass(objProps[i].convex_image)
-            myPoints.append([objProps[i].bbox[1]+loc_center[1], objProps[i].bbox[0]+loc_center[0]])
+            loc_center = ndimage.measurements.center_of_mass(
+                objProps[i].convex_image)
+            myPoints.append([objProps[i].bbox[1]+loc_center[1],
+                            objProps[i].bbox[0]+loc_center[0]])
 
     #         #uncomment to show the selected nuclei
     #         c = [objProps[i].centroid[1], objProps[i].centroid[0], 0]
@@ -164,9 +160,7 @@ def compute_nuclei_centroids(matrix,min_nucleus_area=40,foreground_threshold=140
     return myPoints
 
 
-
 def split_and_compute_nuclei_centroids(matrix, patch_size=500, min_nucleus_area=40, foreground_threshold=100, minimum_area=20):
-
     """
         A method for extracting a point cloud from an histopathology image where each point correspond
         to the centroid of a nucleus. The input matrix is split in patches of size patch_size and processed
@@ -188,7 +182,7 @@ def split_and_compute_nuclei_centroids(matrix, patch_size=500, min_nucleus_area=
     """
 
     dims = matrix.shape
-    #split here the matrices
+    # split here the matrices
     all_points = []
 
     last_rows = dims[0]/patch_size
@@ -197,57 +191,61 @@ def split_and_compute_nuclei_centroids(matrix, patch_size=500, min_nucleus_area=
     for i in range(last_rows):
         for j in range(last_columns):
 
-            sub_matrix = matrix[(i*patch_size):(i*patch_size)+patch_size, (j*patch_size):(j*patch_size)+patch_size, :]
+            sub_matrix = matrix[(i*patch_size):(i*patch_size)+patch_size,
+                                (j*patch_size):(j*patch_size)+patch_size, :]
 
             try:
-                points = compute_nuclei_centroids(sub_matrix,min_nucleus_area=min_nucleus_area,foreground_threshold=foreground_threshold, minimum_area=minimum_area)
+                points = compute_nuclei_centroids(
+                    sub_matrix, min_nucleus_area=min_nucleus_area, foreground_threshold=foreground_threshold, minimum_area=minimum_area)
             except:
                 points = []
 
-            if(len(points) > 0):
-                x,y = zip(*points)
+            if (len(points) > 0):
+                x, y = zip(*points)
 
                 x = np.array(x)
                 y = np.array(y)
                 x = x + (j*patch_size)
                 y = y + (i*patch_size)
 
-                points = zip(x,y)
+                points = zip(x, y)
                 all_points.extend(points)
-
 
     sub_matrix = matrix[(last_rows*patch_size):, :, :]
     try:
-        points = compute_nuclei_centroids(sub_matrix,min_nucleus_area=min_nucleus_area,foreground_threshold=foreground_threshold, minimum_area=minimum_area)
+        points = compute_nuclei_centroids(sub_matrix, min_nucleus_area=min_nucleus_area,
+                                          foreground_threshold=foreground_threshold, minimum_area=minimum_area)
     except:
         points = []
 
-    if(len(points) > 0):
-        x,y = zip(*points)
+    if (len(points) > 0):
+        x, y = zip(*points)
 
         x = np.array(x)
         y = np.array(y)
         x = x
         y = y + (last_rows*patch_size)
 
-        points = zip(x,y)
+        points = zip(x, y)
         all_points.extend(points)
 
-    sub_matrix = matrix[:(last_rows*patch_size), ((last_columns)*patch_size):, :]
+    sub_matrix = matrix[:(last_rows*patch_size),
+                        ((last_columns)*patch_size):, :]
     try:
-        points = compute_nuclei_centroids(sub_matrix,min_nucleus_area=min_nucleus_area,foreground_threshold=foreground_threshold, minimum_area=minimum_area)
+        points = compute_nuclei_centroids(sub_matrix, min_nucleus_area=min_nucleus_area,
+                                          foreground_threshold=foreground_threshold, minimum_area=minimum_area)
     except:
         points = []
-        
-    if(len(points) > 0):
-        x,y = zip(*points)
+
+    if (len(points) > 0):
+        x, y = zip(*points)
 
         x = np.array(x)
         y = np.array(y)
         x = x + (last_columns)*patch_size
         y = y
 
-        points = zip(x,y)
+        points = zip(x, y)
         all_points.extend(points)
 
     return all_points

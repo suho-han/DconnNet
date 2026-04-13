@@ -5,113 +5,110 @@ Created on Wed Apr 10 09:57:49 2019
 @author: Fsl
 """
 import math
-from model.attention import CAM_Module,PAM_Module
+
 import torch
-from torchvision import models
 import torch.nn as nn
-from model.resnet import resnet34
+import torchsummary
 # from resnet import resnet34
 # import resnet
 from torch.nn import functional as F
-import torchsummary
 from torch.nn import init
+from torchvision import models
+
 import model.gap as gap
+from model.attention import CAM_Module, PAM_Module
+from model.resnet import resnet34
+
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
 
 class DconnNet(nn.Module):
-    def __init__(self,num_class=1):
-        super(DconnNet,self).__init__()
-        
-        out_planes = num_class*8
-        self.backbone =resnet34(pretrained=True)
-        self.sde_module = SDE_module(512,512,out_planes)
-        self.fb5=FeatureBlock(512,256,relu=False,last=True) #256
-        self.fb4=FeatureBlock(256,128,relu=False) #128
-        self.fb3=FeatureBlock(128,64,relu=False) #64
-        self.fb2=FeatureBlock(64,64) 
+    def __init__(self, num_class=1, conn_num=8):
+        super(DconnNet, self).__init__()
+
+        out_planes = num_class*conn_num
+        self.backbone = resnet34(pretrained=True)
+        self.sde_module = SDE_module(512, 512, out_planes, conn_num)
+        self.fb5 = FeatureBlock(512, 256, relu=False, last=True)  # 256
+        self.fb4 = FeatureBlock(256, 128, relu=False)  # 128
+        self.fb3 = FeatureBlock(128, 64, relu=False)  # 64
+        self.fb2 = FeatureBlock(64, 64)
 
         self.gap = gap.GlobalAvgPool2D()
 
-        self.sb1 = SpaceBlock(512,512,512)
-        self.sb2 = SpaceBlock(512,256,256)
-        self.sb3 = SpaceBlock(256,128,128)
-        self.sb4 = SpaceBlock(128,64,64)
+        self.sb1 = SpaceBlock(512, 512, 512)
+        self.sb2 = SpaceBlock(512, 256, 256)
+        self.sb3 = SpaceBlock(256, 128, 128)
+        self.sb4 = SpaceBlock(128, 64, 64)
         # self.sb5 = SpaceBlock(64,64,32)
 
-
         self.relu = nn.ReLU()
-        
-        self.final_decoder=LWdecoder(in_channels=[64,64,128,256],out_channels=32,in_feat_output_strides=(4, 8, 16, 32),out_feat_output_stride=4,norm_fn=nn.BatchNorm2d,num_groups_gn=None)
-        
-        self.cls_pred_conv = nn.Conv2d(64, 32, 3,1,1)
+
+        self.final_decoder = LWdecoder(in_channels=[64, 64, 128, 256], out_channels=32, in_feat_output_strides=(4, 8, 16, 32), out_feat_output_stride=4,
+                                       norm_fn=nn.BatchNorm2d, num_groups_gn=None)
+
+        self.cls_pred_conv = nn.Conv2d(64, 32, 3, 1, 1)
         self.cls_pred_conv_2 = nn.Conv2d(32, out_planes, 1)
         self.upsample4x_op = nn.UpsamplingBilinear2d(scale_factor=2)
         self.channel_mapping = nn.Sequential(
-                    nn.Conv2d(512, out_planes, 3,1,1),
-                    nn.BatchNorm2d(out_planes),
-                    nn.ReLU(True)
-                )
+            nn.Conv2d(512, out_planes, 3, 1, 1),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU(True)
+        )
 
         self.direc_reencode = nn.Sequential(
-                    nn.Conv2d(out_planes, out_planes, 1),
-                    # nn.BatchNorm2d(out_planes),
-                    # nn.ReLU(True)
-                )
-
+            nn.Conv2d(out_planes, out_planes, 1),
+            # nn.BatchNorm2d(out_planes),
+            # nn.ReLU(True)
+        )
 
     def forward(self, x):
-        
-        
-        
+
         x = self.backbone.conv1(x)
         x = self.backbone.bn1(x)
-        c1 = self.backbone.relu(x)#1/2  64
-        
+        c1 = self.backbone.relu(x)  # 1/2  64
+
         x = self.backbone.maxpool(c1)
-        c2 = self.backbone.layer1(x)#1/4   64
-        c3 = self.backbone.layer2(c2)#1/8   128
-        c4 = self.backbone.layer3(c3)#1/16   256
-        c5 = self.backbone.layer4(c4)#1/32   512
+        c2 = self.backbone.layer1(x)  # 1/4   64
+        c3 = self.backbone.layer2(c2)  # 1/8   128
+        c4 = self.backbone.layer3(c3)  # 1/16   256
+        c5 = self.backbone.layer4(c4)  # 1/32   512
 
         #### directional Prior ####
         directional_c5 = self.channel_mapping(c5)
-        mapped_c5=F.interpolate(directional_c5,scale_factor=32,mode='bilinear',align_corners=True)
+        mapped_c5 = F.interpolate(
+            directional_c5, scale_factor=32, mode='bilinear', align_corners=True)
         mapped_c5 = self.direc_reencode(mapped_c5)
-        
+
         d_prior = self.gap(mapped_c5)
 
-        c5 = self.sde_module(c5,d_prior)
-
+        c5 = self.sde_module(c5, d_prior)
 
         c6 = self.gap(c5)
-        
 
-        r5 = self.sb1(c6,c5)
+        r5 = self.sb1(c6, c5)
 
-        d4=self.relu(self.fb5(r5)+c4)  #256
-        r4 = self.sb2(self.gap(r5),d4) 
+        d4 = self.relu(self.fb5(r5)+c4)  # 256
+        r4 = self.sb2(self.gap(r5), d4)
 
-        d3=self.relu(self.fb4(r4)+c3)  #128
-        r3 = self.sb3(self.gap(r4),d3) 
+        d3 = self.relu(self.fb4(r4)+c3)  # 128
+        r3 = self.sb3(self.gap(r4), d3)
 
-        d2=self.relu(self.fb3(r3)+c2) #64
-        r2 = self.sb4(self.gap(r3),d2) 
+        d2 = self.relu(self.fb3(r3)+c2)  # 64
+        r2 = self.sb4(self.gap(r3), d2)
 
-        d1=self.fb2(r2)+c1 #32
-        # d1 = self.sr5(c6,d1) 
+        d1 = self.fb2(r2)+c1  # 32
+        # d1 = self.sr5(c6,d1)
 
-        feat_list = [d1,d2,d3,d4,c5]
-
+        feat_list = [d1, d2, d3, d4, c5]
 
         final_feat = self.final_decoder(feat_list)
 
         cls_pred = self.cls_pred_conv_2(final_feat)
         cls_pred = self.upsample4x_op(cls_pred)
 
-        return cls_pred,mapped_c5
-    
-    
+        return cls_pred, mapped_c5
+
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -127,33 +124,37 @@ class DconnNet(nn.Module):
 
 
 class SDE_module(nn.Module):
-    def __init__(self, in_channels, out_channels, num_class):
+    def __init__(self, in_channels, out_channels, num_class, conn_num):
         super(SDE_module, self).__init__()
-        self.inter_channels = in_channels // 8
+        self.conn_num = conn_num
+        self.inter_channels = in_channels // conn_num
 
-        self.att1 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att2 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att3 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att4 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att5 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att6 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att7 = DANetHead(self.inter_channels,self.inter_channels)
-        self.att8 = DANetHead(self.inter_channels,self.inter_channels)
+        for i in range(conn_num):
+            setattr(self, 'att'+str(i+1), DANetHead(self.inter_channels, self.inter_channels))
+        # self.att1 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att2 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att3 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att4 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att5 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att6 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att7 = DANetHead(self.inter_channels, self.inter_channels)
+        # self.att8 = DANetHead(self.inter_channels, self.inter_channels)
 
+        # For conn_num values that do not divide in_channels (e.g., 25 for 512),
+        # concatenated directional features have conn_num * inter_channels channels.
+        self.final_conv = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(self.inter_channels * self.conn_num, out_channels, 1))
+        # self.encoder_block = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(in_channels, 32, 1))
 
-        self.final_conv = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(in_channels, out_channels, 1))
-        #self.encoder_block = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(in_channels, 32, 1))
-        
-        if num_class<32:
+        if num_class < 32:
             self.reencoder = nn.Sequential(
-                        nn.Conv2d(num_class, num_class*8, 1),
-                        nn.ReLU(True),
-                        nn.Conv2d(num_class*8, in_channels, 1))
+                nn.Conv2d(num_class, num_class*conn_num, 1),
+                nn.ReLU(True),
+                nn.Conv2d(num_class*conn_num, in_channels, 1))
         else:
             self.reencoder = nn.Sequential(
-                        nn.Conv2d(num_class, in_channels, 1),
-                        nn.ReLU(True),
-                        nn.Conv2d(in_channels, in_channels, 1))
+                nn.Conv2d(num_class, in_channels, 1),
+                nn.ReLU(True),
+                nn.Conv2d(in_channels, in_channels, 1))
 
     def forward(self, x, d_prior):
 
@@ -164,16 +165,22 @@ class SDE_module(nn.Module):
         # print(d_prior)
         enc_feat = self.reencoder(d_prior)
 
-        feat1 = self.att1(x[:,:self.inter_channels], enc_feat[:,0:self.inter_channels])
-        feat2 = self.att2(x[:,self.inter_channels:2*self.inter_channels],enc_feat[:,self.inter_channels:2*self.inter_channels])
-        feat3 = self.att3(x[:,2*self.inter_channels:3*self.inter_channels],enc_feat[:,2*self.inter_channels:3*self.inter_channels])
-        feat4 = self.att4(x[:,3*self.inter_channels:4*self.inter_channels],enc_feat[:,3*self.inter_channels:4*self.inter_channels])
-        feat5 = self.att5(x[:,4*self.inter_channels:5*self.inter_channels],enc_feat[:,4*self.inter_channels:5*self.inter_channels])
-        feat6 = self.att6(x[:,5*self.inter_channels:6*self.inter_channels],enc_feat[:,5*self.inter_channels:6*self.inter_channels])
-        feat7 = self.att7(x[:,6*self.inter_channels:7*self.inter_channels],enc_feat[:,6*self.inter_channels:7*self.inter_channels])
-        feat8 = self.att8(x[:,7*self.inter_channels:8*self.inter_channels],enc_feat[:,7*self.inter_channels:8*self.inter_channels])
-        
-        feat = torch.cat([feat1,feat2,feat3,feat4,feat5,feat6,feat7,feat8],dim=1)
+        feats = []
+        for i in range(self.conn_num):
+            feats.append(getattr(self, 'att'+str(i+1))(x[:, i*self.inter_channels:(i+1)*self.inter_channels], enc_feat[:, i*self.inter_channels:(i+1)*self.inter_channels]))
+        feat = torch.cat(feats, dim=1)
+
+        # feat1 = self.att1(x[:, :self.inter_channels], enc_feat[:, 0:self.inter_channels])
+        # feat2 = self.att2(x[:, self.inter_channels:2*self.inter_channels], enc_feat[:, self.inter_channels:2*self.inter_channels])
+        # feat3 = self.att3(x[:, 2*self.inter_channels:3*self.inter_channels], enc_feat[:, 2*self.inter_channels:3*self.inter_channels])
+        # feat4 = self.att4(x[:, 3*self.inter_channels:4*self.inter_channels], enc_feat[:, 3*self.inter_channels:4*self.inter_channels])
+        # feat5 = self.att5(x[:, 4*self.inter_channels:5*self.inter_channels], enc_feat[:, 4*self.inter_channels:5*self.inter_channels])
+        # feat6 = self.att6(x[:, 5*self.inter_channels:6*self.inter_channels], enc_feat[:, 5*self.inter_channels:6*self.inter_channels])
+        # feat7 = self.att7(x[:, 6*self.inter_channels:7*self.inter_channels], enc_feat[:, 6*self.inter_channels:7*self.inter_channels])
+        # feat8 = self.att8(x[:, 7*self.inter_channels:8*self.inter_channels], enc_feat[:, 7*self.inter_channels:8*self.inter_channels])
+
+        # feat = torch.cat([feat1, feat2, feat3, feat4,
+        #                  feat5, feat6, feat7, feat8], dim=1)
 
         sasc_output = self.final_conv(feat)
         sasc_output = sasc_output+x
@@ -186,21 +193,21 @@ class DANetHead(nn.Module):
         super(DANetHead, self).__init__()
         # inter_channels = in_channels // 8
         self.conv5a = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-                                   norm_layer(inter_channels),
-                                   nn.ReLU())
-        
+                                    norm_layer(inter_channels),
+                                    nn.ReLU())
+
         self.conv5c = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-                                   norm_layer(inter_channels),
-                                   nn.ReLU())
+                                    norm_layer(inter_channels),
+                                    nn.ReLU())
 
         self.sa = PAM_Module(inter_channels)
         self.sc = CAM_Module(inter_channels)
         self.conv51 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
-                                   norm_layer(inter_channels),
-                                   nn.ReLU())
+                                    norm_layer(inter_channels),
+                                    nn.ReLU())
         self.conv52 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
-                                   norm_layer(inter_channels),
-                                   nn.ReLU())
+                                    norm_layer(inter_channels),
+                                    nn.ReLU())
 
         # self.conv6 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(inter_channels, out_channels, 1))
         # self.conv7 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(inter_channels, out_channels, 1))
@@ -212,22 +219,19 @@ class DANetHead(nn.Module):
         sa_feat = self.sa(feat1)
         sa_conv = self.conv51(sa_feat)
         # sa_output = self.conv6(sa_conv)
-        
+
         feat2 = self.conv5c(x)
         sc_feat = self.sc(feat2)
         sc_conv = self.conv52(sc_feat)
         # sc_output = self.conv7(sc_conv)
 
         feat_sum = sa_conv+sc_conv
-        
+
         feat_sum = feat_sum*F.sigmoid(enc_feat)
 
         sasc_output = self.conv8(feat_sum)
 
-
         return sasc_output
-
-
 
 
 class SpaceBlock(nn.Module):
@@ -239,25 +243,23 @@ class SpaceBlock(nn.Module):
         super(SpaceBlock, self).__init__()
         self.scale_aware_proj = scale_aware_proj
 
-
         self.scene_encoder = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1),
             nn.ReLU(True),
             nn.Conv2d(out_channels, out_channels, 1),
         )
 
-        self.content_encoders=nn.Sequential(
-                nn.Conv2d(channel_in, out_channels, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(True)
-            )
-        
-        self.feature_reencoders=nn.Sequential(
-                nn.Conv2d(channel_in, out_channels, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(True)
-            )
-        
+        self.content_encoders = nn.Sequential(
+            nn.Conv2d(channel_in, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True)
+        )
+
+        self.feature_reencoders = nn.Sequential(
+            nn.Conv2d(channel_in, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True)
+        )
 
         self.normalizer = nn.Sigmoid()
 
@@ -265,17 +267,14 @@ class SpaceBlock(nn.Module):
         content_feats = self.content_encoders(features)
 
         scene_feat = self.scene_encoder(scene_feature)
-        relations = self.normalizer((scene_feat * content_feats).sum(dim=1, keepdim=True))
+        relations = self.normalizer(
+            (scene_feat * content_feats).sum(dim=1, keepdim=True))
 
-        p_feats = self.feature_reencoders(features) 
+        p_feats = self.feature_reencoders(features)
 
-        refined_feats = relations * p_feats 
+        refined_feats = relations * p_feats
 
         return refined_feats
-
-
-
-
 
 
 class LWdecoder(nn.Module):
@@ -291,26 +290,33 @@ class LWdecoder(nn.Module):
             norm_fn_args = dict(num_features=out_channels)
         elif norm_fn == nn.GroupNorm:
             if num_groups_gn is None:
-                raise ValueError('When norm_fn is nn.GroupNorm, num_groups_gn is needed.')
-            norm_fn_args = dict(num_groups=num_groups_gn, num_channels=out_channels)
+                raise ValueError(
+                    'When norm_fn is nn.GroupNorm, num_groups_gn is needed.')
+            norm_fn_args = dict(num_groups=num_groups_gn,
+                                num_channels=out_channels)
         else:
-            raise ValueError('Type of {} is not support.'.format(type(norm_fn)))
+            raise ValueError(
+                'Type of {} is not support.'.format(type(norm_fn)))
         self.blocks = nn.ModuleList()
         dec_level = 0
         for in_feat_os in in_feat_output_strides:
-            num_upsample = int(math.log2(int(in_feat_os))) - int(math.log2(int(out_feat_output_stride)))
+            num_upsample = int(math.log2(int(in_feat_os))) - \
+                int(math.log2(int(out_feat_output_stride)))
 
             num_layers = num_upsample if num_upsample != 0 else 1
 
             self.blocks.append(nn.Sequential(*[
                 nn.Sequential(
-                    nn.Conv2d(in_channels[dec_level] if idx ==0 else out_channels, out_channels, 3, 1, 1, bias=False),
-                    norm_fn(**norm_fn_args) if norm_fn is not None else nn.Identity(),
+                    nn.Conv2d(in_channels[dec_level] if idx ==
+                              0 else out_channels, out_channels, 3, 1, 1, bias=False),
+                    norm_fn(
+                        **norm_fn_args) if norm_fn is not None else nn.Identity(),
                     nn.ReLU(inplace=True),
-                    nn.UpsamplingBilinear2d(scale_factor=2) if num_upsample != 0 else nn.Identity(),
+                    nn.UpsamplingBilinear2d(
+                        scale_factor=2) if num_upsample != 0 else nn.Identity(),
                 )
                 for idx in range(num_layers)]))
-            dec_level+=1
+            dec_level += 1
 
     def forward(self, feat_list: list):
         inner_feat_list = []
@@ -321,11 +327,11 @@ class LWdecoder(nn.Module):
         out_feat = sum(inner_feat_list) / 4.
         return out_feat
 
+
 class FeatureBlock(nn.Module):
     def __init__(self, in_planes, out_planes,
-                 norm_layer=nn.BatchNorm2d,scale=2,relu=True,last=False):
+                 norm_layer=nn.BatchNorm2d, scale=2, relu=True, last=False):
         super(FeatureBlock, self).__init__()
-       
 
         self.conv_3x3 = ConvBnRelu(in_planes, in_planes, 3, 1, 1,
                                    has_bn=True, norm_layer=norm_layer,
@@ -333,9 +339,9 @@ class FeatureBlock(nn.Module):
         self.conv_1x1 = ConvBnRelu(in_planes, out_planes, 1, 1, 0,
                                    has_bn=True, norm_layer=norm_layer,
                                    has_relu=True, has_bias=False)
-       
-        self.scale=scale
-        self.last=last
+
+        self.scale = scale
+        self.last = last
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -348,15 +354,15 @@ class FeatureBlock(nn.Module):
 
     def forward(self, x):
 
-        if self.last==False:
+        if self.last == False:
             x = self.conv_3x3(x)
-        if self.scale>1:
-            x=F.interpolate(x,scale_factor=self.scale,mode='bilinear',align_corners=True)
-        x=self.conv_1x1(x)
+        if self.scale > 1:
+            x = F.interpolate(x, scale_factor=self.scale,
+                              mode='bilinear', align_corners=True)
+        x = self.conv_1x1(x)
         return x
 
 
-    
 class ConvBnRelu(nn.Module):
     def __init__(self, in_planes, out_planes, ksize, stride, pad, dilation=1,
                  groups=1, has_bn=True, norm_layer=nn.BatchNorm2d,
@@ -380,13 +386,10 @@ class ConvBnRelu(nn.Module):
             x = self.relu(x)
 
         return x
-    
 
-
-    
 
 # if __name__ == '__main__':
-   
+
 
 #    model = DconnNet()
 #    torchsummary.summary(model, (3, 512, 512))
