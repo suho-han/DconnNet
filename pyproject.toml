@@ -1,0 +1,23 @@
+[project]
+name = "dconnnet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "apex>=0.9.10.dev0",
+    "autopep8>=2.3.2",
+    "autorootcwd>=1.0.1",
+    "isort>=8.0.1",
+    "matplotlib>=3.10.8",
+    "nibabel>=5.4.2",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "scikit-image>=0.26.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "torch>=2.11.0",
+    "torchsummary>=1.5.1",
+    "torchvision>=0.26.0",
+]
