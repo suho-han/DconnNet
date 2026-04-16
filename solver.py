@@ -3,16 +3,11 @@ import math
 import os
 import time
 from contextlib import contextmanager
-from random import shuffle
 
 import numpy as np
-import sklearn
 import torch
 import torch.nn.functional as F
 import torchvision.utils as utils
-from skimage.io import imread, imsave
-from sklearn.metrics import precision_score
-from torch.autograd import Variable
 from torch.optim import lr_scheduler
 
 try:
@@ -79,7 +74,7 @@ class Solver(object):
         results_csv = 'results_' + str(exp_id) + '.csv'
         with open(os.path.join(self.args.save, results_csv), 'w') as f:
             f.write(
-                'epoch,train_loss,val_loss,dice,Jac,clDice,betti_error_0,betti_error_1,elapsed_hms\n'
+                'epoch,train_loss,val_loss,dice,Jac,clDice,precision,accuracy,betti_error_0,betti_error_1,elapsed_hms\n'
             )
 
     def _format_elapsed_hms(self, elapsed_seconds):
@@ -104,6 +99,8 @@ class Solver(object):
                     f'{float(metrics["dice"]):0.6f}',
                     f'{float(metrics["jac"]):0.6f}',
                     f'{float(metrics["cldice"]):0.6f}',
+                    f'{float(metrics.get("precision", float("nan"))):0.6f}',
+                    f'{float(metrics.get("accuracy", float("nan"))):0.6f}',
                     f'{float(metrics["betti_error_0"]):0.6f}',
                     f'{float(metrics["betti_error_1"]):0.6f}',
                     elapsed_hms or '',
@@ -137,6 +134,8 @@ class Solver(object):
                     'dice',
                     'jac',
                     'cldice',
+                    'precision',
+                    'accuracy',
                     'betti_error_0',
                     'betti_error_1',
                     'elapsed_hms',
@@ -153,11 +152,52 @@ class Solver(object):
                     f'{float(metrics["dice"]):0.6f}',
                     f'{float(metrics["jac"]):0.6f}',
                     f'{float(metrics["cldice"]):0.6f}',
+                    f'{float(metrics.get("precision", float("nan"))):0.6f}',
+                    f'{float(metrics.get("accuracy", float("nan"))):0.6f}',
                     f'{float(metrics["betti_error_0"]):0.6f}',
                     f'{float(metrics["betti_error_1"]):0.6f}',
                     elapsed_hms or '',
                 ]
             )
+
+    def _compute_binary_precision_accuracy(self, pred_mask, gt_mask, eps=1e-6):
+        pred_bin = (pred_mask > 0.5).float()
+        gt_bin = (gt_mask > 0.5).float()
+
+        tp = torch.sum(pred_bin * gt_bin, dim=(1, 2, 3))
+        fp = torch.sum(pred_bin * (1.0 - gt_bin), dim=(1, 2, 3))
+        tn = torch.sum((1.0 - pred_bin) * (1.0 - gt_bin), dim=(1, 2, 3))
+        fn = torch.sum((1.0 - pred_bin) * gt_bin, dim=(1, 2, 3))
+
+        precision = (tp + eps) / (tp + fp + eps)
+        accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
+        return precision, accuracy
+
+    def _compute_multiclass_precision_accuracy(self, pred_label, true_label, num_class, eps=1e-6):
+        batch_size = pred_label.shape[0]
+        precision_vals = []
+        accuracy_vals = []
+
+        class_ids = list(range(1, num_class))
+        if len(class_ids) == 0:
+            class_ids = list(range(num_class))
+
+        for b_idx in range(batch_size):
+            pred_b = pred_label[b_idx]
+            true_b = true_label[b_idx]
+
+            class_precisions = []
+            for class_id in class_ids:
+                pred_pos = (pred_b == class_id)
+                true_pos = (true_b == class_id)
+                tp = torch.sum(pred_pos & true_pos).float()
+                fp = torch.sum(pred_pos & (~true_pos)).float()
+                class_precisions.append((tp + eps) / (tp + fp + eps))
+
+            precision_vals.append(torch.mean(torch.stack(class_precisions)))
+            accuracy_vals.append(torch.mean((pred_b == true_b).float()))
+
+        return torch.stack(precision_vals), torch.stack(accuracy_vals)
 
     def save_checkpoint_batch_triplet(self, images, preds, masks, exp_id, epoch, batch_idx):
         base_dir = os.path.join(
@@ -357,7 +397,6 @@ class Solver(object):
         net, optimizer = amp.initialize(model, optim, opt_level='O2')
 
         best_p = 0
-        best_epo = 0
         scheduled_modes = ['CosineAnnealingWarmRestarts']
         if self.args.lr_update in scheduled_modes:
             scheduled = True
@@ -396,6 +435,8 @@ class Solver(object):
                 'dice': float('nan'),
                 'jac': float('nan'),
                 'cldice': float('nan'),
+                'precision': float('nan'),
+                'accuracy': float('nan'),
                 'betti_error_0': float('nan'),
                 'betti_error_1': float('nan'),
                 'val_loss': float('nan'),
@@ -423,8 +464,8 @@ class Solver(object):
                         param_group['lr'] = curr_lr
 
                 for i_batch, sample_batched in enumerate(train_loader):
-                    X = Variable(sample_batched[0])
-                    y = Variable(sample_batched[1])
+                    X = sample_batched[0]
+                    y = sample_batched[1]
 
                     X = X.cuda()
                     y = y.float().cuda()
@@ -464,6 +505,8 @@ class Solver(object):
                     'dice': float('nan'),
                     'jac': float('nan'),
                     'cldice': float('nan'),
+                    'precision': float('nan'),
+                    'accuracy': float('nan'),
                     'betti_error_0': float('nan'),
                     'betti_error_1': float('nan'),
                     'val_loss': float('nan'),
@@ -486,7 +529,6 @@ class Solver(object):
                     dice_p = epoch_metrics['dice']
                     if best_p < dice_p:
                         best_p = dice_p
-                        best_epo = epoch
                         best_model_dir = os.path.join(self.args.save, 'models', str(exp_id))
                         torch.save(model.state_dict(), os.path.join(best_model_dir, 'best_model.pth'))
                         with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
@@ -522,6 +564,10 @@ class Solver(object):
                     writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), epoch + 1)
                 if not math.isnan(float(epoch_metrics['cldice'])):
                     writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['precision'])):
+                    writer.add_scalar('epoch/precision', float(epoch_metrics['precision']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['accuracy'])):
+                    writer.add_scalar('epoch/accuracy', float(epoch_metrics['accuracy']), epoch + 1)
                 if not math.isnan(float(epoch_metrics['betti_error_0'])):
                     writer.add_scalar(
                         'epoch/betti_error_0',
@@ -552,7 +598,8 @@ class Solver(object):
                         )
                     )
                 elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
-                self._write_epoch_result_row(exp_id, epoch + 1, epoch_metrics, elapsed_hms)
+                if val_loader is not None:
+                    self._write_epoch_result_row(exp_id, epoch + 1, epoch_metrics, elapsed_hms)
 
             final_eval_split = 'test' if test_loader is not None else 'val'
             final_eval_loader = test_loader if test_loader is not None else val_loader
@@ -602,6 +649,8 @@ class Solver(object):
         self.dice_ls = []
         self.Jac_ls = []
         self.cldc_ls = []
+        self.precision_ls = []
+        self.accuracy_ls = []
         self.betti_error_0_ls = []
         self.betti_error_1_ls = []
         self.val_loss_ls = []
@@ -615,8 +664,8 @@ class Solver(object):
         with torch.no_grad():
             for j_batch, test_data in enumerate(loader):
                 X_test_raw, y_test_raw_raw, sample_names = self._unpack_test_batch(test_data, j_batch)
-                X_test = Variable(X_test_raw)
-                y_test_raw = Variable(y_test_raw_raw)
+                X_test = X_test_raw
+                y_test_raw = y_test_raw_raw
 
                 X_test = X_test.cuda()
                 y_test_raw = y_test_raw.float().cuda()
@@ -634,7 +683,7 @@ class Solver(object):
                     val_term_sums[k] += float(v.detach().item())
                 val_term_counts += 1
 
-                batch, channel, H, W = X_test.shape
+                batch, _, H, W = X_test.shape
 
                 hori_translation = self.hori_translation.repeat(batch, 1, 1, 1).cuda()
                 verti_translation = self.verti_translation.repeat(batch, 1, 1, 1).cuda()
@@ -671,6 +720,13 @@ class Solver(object):
                     sample_cldc = []
                     sample_betti_error_0 = []
                     sample_betti_error_1 = []
+                    if self.args.dataset == 'isic':
+                        sample_precision, sample_accuracy = self._compute_binary_precision_accuracy(pred, gt_mask)
+                    else:
+                        sample_precision = torch.full((batch,), float('nan'), device=pred.device)
+                        sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
+                    self.precision_ls += sample_precision.detach().cpu().tolist()
+                    self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
                     for b_idx in range(batch):
                         pred_np = pred[b_idx, 0].detach().cpu().numpy()
                         target_np = gt_mask[b_idx, 0].detach().cpu().numpy()
@@ -705,6 +761,19 @@ class Solver(object):
                     sample_cldc = [float('nan')] * batch
                     sample_betti_error_0 = [float('nan')] * batch
                     sample_betti_error_1 = [float('nan')] * batch
+                    if self.args.dataset == 'isic':
+                        pred_label = pred_to_save.squeeze(1).long()
+                        true_label = mask_to_save.squeeze(1).long()
+                        sample_precision, sample_accuracy = self._compute_multiclass_precision_accuracy(
+                            pred_label,
+                            true_label,
+                            self.args.num_class,
+                        )
+                    else:
+                        sample_precision = torch.full((batch,), float('nan'), device=pred.device)
+                        sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
+                    self.precision_ls += sample_precision.detach().cpu().tolist()
+                    self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
                     self.betti_error_0_ls += sample_betti_error_0
                     self.betti_error_1_ls += sample_betti_error_1
 
@@ -735,6 +804,8 @@ class Solver(object):
                         'dice': float(sample_dice[b_idx].item()),
                         'jac': float(sample_jac[b_idx].item()),
                         'cldice': float(sample_cldc[b_idx]),
+                        'precision': float(sample_precision[b_idx].item()),
+                        'accuracy': float(sample_accuracy[b_idx].item()),
                         'betti_error_0': float(sample_betti_error_0[b_idx]),
                         'betti_error_1': float(sample_betti_error_1[b_idx]),
                     })
@@ -746,10 +817,10 @@ class Solver(object):
                     )
 
             Jac_ls = np.array(self.Jac_ls)
-            dice_ls = np.array(self.dice_ls)
-            total_dice = np.mean(dice_ls)
             total_val_loss = float(np.mean(self.val_loss_ls)) if self.val_loss_ls else float('nan')
             total_cldice = float(np.mean(self.cldc_ls)) if len(self.cldc_ls) > 0 else float('nan')
+            total_precision = float(np.nanmean(np.array(self.precision_ls))) if len(self.precision_ls) > 0 else float('nan')
+            total_accuracy = float(np.nanmean(np.array(self.accuracy_ls))) if len(self.accuracy_ls) > 0 else float('nan')
             total_betti_error_0 = (
                 float(np.mean(self.betti_error_0_ls))
                 if len(self.betti_error_0_ls) > 0 else float('nan')
@@ -774,6 +845,8 @@ class Solver(object):
                     'dice',
                     'jac',
                     'cldice',
+                    'precision',
+                    'accuracy',
                     'betti_error_0',
                     'betti_error_1',
                 ]
@@ -786,6 +859,8 @@ class Solver(object):
                 'dice': float(np.mean(self.dice_ls)),
                 'jac': float(np.mean(Jac_ls)),
                 'cldice': total_cldice,
+                'precision': total_precision,
+                'accuracy': total_accuracy,
                 'betti_error_0': total_betti_error_0,
                 'betti_error_1': total_betti_error_1,
                 'val_loss': float(total_val_loss),
