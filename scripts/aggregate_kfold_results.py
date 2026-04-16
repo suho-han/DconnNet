@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
 import argparse
 import csv
 import math
 import os
 import re
+import shutil
 import subprocess
 from typing import Dict, List, Optional, Set, Tuple
 
 import matplotlib
+
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,8 +25,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="output",
         help=(
-            "Fold root directory. Supported layouts: "
-            "<input-root>/<fold>/<input-name> or <input-root>/results_<fold>.csv"
+            "K-fold result root directory. Supported layouts: "
+            "<input-root>/<experiment>/<fold>/<input-name>, "
+            "<input-root>/<experiment>/final_results_<fold>.csv, "
+            "<input-root>/<scope>/<experiment>/final_results_<fold>.csv "
+            "(for example output/5folds/<experiment>/final_results_<fold>.csv), "
+            "<input-root>/<fold>/<input-name>, or <input-root>/final_results_<fold>.csv"
         ),
     )
     parser.add_argument(
@@ -36,8 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-name",
         type=str,
-        default="results.csv",
-        help="Input CSV file name in each fold directory.",
+        default="final_results_{fold}.csv",
+        help="Input CSV file name pattern in each fold directory/root.",
     )
     parser.add_argument(
         "--output-dir",
@@ -85,40 +91,171 @@ def _safe_std(values: List[float], mean: float) -> float:
     return math.sqrt(var)
 
 
-def parse_fold_csv(path: str) -> Dict[str, float]:
-    epoch_rows: Dict[int, Tuple[float, float, float]] = {}
+def _safe_duration_std(values: List[float], mean: float) -> float:
+    valid = [v for v in values if not math.isnan(v)]
+    if not valid:
+        return float("nan")
+    if len(valid) == 1:
+        return 0.0
+    var = sum((v - mean) ** 2 for v in valid) / (len(valid) - 1)
+    return math.sqrt(var)
+
+
+def _row_float_from_header(
+    row: List[str],
+    header_map: Dict[str, int],
+    key: str,
+    default: float = float("nan"),
+) -> float:
+    idx = header_map.get(key)
+    if idx is None or idx >= len(row):
+        return default
+    value = row[idx].strip()
+    if value == "":
+        return default
+    return _to_float(value)
+
+
+def parse_hms_duration(value: str) -> float:
+    value = value.strip()
+    if value == "":
+        return float("nan")
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid HH:MM:SS duration: {value}")
+    hours, minutes, seconds = [int(part) for part in parts]
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def format_hms_duration(value: float) -> str:
+    if math.isnan(float(value)):
+        return ""
+    total_seconds = max(0, int(round(float(value))))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _fmt_duration_csv(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return format_hms_duration(float(value))
+    text = str(value).strip()
+    return text
+
+
+def _fmt_duration_latex(value: object) -> str:
+    text = _fmt_duration_csv(value)
+    return text if text else "N/A"
+
+
+def parse_final_summary_csv(path: str) -> Optional[Dict[str, object]]:
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        row = next(reader, None)
+        if row is None:
+            return None
+
+    if "dice" not in row or "jac" not in row or "cldice" not in row:
+        return None
+
+    eval_epoch_raw = row.get("eval_epoch", "").strip()
+    eval_epoch = int(eval_epoch_raw) if eval_epoch_raw.isdigit() else 0
+
+    elapsed_raw = row.get("elapsed_hms", "").strip()
+    elapsed_seconds = (
+        parse_hms_duration(elapsed_raw) if elapsed_raw != "" else float("nan")
+    )
+
+    return {
+        "best_epoch": float(eval_epoch),
+        "best_dice": _to_float(str(row.get("dice", "nan"))),
+        "best_jac": _to_float(str(row.get("jac", "nan"))),
+        "best_cldice": _to_float(str(row.get("cldice", "nan"))),
+        "best_betti_error_0": _to_float(str(row.get("betti_error_0", "nan"))),
+        "best_betti_error_1": _to_float(str(row.get("betti_error_1", "nan"))),
+        "train_elapsed_seconds": elapsed_seconds,
+        "train_elapsed_hms": format_hms_duration(elapsed_seconds),
+    }
+
+
+def parse_fold_csv(path: str) -> Dict[str, object]:
+    final_summary = parse_final_summary_csv(path)
+    if final_summary is not None:
+        return final_summary
+
+    epoch_rows: Dict[int, Dict[str, float]] = {}
     summary_epoch: Optional[int] = None
     summary_dice: Optional[float] = None
-    use_extended_epoch_format = False
+    header_map: Optional[Dict[str, int]] = None
+    last_elapsed_seconds = float("nan")
 
     with open(path, "r", newline="") as f:
         reader = csv.reader(f)
-        header_skipped = False
         for row in reader:
-            row = [item.strip() for item in row if item.strip() != ""]
-            if not row:
+            row = [item.strip() for item in row]
+            if not any(item != "" for item in row):
                 continue
-            if not header_skipped and row[0].lower() == "epoch":
-                lowered = [item.lower() for item in row]
-                use_extended_epoch_format = (
-                    "train_loss" in lowered and
-                    "val_loss" in lowered and
-                    "dice" in lowered
-                )
-                header_skipped = True
+            if header_map is None and row[0].lower() == "epoch":
+                header_map = {
+                    item.lower(): idx for idx, item in enumerate(row) if item != ""
+                }
                 continue
 
-            if len(row) >= 4:
+            if row[0] == "":
+                continue
+
+            try:
                 epoch = int(row[0])
-                if use_extended_epoch_format and len(row) >= 6:
-                    dice = _to_float(row[3])
-                    jac = _to_float(row[4])
-                    cldice = _to_float(row[5])
-                else:
-                    dice = _to_float(row[1])
-                    jac = _to_float(row[2])
-                    cldice = _to_float(row[3])
-                epoch_rows[epoch] = (dice, jac, cldice)
+            except ValueError:
+                continue
+
+            if (
+                header_map is not None and
+                "dice" in header_map and
+                "jac" in header_map and
+                "cldice" in header_map
+            ):
+                required_idx = max(
+                    header_map["dice"],
+                    header_map["jac"],
+                    header_map["cldice"],
+                )
+                if len(row) > required_idx:
+                    dice = _to_float(row[header_map["dice"]])
+                    jac = _to_float(row[header_map["jac"]])
+                    cldice = _to_float(row[header_map["cldice"]])
+                    betti_error_0 = _row_float_from_header(row, header_map, "betti_error_0")
+                    betti_error_1 = _row_float_from_header(row, header_map, "betti_error_1")
+                    if (
+                        "elapsed_hms" in header_map and
+                        header_map["elapsed_hms"] < len(row)
+                    ):
+                        elapsed_seconds = parse_hms_duration(row[header_map["elapsed_hms"]])
+                        if not math.isnan(elapsed_seconds):
+                            last_elapsed_seconds = elapsed_seconds
+                    epoch_rows[epoch] = {
+                        "dice": dice,
+                        "jac": jac,
+                        "cldice": cldice,
+                        "betti_error_0": betti_error_0,
+                        "betti_error_1": betti_error_1,
+                    }
+                    continue
+
+            if len(row) >= 4:
+                dice = _to_float(row[1])
+                jac = _to_float(row[2])
+                cldice = _to_float(row[3])
+                betti_error_0 = _to_float(row[6]) if len(row) >= 7 and row[6] != "" else float("nan")
+                betti_error_1 = _to_float(row[7]) if len(row) >= 8 and row[7] != "" else float("nan")
+                epoch_rows[epoch] = {
+                    "dice": dice,
+                    "jac": jac,
+                    "cldice": cldice,
+                    "betti_error_0": betti_error_0,
+                    "betti_error_1": betti_error_1,
+                }
             elif len(row) >= 2:
                 summary_epoch = int(row[0])
                 summary_dice = _to_float(row[1])
@@ -127,22 +264,35 @@ def parse_fold_csv(path: str) -> Dict[str, float]:
         raise ValueError(f"No epoch rows found in: {path}")
 
     if summary_epoch is None or summary_dice is None:
-        best_epoch, (best_dice, best_jac, best_cldice) = max(
-            epoch_rows.items(), key=lambda kv: kv[1][0]
+        best_epoch, best_metrics = max(
+            epoch_rows.items(), key=lambda kv: kv[1]["dice"]
         )
+        best_dice = best_metrics["dice"]
+        best_jac = best_metrics["jac"]
+        best_cldice = best_metrics["cldice"]
+        best_betti_error_0 = best_metrics["betti_error_0"]
+        best_betti_error_1 = best_metrics["betti_error_1"]
     else:
         best_epoch = summary_epoch
         best_dice = summary_dice
         if best_epoch in epoch_rows:
-            _, best_jac, best_cldice = epoch_rows[best_epoch]
+            best_jac = epoch_rows[best_epoch]["jac"]
+            best_cldice = epoch_rows[best_epoch]["cldice"]
+            best_betti_error_0 = epoch_rows[best_epoch]["betti_error_0"]
+            best_betti_error_1 = epoch_rows[best_epoch]["betti_error_1"]
         else:
             best_jac, best_cldice = float("nan"), float("nan")
+            best_betti_error_0, best_betti_error_1 = float("nan"), float("nan")
 
     return {
         "best_epoch": float(best_epoch),
         "best_dice": best_dice,
         "best_jac": best_jac,
         "best_cldice": best_cldice,
+        "best_betti_error_0": best_betti_error_0,
+        "best_betti_error_1": best_betti_error_1,
+        "train_elapsed_seconds": last_elapsed_seconds,
+        "train_elapsed_hms": format_hms_duration(last_elapsed_seconds),
     }
 
 
@@ -151,10 +301,13 @@ def resolve_fold_csv_path(input_root: str, fold: str, input_name: str) -> str:
     if os.path.isfile(default_path):
         return default_path
 
-    candidates = []
+    candidates = [
+        os.path.join(input_root, f"final_results_{fold}.csv"),
+    ]
     if "{fold}" in input_name:
         candidates.append(os.path.join(input_root, input_name.format(fold=fold)))
-    candidates.append(os.path.join(input_root, f"results_{fold}.csv"))
+    else:
+        candidates.append(os.path.join(input_root, input_name))
 
     for candidate in candidates:
         if os.path.isfile(candidate):
@@ -177,14 +330,120 @@ def discover_available_folds(input_root: str, input_name: str) -> List[str]:
         if entry.isdigit() and os.path.isfile(os.path.join(entry_path, input_name)):
             discovered.add(entry)
 
+    if "{fold}" in input_name:
+        prefix, suffix = input_name.split("{fold}")
+        for entry in os.listdir(input_root):
+            if not (entry.startswith(prefix) and entry.endswith(suffix)):
+                continue
+            fold = entry[len(prefix): len(entry) - len(suffix) if len(suffix) > 0 else len(entry)]
+            if fold.isdigit():
+                discovered.add(fold)
+
     for entry in os.listdir(input_root):
-        if not entry.startswith("results_") or not entry.endswith(".csv"):
+        if not entry.startswith("final_results_") or not entry.endswith(".csv"):
             continue
-        fold = entry[len("results_"):-len(".csv")]
+        fold = entry[len("final_results_"):-len(".csv")]
         if fold.isdigit():
             discovered.add(fold)
 
     return sorted(discovered, key=int)
+
+
+def parse_scope_fold_count(name: str) -> Optional[int]:
+    match = re.fullmatch(r"(\d+)folds?", name.lower())
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def extract_scope_info(path: str) -> Tuple[str, object]:
+    for part in reversed(os.path.normpath(path).split(os.sep)):
+        fold_count = parse_scope_fold_count(part)
+        if fold_count is not None:
+            return part.lower(), fold_count
+    return "direct", "NA"
+
+
+def discover_nested_target_root_infos(
+    input_root: str,
+    input_name: str,
+    max_depth: int = 3,
+) -> List[Dict[str, object]]:
+    target_infos: List[Dict[str, object]] = []
+    pending: List[Tuple[str, int]] = [(input_root, 0)]
+    seen_dirs: Set[str] = set()
+
+    while pending:
+        current_dir, depth = pending.pop(0)
+        normalized_dir = os.path.normpath(current_dir)
+        if normalized_dir in seen_dirs:
+            continue
+        seen_dirs.add(normalized_dir)
+
+        if depth > 0:
+            available_folds = discover_available_folds(current_dir, input_name)
+            if available_folds:
+                rel_parts = os.path.relpath(current_dir, input_root).split(os.sep)
+                scope_fold_count = None
+                for part in rel_parts:
+                    scope_fold_count = parse_scope_fold_count(part)
+                    if scope_fold_count is not None:
+                        break
+                target_infos.append(
+                    {
+                        "root": current_dir,
+                        "available_folds": available_folds,
+                        "scope_fold_count": scope_fold_count,
+                    }
+                )
+                continue
+
+        if depth >= max_depth:
+            continue
+
+        try:
+            entries = sorted(os.listdir(current_dir))
+        except OSError:
+            continue
+
+        for entry in entries:
+            entry_path = os.path.join(current_dir, entry)
+            if os.path.isdir(entry_path):
+                pending.append((entry_path, depth + 1))
+
+    return target_infos
+
+
+def select_target_root_infos(
+    input_root: str,
+    target_infos: List[Dict[str, object]],
+    requested_folds: List[str],
+) -> List[Dict[str, object]]:
+    if not target_infos:
+        return []
+
+    scope_names = sorted(
+        {
+            f"{int(info['scope_fold_count'])}-fold"
+            for info in target_infos
+            if isinstance(info.get("scope_fold_count"), int)
+        },
+        key=natural_sort_key,
+    )
+    if len(scope_names) > 1:
+        print(
+            f"[INFO] {input_root}: multiple output scopes detected; "
+            f"including {', '.join(scope_names)} experiment roots for requested folds "
+            f"{', '.join(requested_folds)}."
+        )
+
+    return sorted(
+        target_infos,
+        key=lambda item: (
+            int(item["scope_fold_count"]) if isinstance(item.get("scope_fold_count"), int) else 10 ** 9,
+            str(item["root"]),
+        ),
+    )
 
 
 def discover_target_roots(input_root: str, folds: List[str], input_name: str) -> List[str]:
@@ -195,19 +454,15 @@ def discover_target_roots(input_root: str, folds: List[str], input_name: str) ->
     if available_in_root:
         return [input_root]
 
-    targets: List[str] = []
-    for entry in sorted(os.listdir(input_root)):
-        entry_path = os.path.join(input_root, entry)
-        if not os.path.isdir(entry_path):
-            continue
-        if discover_available_folds(entry_path, input_name):
-            targets.append(entry_path)
-
-    if targets:
-        return targets
+    target_infos = discover_nested_target_root_infos(input_root, input_name)
+    if target_infos:
+        return [
+            str(info["root"])
+            for info in select_target_root_infos(input_root, target_infos, folds)
+        ]
 
     raise FileNotFoundError(
-        f"No fold CSV files were found in '{input_root}' or its direct subdirectories."
+        f"No fold CSV files were found in '{input_root}' or its nested subdirectories."
     )
 
 
@@ -227,15 +482,21 @@ def resolve_folds_for_root(input_root: str, requested_folds: List[str], input_na
         raise FileNotFoundError(
             f"No usable folds in '{input_root}'. Missing requested folds: {', '.join(missing)}"
         )
+    scope_name, scope_fold_count = extract_scope_info(input_root)
+    log_tag = "WARN"
+    if isinstance(scope_fold_count, int) and scope_fold_count == len(auto_folds):
+        log_tag = "INFO"
+
     print(
-        f"[WARN] {input_root}: missing requested folds ({', '.join(missing)}). "
+        f"[{log_tag}] {input_root}: missing requested folds ({', '.join(missing)}). "
         f"Using detected folds: {', '.join(auto_folds)}"
+        + (f" within {scope_name} scope." if log_tag == "INFO" else "")
     )
     return auto_folds
 
 
-def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[List[Dict[str, float]], Dict[str, float], Dict[str, float]]:
-    fold_rows: List[Dict[str, float]] = []
+def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[List[Dict[str, object]], Dict[str, object], Dict[str, object]]:
+    fold_rows: List[Dict[str, object]] = []
     for fold in folds:
         csv_path = resolve_fold_csv_path(input_root, fold, input_name)
         metrics = parse_fold_csv(csv_path)
@@ -246,18 +507,32 @@ def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[
     dices = [row["best_dice"] for row in fold_rows]
     jacs = [row["best_jac"] for row in fold_rows]
     cldices = [row["best_cldice"] for row in fold_rows]
+    betti_error_0s = [row["best_betti_error_0"] for row in fold_rows]
+    betti_error_1s = [row["best_betti_error_1"] for row in fold_rows]
+    elapsed_seconds = [float(row["train_elapsed_seconds"]) for row in fold_rows]
+
+    elapsed_mean_seconds = _safe_mean(elapsed_seconds)
+    elapsed_std_seconds = _safe_duration_std(elapsed_seconds, elapsed_mean_seconds)
 
     mean_row = {
         "best_epoch": _safe_mean(epochs),
         "best_dice": _safe_mean(dices),
         "best_jac": _safe_mean(jacs),
         "best_cldice": _safe_mean(cldices),
+        "best_betti_error_0": _safe_mean(betti_error_0s),
+        "best_betti_error_1": _safe_mean(betti_error_1s),
+        "train_elapsed_seconds": elapsed_mean_seconds,
+        "train_elapsed_hms": format_hms_duration(elapsed_mean_seconds),
     }
     std_row = {
         "best_epoch": _safe_std(epochs, mean_row["best_epoch"]),
         "best_dice": _safe_std(dices, mean_row["best_dice"]),
         "best_jac": _safe_std(jacs, mean_row["best_jac"]),
         "best_cldice": _safe_std(cldices, mean_row["best_cldice"]),
+        "best_betti_error_0": _safe_std(betti_error_0s, mean_row["best_betti_error_0"]),
+        "best_betti_error_1": _safe_std(betti_error_1s, mean_row["best_betti_error_1"]),
+        "train_elapsed_seconds": elapsed_std_seconds,
+        "train_elapsed_hms": format_hms_duration(elapsed_std_seconds),
     }
     return fold_rows, mean_row, std_row
 
@@ -306,24 +581,31 @@ def resolve_visualization_epoch(model_dir: str, target_epoch: int) -> Tuple[Opti
     return nearest, False
 
 
-def find_fold_row(fold_rows: List[Dict[str, float]], fold: int) -> Optional[Dict[str, float]]:
+def find_fold_row(fold_rows: List[Dict[str, object]], fold: int) -> Optional[Dict[str, object]]:
     for row in fold_rows:
         if int(row["fold"]) == int(fold):
             return row
     return None
 
 
-def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, float]) -> Dict[str, object]:
+def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, object]) -> Dict[str, object]:
     fold = int(fold_row["fold"])
     model_dir = os.path.join(str(summary["root"]), "models", str(fold))
     sample_csv = os.path.join(model_dir, "test_sample_metrics.csv")
     sample_rows = parse_sample_metrics_csv(sample_csv) if os.path.isfile(sample_csv) else []
     best_epoch = int(fold_row["best_epoch"])
     vis_epoch, is_exact = resolve_visualization_epoch(model_dir, best_epoch)
+    exp_meta = parse_experiment_metadata(os.path.basename(os.path.normpath(str(summary["root"]))))
+    _, fold_scope_count = extract_scope_info(str(summary["root"]))
+    config_folds = fold_scope_count if isinstance(fold_scope_count, int) else len(summary["folds"])
 
     return {
         "root": summary["root"],
         "root_name": summary["root_name"],
+        "experiment": exp_meta["experiment"],
+        "conn_num": exp_meta["conn_num"],
+        "loss": exp_meta["loss"],
+        "config_folds": config_folds,
         "fold": fold,
         "best_epoch": best_epoch,
         "best_dice": float(fold_row["best_dice"]),
@@ -335,9 +617,11 @@ def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, float]
     }
 
 
-def choose_visualization_models(root_summaries: List[Dict[str, object]]) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
+def choose_visualization_models(
+    root_summaries: List[Dict[str, object]],
+) -> Tuple[Optional[Dict[str, object]], List[Dict[str, object]]]:
     if not root_summaries:
-        return None, None
+        return None, []
 
     ranked_summaries = sorted(
         root_summaries,
@@ -349,37 +633,24 @@ def choose_visualization_models(root_summaries: List[Dict[str, object]]) -> Tupl
         reference_summary["fold_rows"],
         key=lambda row: float(row["best_dice"]),
     )
-    model1 = build_model_candidate(reference_summary, reference_fold_row)
+    reference_model = build_model_candidate(reference_summary, reference_fold_row)
+    reference_fold = int(reference_fold_row["fold"])
 
-    model2: Optional[Dict[str, object]] = None
-    if len(ranked_summaries) >= 2:
-        compare_summary = ranked_summaries[1]
-        compare_fold_row = find_fold_row(compare_summary["fold_rows"], int(reference_fold_row["fold"]))
-        if compare_fold_row is None:
-            compare_fold_row = max(
-                compare_summary["fold_rows"],
+    models: List[Dict[str, object]] = [reference_model]
+    for summary in ranked_summaries[1:]:
+        fold_row = find_fold_row(summary["fold_rows"], reference_fold)
+        if fold_row is None:
+            fold_row = max(
+                summary["fold_rows"],
                 key=lambda row: float(row["best_dice"]),
             )
             print(
-                f"[WARN] {compare_summary['root_name']}: fold {int(reference_fold_row['fold'])} "
+                f"[WARN] {summary['root_name']}: fold {reference_fold} "
                 "not found for sample comparison; using its best fold instead."
             )
-        model2 = build_model_candidate(compare_summary, compare_fold_row)
-    else:
-        ranked_folds = sorted(
-            reference_summary["fold_rows"],
-            key=lambda row: float(row["best_dice"]),
-            reverse=True,
-        )
-        if len(ranked_folds) >= 2:
-            compare_fold_row = ranked_folds[1]
-            model2 = build_model_candidate(reference_summary, compare_fold_row)
-            print(
-                "[WARN] Only one experiment root detected; "
-                "Model 2 uses the second-best fold from the same experiment."
-            )
+        models.append(build_model_candidate(summary, fold_row))
 
-    return model1, model2
+    return reference_model, models
 
 
 def filter_sample_rows_for_epoch(sample_rows: List[Dict[str, object]], epoch: int) -> List[Dict[str, object]]:
@@ -448,9 +719,17 @@ def checkpoint_image_path(model_dir: str, epoch: Optional[int], kind: str, batch
 def load_panel_image(image_path: str, panel_kind: str) -> np.ndarray:
     with Image.open(image_path) as image:
         if panel_kind == "image":
-            # Keep input images in RGB to avoid OpenCV-style BGR confusion.
+            # Keep input images in RGB and auto-correct likely BGR-encoded snapshots.
             image = image.convert("RGB")
-            return np.asarray(image)
+            image_arr = np.asarray(image)
+            if image_arr.ndim == 3 and image_arr.shape[-1] == 3:
+                red_mean = float(np.mean(image_arr[:, :, 0]))
+                blue_mean = float(np.mean(image_arr[:, :, 2]))
+                # Fundus-like images should generally not be blue-dominant.
+                # If blue is clearly larger than red, treat it as BGR-encoded and swap.
+                if blue_mean > red_mean * 1.10:
+                    image_arr = image_arr[:, :, ::-1]
+            return image_arr
 
         # Segmentation targets/predictions are binary-like maps; render as single-channel grayscale.
         image = image.convert("L")
@@ -483,7 +762,19 @@ def render_panel(
         ax.imshow(image)
 
 
-def write_sample_visualization_csv(path: str, rows: List[Dict[str, object]]) -> None:
+def format_model_config_summary(model: Dict[str, object], multiline: bool = False) -> str:
+    separator = "\n" if multiline else " | "
+    return separator.join(
+        [
+            f"Exp={model['experiment']}",
+            f"Conn={model['conn_num']}",
+            f"Loss={model['loss']}",
+            f"Folds={model['config_folds']}",
+        ]
+    )
+
+
+def build_sample_visualization_fieldnames(model_count: int) -> List[str]:
     fieldnames = [
         "sample_rank",
         "sample_group",
@@ -493,21 +784,29 @@ def write_sample_visualization_csv(path: str, rows: List[Dict[str, object]]) -> 
         "reference_cldice",
         "image_path",
         "gt_path",
-        "model1_name",
-        "model1_fold",
-        "model1_best_epoch",
-        "model1_vis_epoch",
-        "model1_vis_epoch_exact",
-        "model1_dice",
-        "model1_pred_path",
-        "model2_name",
-        "model2_fold",
-        "model2_best_epoch",
-        "model2_vis_epoch",
-        "model2_vis_epoch_exact",
-        "model2_dice",
-        "model2_pred_path",
     ]
+    for idx in range(1, model_count + 1):
+        fieldnames.extend(
+            [
+                f"model{idx}_name",
+                f"model{idx}_config",
+                f"model{idx}_experiment",
+                f"model{idx}_conn_num",
+                f"model{idx}_loss",
+                f"model{idx}_folds",
+                f"model{idx}_fold",
+                f"model{idx}_best_epoch",
+                f"model{idx}_vis_epoch",
+                f"model{idx}_vis_epoch_exact",
+                f"model{idx}_dice",
+                f"model{idx}_pred_path",
+            ]
+        )
+    return fieldnames
+
+
+def write_sample_visualization_csv(path: str, rows: List[Dict[str, object]], model_count: int) -> None:
+    fieldnames = build_sample_visualization_fieldnames(model_count)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -516,6 +815,7 @@ def write_sample_visualization_csv(path: str, rows: List[Dict[str, object]]) -> 
 
 def maybe_write_sample_visualization(
     output_dir: str,
+    image_output_dir: str,
     output_stem: str,
     root_summaries: List[Dict[str, object]],
     sample_vis_count: int,
@@ -523,20 +823,20 @@ def maybe_write_sample_visualization(
     if sample_vis_count <= 0:
         return
 
-    model1, model2 = choose_visualization_models(root_summaries)
-    if model1 is None:
+    reference_model, models = choose_visualization_models(root_summaries)
+    if reference_model is None or not models:
         return
-    if model1["vis_epoch"] is None:
-        print(f"[WARN] {model1['model_dir']}: no checkpoint_batches found; skipping sample visualization.")
+    if reference_model["vis_epoch"] is None:
+        print(f"[WARN] {reference_model['model_dir']}: no checkpoint_batches found; skipping sample visualization.")
         return
-    if not model1["sample_rows"]:
-        print(f"[WARN] {model1['sample_csv']}: missing sample metrics; skipping sample visualization.")
+    if not reference_model["sample_rows"]:
+        print(f"[WARN] {reference_model['sample_csv']}: missing sample metrics; skipping sample visualization.")
         return
 
-    reference_rows = filter_sample_rows_for_epoch(model1["sample_rows"], int(model1["best_epoch"]))
+    reference_rows = filter_sample_rows_for_epoch(reference_model["sample_rows"], int(reference_model["best_epoch"]))
     if not reference_rows:
         print(
-            f"[WARN] {model1['sample_csv']}: no rows for best epoch {model1['best_epoch']}; "
+            f"[WARN] {reference_model['sample_csv']}: no rows for best epoch {reference_model['best_epoch']}; "
             "skipping sample visualization."
         )
         return
@@ -546,99 +846,94 @@ def maybe_write_sample_visualization(
         print("[WARN] No sample rows available for visualization.")
         return
 
-    if not bool(model1["vis_epoch_exact"]):
+    if not bool(reference_model["vis_epoch_exact"]):
         print(
-            f"[WARN] {model1['root_name']} fold {model1['fold']}: "
-            f"best epoch {model1['best_epoch']} has no saved PNG; using nearest checkpoint epoch {model1['vis_epoch']}."
+            f"[WARN] {reference_model['root_name']} fold {reference_model['fold']}: "
+            f"best epoch {reference_model['best_epoch']} has no saved PNG; "
+            f"using nearest checkpoint epoch {reference_model['vis_epoch']}."
         )
-    if model2 is not None and model2["vis_epoch"] is not None and not bool(model2["vis_epoch_exact"]):
-        print(
-            f"[WARN] {model2['root_name']} fold {model2['fold']}: "
-            f"best epoch {model2['best_epoch']} has no saved PNG; using nearest checkpoint epoch {model2['vis_epoch']}."
-        )
+    for model in models[1:]:
+        if model["vis_epoch"] is None:
+            print(f"[WARN] {model['model_dir']}: no checkpoint_batches found; prediction column will be N/A.")
+            continue
+        if not bool(model["vis_epoch_exact"]):
+            print(
+                f"[WARN] {model['root_name']} fold {model['fold']}: "
+                f"best epoch {model['best_epoch']} has no saved PNG; using nearest checkpoint epoch {model['vis_epoch']}."
+            )
+        if not model["sample_rows"]:
+            print(f"[WARN] {model['sample_csv']}: missing sample metrics; prediction column may be N/A.")
 
     render_rows: List[Dict[str, object]] = []
     for row in selected_rows:
         sample_name = str(row["sample_name"])
         batch_idx = int(row["batch"])
-        image_path = checkpoint_image_path(str(model1["model_dir"]), model1["vis_epoch"], "image", batch_idx)
-        gt_path = checkpoint_image_path(str(model1["model_dir"]), model1["vis_epoch"], "mask", batch_idx)
-        model1_pred_path = checkpoint_image_path(str(model1["model_dir"]), model1["vis_epoch"], "pred", batch_idx)
+        image_path = checkpoint_image_path(str(reference_model["model_dir"]), reference_model["vis_epoch"], "image", batch_idx)
+        gt_path = checkpoint_image_path(str(reference_model["model_dir"]), reference_model["vis_epoch"], "mask", batch_idx)
 
-        model2_row = None
-        model2_pred_path = None
-        model2_dice = float("nan")
-        model2_name = ""
-        model2_fold = ""
-        model2_best_epoch = ""
-        model2_vis_epoch = ""
-        model2_vis_epoch_exact = ""
+        render_row: Dict[str, object] = {
+            "sample_rank": int(row["sample_rank"]),
+            "sample_group": str(row["sample_group"]),
+            "sample_name": sample_name,
+            "reference_dice": float(row["dice"]),
+            "reference_jac": float(row["jac"]),
+            "reference_cldice": float(row["cldice"]),
+            "image_path": image_path or "",
+            "gt_path": gt_path or "",
+        }
 
-        if model2 is not None and model2["vis_epoch"] is not None and model2["sample_rows"]:
-            model2_row = find_sample_row(model2["sample_rows"], int(model2["best_epoch"]), sample_name)
-            model2_name = str(model2["root_name"])
-            model2_fold = int(model2["fold"])
-            model2_best_epoch = int(model2["best_epoch"])
-            model2_vis_epoch = int(model2["vis_epoch"])
-            model2_vis_epoch_exact = bool(model2["vis_epoch_exact"])
-            if model2_row is not None:
-                model2_dice = float(model2_row["dice"])
-                model2_pred_path = checkpoint_image_path(
-                    str(model2["model_dir"]),
-                    model2["vis_epoch"],
-                    "pred",
-                    int(model2_row["batch"]),
-                )
+        for idx, model in enumerate(models, start=1):
+            model_row = None
+            model_pred_path = None
+            model_dice = float("nan")
+            model_vis_epoch = ""
+            if model["vis_epoch"] is not None:
+                model_vis_epoch = int(model["vis_epoch"])
 
-        render_rows.append(
-            {
-                "sample_rank": int(row["sample_rank"]),
-                "sample_group": str(row["sample_group"]),
-                "sample_name": sample_name,
-                "reference_dice": float(row["dice"]),
-                "reference_jac": float(row["jac"]),
-                "reference_cldice": float(row["cldice"]),
-                "image_path": image_path or "",
-                "gt_path": gt_path or "",
-                "model1_name": str(model1["root_name"]),
-                "model1_fold": int(model1["fold"]),
-                "model1_best_epoch": int(model1["best_epoch"]),
-                "model1_vis_epoch": int(model1["vis_epoch"]),
-                "model1_vis_epoch_exact": bool(model1["vis_epoch_exact"]),
-                "model1_dice": float(row["dice"]),
-                "model1_pred_path": model1_pred_path or "",
-                "model2_name": model2_name,
-                "model2_fold": model2_fold,
-                "model2_best_epoch": model2_best_epoch,
-                "model2_vis_epoch": model2_vis_epoch,
-                "model2_vis_epoch_exact": model2_vis_epoch_exact,
-                "model2_dice": model2_dice,
-                "model2_pred_path": model2_pred_path or "",
-            }
-        )
+            if model["vis_epoch"] is not None and model["sample_rows"]:
+                model_row = find_sample_row(model["sample_rows"], int(model["best_epoch"]), sample_name)
+                if model_row is not None:
+                    model_dice = float(model_row["dice"])
+                    model_pred_path = checkpoint_image_path(
+                        str(model["model_dir"]),
+                        model["vis_epoch"],
+                        "pred",
+                        int(model_row["batch"]),
+                    )
+
+            render_row[f"model{idx}_name"] = str(model["root_name"])
+            render_row[f"model{idx}_config"] = format_model_config_summary(model)
+            render_row[f"model{idx}_experiment"] = str(model["experiment"])
+            render_row[f"model{idx}_conn_num"] = model["conn_num"]
+            render_row[f"model{idx}_loss"] = str(model["loss"])
+            render_row[f"model{idx}_folds"] = model["config_folds"]
+            render_row[f"model{idx}_fold"] = int(model["fold"])
+            render_row[f"model{idx}_best_epoch"] = int(model["best_epoch"])
+            render_row[f"model{idx}_vis_epoch"] = model_vis_epoch
+            render_row[f"model{idx}_vis_epoch_exact"] = bool(model["vis_epoch_exact"])
+            render_row[f"model{idx}_dice"] = model_dice
+            render_row[f"model{idx}_pred_path"] = model_pred_path or ""
+
+        render_rows.append(render_row)
 
     vis_csv_out = os.path.join(output_dir, f"{output_stem}_sample_visualization.csv")
-    vis_png_out = os.path.join(output_dir, f"{output_stem}_sample_visualization.png")
-    write_sample_visualization_csv(vis_csv_out, render_rows)
+    vis_png_out = os.path.join(image_output_dir, f"{output_stem}_sample_visualization.png")
+    write_sample_visualization_csv(vis_csv_out, render_rows, len(models))
 
     fig, axes = plt.subplots(
         nrows=len(render_rows),
-        ncols=4,
-        figsize=(16, max(4, len(render_rows) * 4)),
+        ncols=2 + len(models),
+        figsize=(max(14, (2 + len(models)) * 3.7), max(4, len(render_rows) * 4)),
         squeeze=False,
     )
 
-    model1_title = "Model 1"
-    model2_title = "Model 2"
+    model_titles = [format_model_config_summary(model, multiline=True) for model in models]
     figure_title = (
-        f"Reference: {model1['root_name']} / fold {model1['fold']} / best epoch {model1['best_epoch']} "
-        f"(viz epoch {model1['vis_epoch']})"
+        f"Reference: {format_model_config_summary(reference_model)} / fold {reference_model['fold']} "
+        f"/ best epoch {reference_model['best_epoch']} (viz epoch {reference_model['vis_epoch']})"
     )
-    if model2 is not None:
-        figure_title += (
-            f"\nCompare: {model2['root_name']} / fold {model2['fold']} / best epoch {model2['best_epoch']}"
-            f" (viz epoch {model2['vis_epoch']})"
-        )
+    if len(models) > 1:
+        figure_title += f"\nCompared Models: {len(models)}"
 
     for row_idx, row in enumerate(render_rows):
         row_label = (
@@ -654,8 +949,13 @@ def maybe_write_sample_visualization(
             row_label=row_label,
         )
         render_panel(axes[row_idx][1], row["gt_path"] or None, "GT", panel_kind="mask")
-        render_panel(axes[row_idx][2], row["model1_pred_path"] or None, model1_title, panel_kind="pred")
-        render_panel(axes[row_idx][3], row["model2_pred_path"] or None, model2_title, panel_kind="pred")
+        for model_idx, title in enumerate(model_titles, start=1):
+            render_panel(
+                axes[row_idx][model_idx + 1],
+                row.get(f"model{model_idx}_pred_path") or None,
+                title,
+                panel_kind="pred",
+            )
 
     fig.suptitle(figure_title, fontsize=12)
     plt.tight_layout(rect=(0.03, 0.03, 1.0, 0.93))
@@ -666,11 +966,21 @@ def maybe_write_sample_visualization(
     print(f"[SAMPLE_VIS] PNG: {vis_png_out}")
 
 
-def write_summary_csv(path: str, fold_rows: List[Dict[str, float]], mean_row: Dict[str, float], std_row: Dict[str, float]) -> None:
+def write_summary_csv(path: str, fold_rows: List[Dict[str, object]], mean_row: Dict[str, object], std_row: Dict[str, object]) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["fold", "best_epoch", "best_dice",
-                        "best_jac", "best_cldice"])
+        writer.writerow(
+            [
+                "fold",
+                "best_epoch",
+                "best_dice",
+                "best_jac",
+                "best_cldice",
+                "best_betti_error_0",
+                "best_betti_error_1",
+                "train_elapsed_hms",
+            ]
+        )
         for row in fold_rows:
             writer.writerow(
                 [
@@ -681,6 +991,11 @@ def write_summary_csv(path: str, fold_rows: List[Dict[str, float]], mean_row: Di
                         row["best_jac"]) else "nan",
                     f'{row["best_cldice"]:.4f}' if not math.isnan(
                         row["best_cldice"]) else "nan",
+                    f'{row["best_betti_error_0"]:.4f}' if not math.isnan(
+                        row["best_betti_error_0"]) else "nan",
+                    f'{row["best_betti_error_1"]:.4f}' if not math.isnan(
+                        row["best_betti_error_1"]) else "nan",
+                    _fmt_duration_csv(row.get("train_elapsed_hms", "")),
                 ]
             )
         writer.writerow(
@@ -692,6 +1007,11 @@ def write_summary_csv(path: str, fold_rows: List[Dict[str, float]], mean_row: Di
                     mean_row["best_jac"]) else "nan",
                 f'{mean_row["best_cldice"]:.4f}' if not math.isnan(
                     mean_row["best_cldice"]) else "nan",
+                f'{mean_row["best_betti_error_0"]:.4f}' if not math.isnan(
+                    mean_row["best_betti_error_0"]) else "nan",
+                f'{mean_row["best_betti_error_1"]:.4f}' if not math.isnan(
+                    mean_row["best_betti_error_1"]) else "nan",
+                _fmt_duration_csv(mean_row.get("train_elapsed_hms", "")),
             ]
         )
         writer.writerow(
@@ -703,6 +1023,11 @@ def write_summary_csv(path: str, fold_rows: List[Dict[str, float]], mean_row: Di
                     std_row["best_jac"]) else "nan",
                 f'{std_row["best_cldice"]:.4f}' if not math.isnan(
                     std_row["best_cldice"]) else "nan",
+                f'{std_row["best_betti_error_0"]:.4f}' if not math.isnan(
+                    std_row["best_betti_error_0"]) else "nan",
+                f'{std_row["best_betti_error_1"]:.4f}' if not math.isnan(
+                    std_row["best_betti_error_1"]) else "nan",
+                _fmt_duration_csv(std_row.get("train_elapsed_hms", "")),
             ]
         )
 
@@ -713,20 +1038,22 @@ def _fmt_float(value: float) -> str:
     return f"{value:.4f}"
 
 
-def infer_loss_label(experiment: str) -> str:
+def infer_loss_tag_from_legacy_name(experiment: str) -> str:
     name = experiment.lower()
     if "_gjml_sf_l1" in name:
-        return "GJML+SF-L1"
+        return "gjml_sf_l1"
     if "_gjml_sj_l1" in name:
-        return "GJML+SJ-L1"
+        return "gjml_sj_l1"
+    if "_smooth_l1" in name:
+        return "smooth_l1"
     if "dist" in name:
-        return "Smooth-L1"
+        return "smooth_l1"
     if "binary" in name:
-        return "BCE"
-    return "Unknown"
+        return "bce"
+    return "unknown"
 
 
-def _rank_row_indices(rows: List[Dict[str, object]], key: str) -> Tuple[Set[int], Set[int]]:
+def _rank_row_indices(rows: List[Dict[str, object]], key: str, higher_is_better: bool = True) -> Tuple[Set[int], Set[int]]:
     indexed_values: List[Tuple[int, float]] = []
     for idx, row in enumerate(rows):
         value = row.get(key)
@@ -740,9 +1067,9 @@ def _rank_row_indices(rows: List[Dict[str, object]], key: str) -> Tuple[Set[int]
     if not indexed_values:
         return set(), set()
 
-    unique_desc = sorted({value for _, value in indexed_values}, reverse=True)
-    best_value = unique_desc[0]
-    second_value = unique_desc[1] if len(unique_desc) > 1 else None
+    ranked_values = sorted({value for _, value in indexed_values}, reverse=higher_is_better)
+    best_value = ranked_values[0]
+    second_value = ranked_values[1] if len(ranked_values) > 1 else None
 
     best_indices = {idx for idx, value in indexed_values if value == best_value}
     second_indices = (
@@ -768,25 +1095,38 @@ def natural_sort_key(text: str) -> Tuple[object, ...]:
     return tuple(int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text))
 
 
-def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
-    raw = root_name
-    lowered = raw.lower()
-    loss = infer_loss_label(lowered)
+def sanitize_scope_name_for_filename(scope_name: str) -> str:
+    sanitized = scope_name.strip().replace(os.sep, "_")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", sanitized).strip("_")
+    return sanitized if sanitized else "unknown_scope"
 
-    # Keep experiment name clean by removing known loss suffix tags first.
-    for suffix in ("_gjml_sf_l1", "_gjml_sj_l1"):
-        if lowered.endswith(suffix):
-            raw = raw[: -len(suffix)]
-            lowered = raw.lower()
+
+def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
+    tokens = root_name.split("_")
+    loss = "unknown"
+
+    loss_suffixes = [
+        (["gjml", "sf", "l1"], "gjml_sf_l1"),
+        (["gjml", "sj", "l1"], "gjml_sj_l1"),
+        (["smooth", "l1"], "smooth_l1"),
+        (["bce"], "bce"),
+    ]
+    for suffix_tokens, loss_name in loss_suffixes:
+        if tokens[-len(suffix_tokens):] == suffix_tokens:
+            tokens = tokens[:-len(suffix_tokens)]
+            loss = loss_name
             break
 
     conn_num: object = "NA"
-    match = re.search(r"_(\d+)$", raw)
-    if match is not None:
-        conn_num = int(match.group(1))
-        experiment = raw[:match.start()]
-    else:
-        experiment = raw
+    if tokens and tokens[-1].isdigit():
+        conn_num = int(tokens[-1])
+        tokens = tokens[:-1]
+
+    experiment = "_".join(tokens) if tokens else root_name
+    if loss == "unknown":
+        loss = infer_loss_tag_from_legacy_name(root_name)
+    if experiment == "binary":
+        loss = "bce"
 
     return {
         "experiment": experiment,
@@ -799,7 +1139,7 @@ def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
     experiment = str(row["experiment"])
     exp_order = {
         "binary": 0,
-        "dist_signed": 1,
+        "dist": 1,
         "dist_inverted": 2,
     }.get(experiment, 9)
 
@@ -808,14 +1148,26 @@ def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
 
     loss = str(row.get("loss", "Unknown"))
     loss_order = {
-        "BCE": 0,
-        "Smooth-L1": 1,
-        "GJML+SF-L1": 2,
-        "GJML+SJ-L1": 2,
-        "Unknown": 9,
+        "bce": 0,
+        "smooth_l1": 1,
+        "gjml_sf_l1": 2,
+        "gjml_sj_l1": 2,
+        "unknown": 9,
     }.get(loss, 9)
 
-    return (exp_order, natural_sort_key(experiment), conn_sort, loss_order, loss.lower())
+    fold_scope = str(row.get("fold_scope", "direct"))
+    fold_scope_count = row.get("fold_scope_count", "NA")
+    fold_scope_sort = int(fold_scope_count) if isinstance(fold_scope_count, int) else 10 ** 9
+
+    return (
+        exp_order,
+        natural_sort_key(experiment),
+        conn_sort,
+        loss_order,
+        loss.lower(),
+        fold_scope_sort,
+        fold_scope.lower(),
+    )
 
 
 def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
@@ -830,6 +1182,9 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
                 "best_dice_mean",
                 "best_jac_mean",
                 "best_cldice_mean",
+                "best_betti_error_0_mean",
+                "best_betti_error_1_mean",
+                "train_elapsed_mean_hms",
             ]
         )
         for row in rows:
@@ -842,23 +1197,26 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
                     _fmt_float(row["best_dice"]),
                     _fmt_float(row["best_jac"]),
                     _fmt_float(row["best_cldice"]),
+                    _fmt_float(row["best_betti_error_0"]),
+                    _fmt_float(row["best_betti_error_1"]),
+                    _fmt_duration_csv(row.get("train_elapsed_hms", "")),
                 ]
             )
 
 
-def write_latex(path: str, title: str, fold_rows: List[Dict[str, float]], mean_row: Dict[str, float], std_row: Dict[str, float]) -> None:
+def write_latex(path: str, title: str, fold_rows: List[Dict[str, object]], mean_row: Dict[str, object], std_row: Dict[str, object]) -> None:
     lines = [
         r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in]{geometry}",
+        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
         rf"\section*{{{title}}}",
         r"\begin{table}[H]",
         r"\centering",
-        r"\begin{tabular}{lcccc}",
+        r"\begin{tabular}{lccccccc}",
         r"\toprule",
-        r"Fold & Best Epoch & Dice & Jac & clDice \\",
+        r"Fold & Best Epoch & Dice & Jac & clDice & Betti Err (0) & Betti Err (1) & Train Time \\",
         r"\midrule",
     ]
 
@@ -867,8 +1225,13 @@ def write_latex(path: str, title: str, fold_rows: List[Dict[str, float]], mean_r
             row["best_jac"]) else "nan"
         cld_txt = f'{row["best_cldice"]:.4f}' if not math.isnan(
             row["best_cldice"]) else "nan"
+        betti_0_txt = f'{row["best_betti_error_0"]:.4f}' if not math.isnan(
+            row["best_betti_error_0"]) else "nan"
+        betti_1_txt = f'{row["best_betti_error_1"]:.4f}' if not math.isnan(
+            row["best_betti_error_1"]) else "nan"
+        time_txt = _fmt_duration_latex(row.get("train_elapsed_hms", ""))
         lines.append(
-            f'{int(row["fold"])} & {int(row["best_epoch"])} & {row["best_dice"]:.4f} & {jac_txt} & {cld_txt} \\\\'
+            f'{int(row["fold"])} & {int(row["best_epoch"])} & {row["best_dice"]:.4f} & {jac_txt} & {cld_txt} & {betti_0_txt} & {betti_1_txt} & {time_txt} \\\\'
         )
 
     mean_jac = f'{mean_row["best_jac"]:.4f}' if not math.isnan(
@@ -879,10 +1242,20 @@ def write_latex(path: str, title: str, fold_rows: List[Dict[str, float]], mean_r
         std_row["best_jac"]) else "nan"
     std_cld = f'{std_row["best_cldice"]:.4f}' if not math.isnan(
         std_row["best_cldice"]) else "nan"
+    mean_betti_0 = f'{mean_row["best_betti_error_0"]:.4f}' if not math.isnan(
+        mean_row["best_betti_error_0"]) else "nan"
+    mean_betti_1 = f'{mean_row["best_betti_error_1"]:.4f}' if not math.isnan(
+        mean_row["best_betti_error_1"]) else "nan"
+    std_betti_0 = f'{std_row["best_betti_error_0"]:.4f}' if not math.isnan(
+        std_row["best_betti_error_0"]) else "nan"
+    std_betti_1 = f'{std_row["best_betti_error_1"]:.4f}' if not math.isnan(
+        std_row["best_betti_error_1"]) else "nan"
+    mean_time = _fmt_duration_latex(mean_row.get("train_elapsed_hms", ""))
+    std_time = _fmt_duration_latex(std_row.get("train_elapsed_hms", ""))
     lines += [
         r"\midrule",
-        f'Mean & {mean_row["best_epoch"]:.4f} & {mean_row["best_dice"]:.4f} & {mean_jac} & {mean_cld} \\\\',
-        f'Std & {std_row["best_epoch"]:.4f} & {std_row["best_dice"]:.4f} & {std_jac} & {std_cld} \\\\',
+        f'Mean & {mean_row["best_epoch"]:.4f} & {mean_row["best_dice"]:.4f} & {mean_jac} & {mean_cld} & {mean_betti_0} & {mean_betti_1} & {mean_time} \\\\',
+        f'Std & {std_row["best_epoch"]:.4f} & {std_row["best_dice"]:.4f} & {std_jac} & {std_cld} & {std_betti_0} & {std_betti_1} & {std_time} \\\\',
         r"\bottomrule",
         r"\end{tabular}",
         r"\caption{K-fold final result summary}",
@@ -894,23 +1267,19 @@ def write_latex(path: str, title: str, fold_rows: List[Dict[str, float]], mean_r
         f.write("\n".join(lines) + "\n")
 
 
-def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, object]]) -> None:
+def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, object]], caption: str) -> None:
     dice_best, dice_second = _rank_row_indices(rows, "best_dice")
     jac_best, jac_second = _rank_row_indices(rows, "best_jac")
     cldice_best, cldice_second = _rank_row_indices(rows, "best_cldice")
+    betti0_best, betti0_second = _rank_row_indices(rows, "best_betti_error_0", higher_is_better=False)
+    betti1_best, betti1_second = _rank_row_indices(rows, "best_betti_error_1", higher_is_better=False)
 
-    lines = [
-        r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in]{geometry}",
-        r"\usepackage{booktabs}",
-        r"\usepackage{float}",
-        r"\begin{document}",
-        rf"\section*{{{title}}}",
+    lines += [
         r"\begin{table}[H]",
         r"\centering",
-        r"\begin{tabular}{lcccccc}",
+        r"\begin{tabular}{lccccccccc}",
         r"\toprule",
-        r"Experiment & Conn & Loss & \#Folds & Dice (Mean) & Jac (Mean) & clDice (Mean) \\",
+        r"Experiment & Conn & Loss & \#Folds & Dice & Jac & clDice & Err $(\beta_0)$ & Err $(\beta_1)$ & Train Time \\",
         r"\midrule",
     ]
 
@@ -922,17 +1291,80 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
             idx in cldice_best,
             idx in cldice_second,
         )
+        betti0_txt = _fmt_latex_ranked_value(
+            float(row["best_betti_error_0"]),
+            idx in betti0_best,
+            idx in betti0_second,
+        )
+        betti1_txt = _fmt_latex_ranked_value(
+            float(row["best_betti_error_1"]),
+            idx in betti1_best,
+            idx in betti1_second,
+        )
+        time_txt = _fmt_duration_latex(row.get("train_elapsed_hms", ""))
         lines.append(
             f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
-            f'& {escape_latex_text(str(row["loss"]))} & {int(row["num_folds"])} & {dice_txt} '
-            f'& {jac_txt} & {cldice_txt} \\\\'
+            f'& {escape_latex_text(str(row["loss"]))} '
+            f'& {int(row["num_folds"])} & {dice_txt} & {jac_txt} & {cldice_txt} & {betti0_txt} & {betti1_txt} & {time_txt} \\\\'
         )
 
     lines += [
         r"\bottomrule",
         r"\end{tabular}",
-        r"\caption{Cross-experiment mean summary from k-fold runs}",
+        rf"\caption{{{caption}}}",
         r"\end{table}",
+    ]
+
+
+def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, object]]) -> None:
+    lines = [
+        r"\documentclass[11pt]{article}",
+        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{float}",
+        r"\begin{document}",
+        rf"\section*{{{title}}}",
+    ]
+
+    _append_experiment_mean_table_lines(
+        lines,
+        rows,
+        "Cross-experiment mean summary from k-fold runs",
+    )
+
+    lines += [
+        r"\end{document}",
+    ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_experiment_mean_scope_tables_latex(
+    path: str,
+    title: str,
+    rows_by_scope: Dict[str, List[Dict[str, object]]],
+) -> None:
+    lines = [
+        r"\documentclass[11pt]{article}",
+        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{float}",
+        r"\begin{document}",
+        rf"\section*{{{title}}}",
+    ]
+
+    for scope_name, rows in sorted(rows_by_scope.items(), key=lambda item: natural_sort_key(item[0])):
+        if len(rows) == 0:
+            continue
+        lines.append(rf"\subsection*{{Scope: {escape_latex_text(scope_name)}}}")
+        _append_experiment_mean_table_lines(
+            lines,
+            rows,
+            f"Cross-experiment mean summary ({escape_latex_text(scope_name)})",
+        )
+
+    lines += [
         r"\end{document}",
     ]
 
@@ -959,9 +1391,11 @@ def escape_latex_text(text: str) -> str:
     return escaped
 
 
-def build_pdf(tex_path: str) -> None:
+def build_pdf(tex_path: str, pdf_out_path: Optional[str] = None) -> str:
     out_dir = os.path.dirname(os.path.abspath(tex_path))
     tex_file = os.path.basename(tex_path)
+    tex_stem, _ = os.path.splitext(tex_file)
+    generated_pdf_path = os.path.join(out_dir, f"{tex_stem}.pdf")
     cmd = [
         "pdflatex",
         "-interaction=nonstopmode",
@@ -970,6 +1404,43 @@ def build_pdf(tex_path: str) -> None:
     ]
     subprocess.run(cmd, cwd=out_dir, check=True,
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    target_pdf_path = (
+        os.path.abspath(pdf_out_path)
+        if pdf_out_path is not None
+        else generated_pdf_path
+    )
+    if os.path.abspath(generated_pdf_path) != target_pdf_path:
+        os.makedirs(os.path.dirname(target_pdf_path), exist_ok=True)
+        shutil.move(generated_pdf_path, target_pdf_path)
+    return target_pdf_path
+
+
+def root_display_name(root: str, input_root: str) -> str:
+    rel_path = os.path.relpath(root, input_root)
+    if rel_path == ".":
+        return os.path.basename(os.path.normpath(root))
+    return rel_path
+
+
+def root_output_label(root: str, input_root: str) -> str:
+    return root_display_name(root, input_root).replace(os.sep, "_")
+
+
+def move_non_pdf_files_to_dump(output_dir: str, dump_dir: str) -> None:
+    for entry in os.listdir(output_dir):
+        src_path = os.path.join(output_dir, entry)
+        if not os.path.isfile(src_path):
+            continue
+        if entry.lower().endswith(".pdf") or entry.lower().endswith(".png"):
+            continue
+
+        dst_path = os.path.join(dump_dir, entry)
+        if os.path.exists(dst_path):
+            if os.path.isfile(dst_path):
+                os.remove(dst_path)
+            else:
+                shutil.rmtree(dst_path)
+        shutil.move(src_path, dst_path)
 
 
 def main() -> None:
@@ -979,6 +1450,9 @@ def main() -> None:
         raise ValueError("No folds were provided.")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    dump_dir = os.path.join(args.output_dir, "dump")
+    os.makedirs(dump_dir, exist_ok=True)
+    move_non_pdf_files_to_dump(args.output_dir, dump_dir)
     target_roots = discover_target_roots(args.input_root, requested_folds, args.input_name)
     experiment_mean_rows: List[Dict[str, object]] = []
     root_summaries: List[Dict[str, object]] = []
@@ -986,27 +1460,35 @@ def main() -> None:
     for root in target_roots:
         folds = resolve_folds_for_root(root, requested_folds, args.input_name)
         fold_rows, mean_row, std_row = aggregate_root(root, folds, args.input_name)
-        root_name = os.path.basename(os.path.normpath(root))
+        experiment_root_name = os.path.basename(os.path.normpath(root))
+        display_name = root_display_name(root, args.input_root)
+        scope_name, scope_fold_count = extract_scope_info(root)
         root_summaries.append(
             {
                 "root": root,
-                "root_name": root_name,
+                "root_name": display_name,
                 "folds": folds,
                 "fold_rows": fold_rows,
                 "mean_row": mean_row,
                 "std_row": std_row,
             }
         )
-        exp_meta = parse_experiment_metadata(root_name)
+        exp_meta = parse_experiment_metadata(experiment_root_name)
         experiment_mean_rows.append(
             {
                 "experiment": exp_meta["experiment"],
                 "conn_num": exp_meta["conn_num"],
                 "loss": exp_meta["loss"],
+                "fold_scope": scope_name,
+                "fold_scope_count": scope_fold_count,
                 "num_folds": float(len(folds)),
                 "best_dice": mean_row["best_dice"],
                 "best_jac": mean_row["best_jac"],
                 "best_cldice": mean_row["best_cldice"],
+                "best_betti_error_0": mean_row["best_betti_error_0"],
+                "best_betti_error_1": mean_row["best_betti_error_1"],
+                "train_elapsed_seconds": mean_row["train_elapsed_seconds"],
+                "train_elapsed_hms": mean_row["train_elapsed_hms"],
             }
         )
 
@@ -1014,22 +1496,23 @@ def main() -> None:
             output_stem = args.output_stem
             title = "K-fold Final Metrics"
         else:
-            output_stem = f"{root_name}_{args.output_stem}"
-            title = f"K-fold Final Metrics ({escape_latex_text(root_name)})"
+            output_stem = f"{root_output_label(root, args.input_root)}_{args.output_stem}"
+            title = f"K-fold Final Metrics ({escape_latex_text(display_name)})"
 
-        csv_out = os.path.join(args.output_dir, f"{output_stem}.csv")
-        tex_out = os.path.join(args.output_dir, f"{output_stem}.tex")
+        csv_out = os.path.join(dump_dir, f"{output_stem}.csv")
+        tex_out = os.path.join(dump_dir, f"{output_stem}.tex")
         pdf_out = os.path.join(args.output_dir, f"{output_stem}.pdf")
 
         write_summary_csv(csv_out, fold_rows, mean_row, std_row)
         write_latex(tex_out, title, fold_rows, mean_row, std_row)
-        build_pdf(tex_out)
+        build_pdf(tex_out, pdf_out)
 
         print(f"[{root}] CSV: {csv_out}")
         print(f"[{root}] LaTeX: {tex_out}")
         print(f"[{root}] PDF: {pdf_out}")
 
     maybe_write_sample_visualization(
+        dump_dir,
         args.output_dir,
         args.output_stem,
         root_summaries,
@@ -1042,21 +1525,55 @@ def main() -> None:
             key=experiment_sort_key,
         )
         agg_stem = f"{args.output_stem}_experiment_means"
-        agg_csv_out = os.path.join(args.output_dir, f"{agg_stem}.csv")
-        agg_tex_out = os.path.join(args.output_dir, f"{agg_stem}.tex")
+        agg_csv_out = os.path.join(dump_dir, f"{agg_stem}.csv")
+        agg_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}.csv")
+        agg_tex_out = os.path.join(dump_dir, f"{agg_stem}.tex")
         agg_pdf_out = os.path.join(args.output_dir, f"{agg_stem}.pdf")
 
         write_experiment_mean_csv(agg_csv_out, experiment_mean_rows)
+        write_experiment_mean_csv(agg_csv_summary_out, experiment_mean_rows)
         write_experiment_mean_latex(
             agg_tex_out,
             "Cross-experiment Mean Summary",
             experiment_mean_rows,
         )
-        build_pdf(agg_tex_out)
+        build_pdf(agg_tex_out, agg_pdf_out)
 
         print(f"[ALL] CSV: {agg_csv_out}")
+        print(f"[ALL] CSV (summary): {agg_csv_summary_out}")
         print(f"[ALL] LaTeX: {agg_tex_out}")
         print(f"[ALL] PDF: {agg_pdf_out}")
+
+        rows_by_scope: Dict[str, List[Dict[str, object]]] = {}
+        for row in experiment_mean_rows:
+            scope_name = str(row.get("fold_scope", "direct"))
+            rows_by_scope.setdefault(scope_name, []).append(row)
+
+        for scope_name, scope_rows in sorted(
+            rows_by_scope.items(),
+            key=lambda item: natural_sort_key(item[0]),
+        ):
+            scope_suffix = sanitize_scope_name_for_filename(scope_name)
+            scope_csv_out = os.path.join(dump_dir, f"{agg_stem}_{scope_suffix}.csv")
+            scope_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}_{scope_suffix}.csv")
+            write_experiment_mean_csv(scope_csv_out, scope_rows)
+            write_experiment_mean_csv(scope_csv_summary_out, scope_rows)
+            print(f"[ALL:{scope_name}] CSV: {scope_csv_out}")
+            print(f"[ALL:{scope_name}] CSV (summary): {scope_csv_summary_out}")
+
+        if len(rows_by_scope) > 1:
+            scoped_tex_out = os.path.join(dump_dir, f"{agg_stem}_scopes.tex")
+            scoped_pdf_out = os.path.join(args.output_dir, f"{agg_stem}_scopes.pdf")
+
+            write_experiment_mean_scope_tables_latex(
+                scoped_tex_out,
+                "Cross-experiment Mean Summary by Scope",
+                rows_by_scope,
+            )
+            build_pdf(scoped_tex_out, scoped_pdf_out)
+
+            print(f"[ALL:SCOPES] LaTeX: {scoped_tex_out}")
+            print(f"[ALL:SCOPES] PDF: {scoped_pdf_out}")
 
 
 if __name__ == "__main__":

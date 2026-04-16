@@ -1,5 +1,457 @@
 # Testing Notes
 
+## Updated on 2026-04-16 (launcher all-exit Telegram alert path)
+
+- Validation target:
+  - verify CHASE/ISIC training launchers remain syntactically valid after introducing `EXIT`-trap notifier logic
+- Executed checks:
+  - `bash -n scripts/chasedb1_train.sh scripts/isic2018_train.sh` passed
+- Notes:
+  - notifier now runs on shell exit for both success and failure paths; this validation only covers shell syntax
+
+## Updated on 2026-04-16 (`multi_train.sh` 1-fold 10-epoch full-combination smoke)
+
+- Validation target:
+  - verify every experiment combination in `scripts/multi_train.sh` completes under the current `1fold` policy
+  - verify the batch launcher no longer depends on `5folds`
+  - verify CHASE training still runs after restoring the held-out split as `validset`
+- Executed checks:
+  - `bash -n scripts/multi_train.sh scripts/chasedb1_train.sh` passed
+  - `.venv/bin/python -m py_compile train.py solver.py` passed
+  - `MULTI_TRAIN_EPOCHS=10 PYTHONUNBUFFERED=1 MPLBACKEND=Agg bash scripts/multi_train.sh --output_dir output_multi_smoke_1fold_10epoch --save-per-epochs 10` passed
+- Verified output:
+  - run log:
+    - `output_multi_smoke_1fold_10epoch/run.log`
+  - successful completion count:
+    - `FINISH.` lines in log: `10`
+    - `val_results_1.csv` files under `output_multi_smoke_1fold_10epoch/1fold/*/`: `10`
+  - completed experiment roots:
+    - `binary_8_bce`
+    - `binary_24_bce`
+    - `dist_signed_8_gjml_sf_l1`
+    - `dist_signed_8_smooth_l1`
+    - `dist_inverted_8_gjml_sf_l1`
+    - `dist_inverted_8_smooth_l1`
+    - `dist_signed_24_gjml_sf_l1`
+    - `dist_signed_24_smooth_l1`
+    - `dist_inverted_24_gjml_sf_l1`
+    - `dist_inverted_24_smooth_l1`
+  - per-combination final validation summaries (`val_results_1.csv`) include:
+    - `binary_24_bce`: `dice=0.675209`, `jac=0.510123`
+    - `binary_8_bce`: `dice=0.674290`, `jac=0.509033`
+    - `dist_inverted_24_gjml_sf_l1`: `dice=0.715970`, `jac=0.558031`
+    - `dist_inverted_24_smooth_l1`: `dice=0.690617`, `jac=0.527915`
+    - `dist_inverted_8_gjml_sf_l1`: `dice=0.713433`, `jac=0.554967`
+    - `dist_inverted_8_smooth_l1`: `dice=0.709243`, `jac=0.549838`
+    - `dist_signed_24_gjml_sf_l1`: `dice=0.708597`, `jac=0.549128`
+    - `dist_signed_24_smooth_l1`: `dice=0.684347`, `jac=0.520496`
+    - `dist_signed_8_gjml_sf_l1`: `dice=0.665237`, `jac=0.498813`
+    - `dist_signed_8_smooth_l1`: `dice=0.695516`, `jac=0.533546`
+- Notes:
+  - the earlier `5fold` sweep attempt was intentionally abandoned after the project direction changed to `1fold`
+  - CHASE still emits existing `clDice` runtime warnings in some validation batches; the smoke run itself completed successfully
+
+## Updated on 2026-04-16 (ISIC validation-vs-test split behavior check)
+
+- Validation target:
+  - verify ISIC training epochs evaluate on the validation split, not the held-out test split
+  - verify the held-out ISIC test split is evaluated only after training finishes
+  - verify final held-out evaluation reloads `best_model.pth`
+- Executed checks:
+  - `.venv/bin/python -m py_compile solver.py train.py` passed
+  - `PYTHONUNBUFFERED=1 MPLBACKEND=Agg bash scripts/isic2018_train.sh --epochs 1 --save-per-epochs 1 --output_dir output_script_smoke_isic_eval_split_check` passed
+- Verified runtime behavior:
+  - log printed:
+    - `RUN VALIDATION ON validation split.`
+  - after epoch validation finished, log printed:
+    - `LOAD BEST MODEL FOR FINAL TEST EVAL: .../best_model.pth`
+    - `RUN FINAL TEST EVAL AFTER TRAINING.`
+- Verified output:
+  - validation epoch history remained in:
+    - `output_script_smoke_isic_eval_split_check/1fold/binary_8_bce/results_1.csv`
+  - final held-out test summary was written separately:
+    - `output_script_smoke_isic_eval_split_check/1fold/binary_8_bce/test_results_1.csv`
+  - split-specific sample metrics were separated:
+    - `.../models/1/val_sample_metrics.csv`
+    - `.../models/1/test_sample_metrics.csv`
+  - observed metric separation:
+    - validation best row in `results_1.csv`: `dice=0.817109`, `jac=0.714064`
+    - held-out final test row in `test_results_1.csv`: `checkpoint=best_model.pth`, `dice=0.803035`, `jac=0.695233`
+- Notes:
+  - this confirms ISIC `folds=1` now follows the intended protocol:
+    - validation split for epoch-by-epoch model selection
+    - held-out test split only after training completes
+
+## Updated on 2026-04-15 (CHASE/ISIC launcher smoke + ISIC one-time prep decoupling)
+
+- Validation target:
+  - verify `scripts/chasedb1_train.sh` still completes a minimal training smoke
+  - verify `scripts/isic2018_train.sh` runs without invoking dataset conversion during training
+  - verify `scripts/prepare_isic2018_npy.py` behaves as a standalone one-time prep utility
+- Executed checks:
+  - `bash -n scripts/chasedb1_train.sh scripts/isic2018_train.sh` passed
+  - `.venv/bin/python -m py_compile scripts/prepare_isic2018_npy.py train.py data_loader/GetDataset_ISIC2018.py` passed
+  - `MPLBACKEND=Agg bash scripts/chasedb1_train.sh --epochs 1 --target_fold 1 --batch-size 2 --save-per-epochs 1 --output_dir output_script_smoke_chase` passed
+  - `.venv/bin/python scripts/prepare_isic2018_npy.py --migrate-from-root data/ISIC2018 --raw-root data/ISIC2018_img --output-root data/ISIC2018 --height 224 --width 320` passed
+    - observed runtime: about `0.8s`
+    - observed summary: `converted=0, skipped=3694`
+  - `PYTHONUNBUFFERED=1 MPLBACKEND=Agg bash scripts/isic2018_train.sh --epochs 1 --save-per-epochs 1 --output_dir output_script_smoke_isic_no_prepare` passed
+- Verified output:
+  - CHASE smoke wrote:
+    - `output_script_smoke_chase/5folds/binary_8_bce/results_1.csv`
+    - `output_script_smoke_chase/5folds/binary_8_bce/models/1/best_model_meta.txt`
+  - ISIC standalone prep no longer rebuilt existing flat artifacts during the validation run
+  - ISIC smoke wrote:
+    - `output_script_smoke_isic_no_prepare/1fold/binary_8_bce/results_1.csv`
+    - `output_script_smoke_isic_no_prepare/1fold/binary_8_bce/models/1/{1_model.pth,best_model.pth,best_model_meta.txt}`
+  - ISIC smoke `results_1.csv` epoch row recorded:
+    - `train_loss=2.918797`
+    - `val_loss=2.811608`
+    - `dice=0.737385`
+    - `elapsed_hms=00:00:24`
+- Notes:
+  - ISIC validation/test still emits existing `clDice` runtime warnings in empty-skeleton cases; the launcher change did not modify metric behavior
+
+## Updated on 2026-04-15 (ISIC2018 raw-image migration + `.npy` preparation check)
+
+- Validation target:
+  - verify raw `data/ISIC2018` can be migrated to `data/ISIC2018_img`
+  - verify resized `.npy` artifacts are created under `data/ISIC2018/{image,label}`
+  - verify `folder0` lists still resolve correctly against the rebuilt flat `.npy` dataset
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/prepare_isic2018_npy.py train.py data_loader/GetDataset_ISIC2018.py` passed
+  - `bash -n scripts/isic2018_train.sh` passed
+  - `.venv/bin/python scripts/prepare_isic2018_npy.py --migrate-from-root data/ISIC2018 --raw-root data/ISIC2018_img --output-root data/ISIC2018 --height 224 --width 320` passed
+  - `.venv/bin/python - <<'PY' ... load`ISIC2018_dataset(..., folder=0, train/validation/test)`and check counts/shapes ... PY` passed
+- Verified output:
+  - raw tree exists at `data/ISIC2018_img/{train,val,test}/{images,labels}`
+  - rebuilt flat dataset exists at `data/ISIC2018/image` and `data/ISIC2018/label`
+  - `folder0` lengths remain `2594 / 100 / 1000`
+  - rebuilt `.npy` sample shapes match `(224, 320, 3)` for images and `(224, 320)` for masks
+
+## Updated on 2026-04-15 (`solver.py`, `aggregate_kfold_results.py` elapsed-time reporting smoke)
+
+- Validation target:
+  - verify raw training result CSVs accept the new `elapsed_hms` epoch column
+  - verify `aggregate_kfold_results.py` reads both new and legacy result CSV formats
+  - verify fold summary / experiment mean outputs expose train-time columns without breaking existing aggregation
+- Executed checks:
+  - `.venv/bin/python -m py_compile solver.py scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python - <<'PY' ... Solver.create_exp_directory(...) + _write_epoch_result_row(...) ... PY` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root <tmp fixture root> --output-dir <tmp fixture out> --sample-vis-count 0` passed
+    - fixture mix:
+      - new format `results_<fold>.csv` with `elapsed_hms`
+      - legacy format `results_<fold>.csv` without `elapsed_hms`
+  - `MPLBACKEND=Agg .venv/bin/python train.py --dataset chase --data_root data/chase --resize 960 960 --num-class 1 --batch-size 2 --epochs 1 --lr 0.0038 --lr-update poly --folds 1 --conn_num 8 --label_mode binary --output_dir output_chase_time_smoke --save-per-epochs 1` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output_chase_time_smoke --output-dir output_chase_time_smoke/summary --sample-vis-count 0` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output --output-dir output/summary_time_check --sample-vis-count 0` passed
+- Verified output:
+  - raw solver smoke wrote header:
+    - `epoch,train_loss,val_loss,dice,Jac,clDice,betti_error_0,betti_error_1,elapsed_hms`
+  - raw solver smoke wrote epoch row ending with:
+    - `00:01:23`
+  - fixture aggregation outputs:
+    - per-root summary CSV header includes `train_elapsed_hms`
+    - experiment mean CSV header includes `train_elapsed_mean_hms`
+    - new-format mean duration example rendered as `00:03:15`
+    - legacy-format duration remains blank in CSV and `N/A` in TeX
+  - CHASE 1-epoch smoke wrote:
+    - `output_chase_time_smoke/1fold/binary_8_bce/results_1.csv`
+    - epoch row with `elapsed_hms=00:00:06`
+    - summary tail row `001,0.000000`
+    - `models/1/best_model_meta.txt` with `best_epoch=1`
+  - CHASE smoke summary wrote:
+    - `output_chase_time_smoke/summary/dump/kfold_summary.csv`
+    - header includes `train_elapsed_hms`
+    - row includes `best_epoch=1` and `train_elapsed_hms=00:00:06`
+    - companion TeX includes `Train Time` column with `00:00:06`
+  - real-output aggregation on existing repository outputs completed successfully with empty train-time cells for legacy runs
+- Notes:
+  - attempted ISIC 1-epoch smoke first, but current flat `.npy` dataset was incomplete relative to `folder0` split lists; switched to CHASE for end-to-end runtime verification.
+
+## Updated on 2026-04-15 (`folder0` official ISIC2018 split-list generation check)
+
+- Validation target:
+  - verify `data_loader/isic_datalist/folder0` matches official raw `data/ISIC2018/{train,val,test}` split boundaries
+- Executed checks:
+  - `.venv/bin/python - <<'PY' ... compare`folder0_{train,validation,test}.list`stems against raw split image stems ... PY` passed
+  - `.venv/bin/python - <<'PY' ... compare raw image stems vs label stems for`train/val/test`... PY` passed
+- Verified output:
+  - `folder0_train.list`: `2594` entries, exact stem match with `data/ISIC2018/train/images`
+  - `folder0_validation.list`: `100` entries, exact stem match with `data/ISIC2018/val/images`
+  - `folder0_test.list`: `1000` entries, exact stem match with `data/ISIC2018/test/images`
+  - raw image/label stem sets matched for all three splits before list generation
+
+## Updated on 2026-04-15 (`notebooks/result.ipynb` experiment-comparison update smoke)
+
+- Validation target:
+  - verify fold-comparison removal and new experiment-comparison section execute correctly
+  - verify notebook runs using scope-split summary CSV inputs
+- Executed checks:
+  - `MPLBACKEND=Agg .venv/bin/python - <<'PY' ... execute all code cells in notebooks/result.ipynb ... PY` passed
+- Verified output:
+  - notebook loaded:
+    - `output/summary/kfold_summary_experiment_means_5folds.csv` (`6` rows)
+  - figures saved:
+    - `output/summary/analysis_figures/abs_performance_by_config.png`
+    - `output/summary/analysis_figures/experiment_comparison_mean_vs_best.png`
+    - `output/summary/analysis_figures/delta_conn_24_minus_8.png`
+    - `output/summary/analysis_figures/delta_loss_gjml_minus_smooth.png`
+  - summary printout includes experiment mean ranking and no fold-delta summary
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` scope-split experiment-means CSV smoke)
+
+- Validation target:
+  - verify `1fold` and `5folds` cross-experiment mean CSV files are emitted separately
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output --output-dir output/summary --sample-vis-count 0` passed
+- Verified output:
+  - `output/summary/kfold_summary_experiment_means_1fold.csv` exists
+  - `output/summary/kfold_summary_experiment_means_5folds.csv` exists
+  - `output/summary/dump/` also contains both scope-split CSV files
+
+## Updated on 2026-04-15 (`notebooks/result.ipynb` analysis notebook smoke execution)
+
+- Validation target:
+  - verify newly created notebook code cells execute end-to-end
+  - verify requested setting-change visualizations are generated from summary CSV
+- Executed checks:
+  - `MPLBACKEND=Agg .venv/bin/python - <<'PY' ... execute all code cells in notebooks/result.ipynb ... PY` passed
+- Verified output:
+  - notebook load message:
+    - `Loaded output/summary/kfold_summary_experiment_means.csv with 16 rows`
+  - figures saved:
+    - `output/summary/analysis_figures/abs_performance_by_config.png`
+    - `output/summary/analysis_figures/delta_fold_5_minus_1.png`
+    - `output/summary/analysis_figures/delta_conn_24_minus_8.png`
+    - `output/summary/analysis_figures/delta_loss_gjml_minus_smooth.png`
+  - summary printout includes:
+    - best-setting rows for Dice/Jac/clDice
+    - mean delta overview for fold/conn/loss changes
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` summary-root experiment-means CSV smoke)
+
+- Validation target:
+  - verify cross-experiment mean CSV is emitted to `output/summary/` in addition to `dump/`
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output --output-dir output/summary --sample-vis-count 0` passed
+  - `cmp -s output/summary/kfold_summary_experiment_means.csv output/summary/dump/kfold_summary_experiment_means.csv` returned `0`
+- Verified output:
+  - `output/summary/kfold_summary_experiment_means.csv` exists
+  - file contents are identical to `output/summary/dump/kfold_summary_experiment_means.csv`
+
+## Updated on 2026-04-15 (conn_num=24 5x5 normalization + dist-mode support)
+
+- Validation target:
+  - verify global 5x5 contract is now 24 directional channels with center excluded
+  - verify distance label modes run with `conn_num=24`
+  - verify 24-channel first 8 offsets stay aligned with canonical 8-neighbor voting order
+- Executed checks:
+  - `.venv/bin/python -m py_compile connect_loss.py solver.py train.py scripts/rebuild_dist_signed_artifacts.py` passed
+  - `.venv/bin/python -m pytest -q tests/test_conn24_support.py` passed
+  - `.venv/bin/python -m pytest -q tests/test_dist_aux_loss_selection.py` passed
+  - `bash -n scripts/chasedb1_train.sh scripts/chasedb1_test_best.sh scripts/multi_train.sh` passed
+  - `.venv/bin/python - <<'PY' ... Solver.apply_connectivity_voting(conn_num=24) ... PY` passed
+- targeted smoke script confirmed:
+  - `shift_n_directions(..., 24)` returns 24 channels
+  - `distance_affinity_matrix(..., conn_num=24, ...)` shape is `(B, 24, H, W)`
+  - `connect_loss(..., label_mode='binary', conn_num=24)` forward passes
+  - `connect_loss(..., label_mode='dist_signed', conn_num=24)` forward passes
+  - `Solver.apply_connectivity_voting(...)` uses `Bilateral_voting_kxk(..., conn_num=5)` for 24-channel maps
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` all-model sample visualization smoke)
+
+- Validation target:
+  - verify sample visualization PNG renders all models in one figure
+  - verify sample visualization CSV includes dynamic `model1..modelN` columns
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_all_models_vis_check --sample-vis-count 1` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_all_models_vis_check2 --sample-vis-count 1` passed
+- Verified output:
+  - `output/summary_all_models_vis_check/kfold_summary_sample_visualization.png` generated with all-model comparison columns
+  - CSV header includes dynamic columns through `model12_*` in current dataset
+    - file: `output/summary_all_models_vis_check/dump/kfold_summary_sample_visualization.csv`
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` PNG routed to summary root smoke)
+
+- Validation target:
+  - verify sample visualization PNG is saved in summary root (with PDFs)
+  - verify sample visualization CSV remains in `dump/`
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_png_with_pdf_check --sample-vis-count 1` passed
+- Verified output:
+  - top-level includes:
+    - `output/summary_png_with_pdf_check/kfold_summary_sample_visualization.png`
+    - `*.pdf` reports
+  - dump includes:
+    - `output/summary_png_with_pdf_check/dump/kfold_summary_sample_visualization.csv`
+    - report `.csv/.tex/.aux/.log` artifacts
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` PDF-only root + dump artifact routing smoke)
+
+- Validation target:
+  - verify summary root keeps only PDF files
+  - verify TeX/CSV/log/aux/png artifacts are written or moved into `dump/`
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_pdf_only_check --sample-vis-count 1` passed
+  - added a synthetic top-level non-PDF file and reran:
+    - `echo stale > output/summary_pdf_only_check/legacy_note.txt`
+    - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_pdf_only_check --sample-vis-count 0` passed
+- Verified output:
+  - top-level files under `output/summary_pdf_only_check` are all `.pdf`
+  - `output/summary_pdf_only_check/dump/` contains:
+    - `.csv`, `.tex`, `.aux`, `.log`
+    - sample visualization files (`.csv`, `.png`)
+    - migrated legacy file `legacy_note.txt`
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` single-TeX two-table scope report smoke)
+
+- Validation target:
+  - verify `1fold` and `5folds` are rendered as two tables in one TeX document
+  - verify consolidated scope PDF builds successfully
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_scope_two_tables_check --sample-vis-count 0` passed
+- Verified output:
+  - generated consolidated scope report:
+    - `output/summary_scope_two_tables_check/kfold_summary_experiment_means_scopes.tex`
+    - `output/summary_scope_two_tables_check/kfold_summary_experiment_means_scopes.pdf`
+  - TeX content check:
+    - contains `\subsection*{Scope: 1fold}` + one `table`
+    - contains `\subsection*{Scope: 5folds}` + one `table`
+
+## Updated on 2026-04-15 (`aggregate_kfold_results.py` 1fold/5fold split-table smoke)
+
+- Validation target:
+  - verify cross-experiment mean outputs are generated separately for `1fold` and `5folds`
+  - verify existing combined mean output remains generated
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_scope_split_check --sample-vis-count 0` passed
+- Verified output:
+  - combined:
+    - `output/summary_scope_split_check/kfold_summary_experiment_means.csv`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means.tex`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means.pdf`
+  - split by scope:
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_1fold.csv`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_1fold.tex`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_1fold.pdf`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_5folds.csv`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_5folds.tex`
+    - `output/summary_scope_split_check/kfold_summary_experiment_means_5folds.pdf`
+
+## Updated on 2026-04-14 (best_model-only CHASE test launcher smoke)
+
+- Validation target:
+  - verify the new best-model test launcher is syntactically valid
+  - verify `train.py` exposes single-fold execution needed for fold-specific `best_model.pth` evaluation
+- Executed checks:
+  - `.venv/bin/python -m py_compile train.py` passed
+  - `bash -n scripts/chasedb1_test_best.sh` passed
+  - `.venv/bin/python train.py --help` passed and showed `--target_fold`
+  - `bash scripts/chasedb1_test_best.sh --help` passed
+- Notes:
+  - `train.py --help` emitted an environment warning from `pyramid/pkg_resources`, but CLI output completed successfully.
+  - launcher includes Telegram alert handling, but alert send itself was not end-to-end exercised in this turn.
+
+## Updated on 2026-04-14 (inference/test Betti-0/1 metric smoke)
+
+- Validation target:
+  - verify the evaluation path compiles after adding separate `betti_error_0` / `betti_error_1` reporting
+  - verify the Betti helper returns expected component/hole errors on toy masks
+- Executed checks:
+  - `.venv/bin/python -m py_compile solver.py metrics/cal_betti.py metrics/betti_error.py metrics/betti_compute.py` passed
+  - `.venv/bin/python` toy-mask smoke passed:
+    - identical solid mask -> `betti_error_0=0`, `betti_error_1=0`
+    - two-component prediction vs one-component GT -> `betti_error_0=1`, `betti_error_1=0`
+    - ring prediction vs solid GT -> `betti_error_0=0`, `betti_error_1=1`
+  - temporary-CSV parser smoke passed:
+    - `scripts.aggregate_kfold_results.parse_fold_csv(...)` kept reading `dice/Jac/clDice` from the first 6 columns of extended `results_<fold>.csv`
+    - `parse_sample_metrics_csv(...)` accepted extended `test_sample_metrics.csv` rows and preserved legacy fields
+
+## Updated on 2026-04-14 (sample visualization config-title smoke)
+
+- Validation target:
+  - verify sample-visualization labels summarize model config instead of generic `Model 1` / `Model 2`
+  - verify companion CSV exports the same config metadata explicitly
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_vis_config_label_check --sample-vis-count 1` passed
+- Verified output:
+  - `output/summary_vis_config_label_check/kfold_summary_sample_visualization.csv` header now includes:
+    - `model1_config`, `model1_experiment`, `model1_conn_num`, `model1_loss`, `model1_folds`
+    - `model2_config`, `model2_experiment`, `model2_conn_num`, `model2_loss`, `model2_folds`
+  - sample row values include config summaries such as:
+    - `Exp=dist_inverted | Conn=8 | Loss=gjml_sf_l1 | Folds=5`
+
+## Updated on 2026-04-14 (binary `_bce` naming + 5-fold batch script smoke)
+
+- Validation target:
+  - verify binary runs are named with `_bce` instead of inheriting `smooth_l1`
+  - verify `scripts/multi_train.sh` active commands now target 5-fold runs
+- Executed checks:
+  - `.venv/bin/python -m py_compile train.py scripts/aggregate_kfold_results.py` passed
+  - `sh -n scripts/chasedb1_train.sh` passed
+  - `bash -n scripts/multi_train.sh` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_binary_bce_name_check --sample-vis-count 0` passed
+- Verified output:
+  - `output/summary_binary_bce_name_check/kfold_summary_experiment_means.csv` contains binary rows as:
+    - `binary,8,bce,1fold,...`
+    - `binary,8,bce,5folds,...`
+  - active lines in `scripts/multi_train.sh` now all use `--folds 5`
+
+## Updated on 2026-04-14 (`aggregate_kfold_results.py` default all-scope aggregation smoke)
+
+- Validation target:
+  - verify default execution aggregates both `output/1fold` and `output/5folds`
+  - verify folder-name parsing splits `binary_8_smooth_l1` into `binary / 8 / smooth_l1`
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_default_all_scope_check --sample-vis-count 0` passed
+- Verified output:
+  - run prints multi-scope discovery info and writes both:
+    - `output/summary_default_all_scope_check/1fold_binary_8_smooth_l1_kfold_summary.csv`
+    - `output/summary_default_all_scope_check/5folds_binary_8_smooth_l1_kfold_summary.csv`
+  - `output/summary_default_all_scope_check/kfold_summary_experiment_means.csv` includes both rows:
+    - `binary,8,smooth_l1,1fold,...`
+    - `binary,8,smooth_l1,5folds,...`
+
+## Updated on 2026-04-14 (fold-aware output script/help smoke + legacy 5-fold directory move)
+
+- Validation target:
+  - verify launcher help and 5-fold batch script align with the `output/{1fold,5folds}` layout
+  - verify CHASE 5-fold result directories are placed under `output/5folds/`
+- Executed checks:
+  - `sh -n scripts/chasedb1_train.sh` passed
+  - `bash -n scripts/multi_train.sh` passed
+  - `sh scripts/chasedb1_train.sh --help` passed
+  - directory checks confirmed:
+    - `output/5folds/binary_8_smooth_l1`
+    - `output/5folds/binary_25_smooth_l1`
+    - `output/5folds/dist_signed_8_smooth_l1`
+    - `output/5folds/dist_inverted_8_smooth_l1`
+    - `output/5folds/dist_signed_8_gjml_sf_l1`
+    - `output/5folds/dist_inverted_8_gjml_sf_l1`
+- Notes:
+  - `output/summary*` directories were left in place because they are aggregation artifacts, not training run roots.
+
+## Updated on 2026-04-14 (`aggregate_kfold_results.py` default 5-fold root smoke)
+
+- Validation target:
+  - verify aggregation defaults now target `output/5folds`
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --output-dir output/summary_5fold_default_root_check` passed
+- Verified output:
+  - `output/summary_5fold_default_root_check/kfold_summary_experiment_means.csv`
+  - default `--input-root` resolved current 5-fold experiment directories under `output/5folds/`
+
 ## Updated on 2026-04-13 (sample visualization RGB/BGR handling smoke)
 
 - Validation target:
@@ -10,6 +462,17 @@
 - Verified output:
   - `output/summary_sample_vis_test_rgbbgr/kfold_summary_sample_visualization.png`
   - `output/summary_sample_vis_test_rgbbgr/kfold_summary_sample_visualization.csv`
+
+## Updated on 2026-04-13 (sample visualization blue-tint fix smoke)
+
+- Validation target:
+  - verify blue-tinted image-panel correction via automatic BGR->RGB swap heuristic
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output --output-dir output/summary_sample_vis_test_rgbfix --sample-vis-count 2` passed
+- Verified output:
+  - `output/summary_sample_vis_test_rgbfix/kfold_summary_sample_visualization.png`
+  - image-panel color changed from blue-dominant to expected orange/red fundus tone
 
 ## Updated on 2026-04-13 (aggregate_kfold_results sample visualization smoke)
 
@@ -341,7 +804,7 @@
 
 - Added `--output_dir` to `train.py`.
 - When `--output_dir` is set, training outputs are now saved under:
-  - `<output_dir>/<label_mode>/`
+  - `<output_dir>/<fold_scope>/<label_mode>_<conn_num>_<dist_aux_loss>/`
 - Updated `solver.py` checkpoint save path to follow `args.save` instead of fixed `models/` at repository root:
   - checkpoints now go to `<save>/models/<exp_id>/`
 - Scope:

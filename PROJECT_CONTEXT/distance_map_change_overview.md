@@ -1,8 +1,8 @@
 # Distance Map 변경 한눈에 보기 (CHASE 기준)
 
 > 기준 문서: `PROJECT_CONTEXT/modification.md`  
-> 정리 기준일: 2026-04-12  
-> 범위: distance-map(`dist_signed`, `dist_inverted`) 학습/평가 경로 중심
+> 정리 기준일: 2026-04-15  
+> 범위: distance-map(`dist`, `dist_inverted`) 학습/평가 경로 중심
 
 ## 1) 변경 목적
 
@@ -14,9 +14,9 @@
 
 | 구분 | 파일 | 핵심 변경 | baseline 영향 |
 |---|---|---|---|
-| 데이터 로딩 | `data_loader/GetDataset_CHASE.py` | `label_mode` 지원(`binary`, `dist_signed`, `dist_inverted`), distance GT `.npy` 로딩 | 없음(기존 binary 유지) |
-| 실행 인자/출력 | `train.py` | `--label_mode`, `--tau`, `--sigma`, `--dist_aux_loss`, `--dist_sf_l1_gamma`, `--output_dir` 추가, 저장 경로를 `<output_dir>/<label_mode>_<conn_num>`로 정규화 | 경미(CLI/저장경로 인터페이스) |
-| 거리 기반 타깃/손실 | `connect_loss.py` | distance 전용 경로 추가(`distance_connectivity_matrix`, affinity regression). **최신 설계(2026-04-10): final 출력은 binary mask로 BCE+Dice supervision**, distance affinity는 보조(supervision)로 유지하며 `SmoothL1` 또는 선택적 `GJML + SF-L1` 사용 가능(CHASE dist에서는 bicon 항 제외) | 있음(single-class CHASE 손실 경로) |
+| 데이터 로딩 | `data_loader/GetDataset_CHASE.py` | `label_mode` 지원(`binary`, `dist`, `dist_inverted`), distance GT `.npy` 로딩 | 없음(기존 binary 유지) |
+| 실행 인자/출력 | `train.py` | `--label_mode`, `--tau`, `--sigma`, `--dist_aux_loss`, `--dist_sf_l1_gamma`, `--output_dir` 추가, 저장 경로를 `<output_dir>/<fold_scope>/<experiment_name>`로 정규화. 현재 `conn_num` 유효값은 `8`, `24` | 경미(CLI/저장경로 인터페이스) |
+| 거리 기반 타깃/손실 | `connect_loss.py` | distance 전용 경로 추가(`distance_connectivity_matrix`, affinity regression). **최신 설계(2026-04-15): 5x5는 center-excluding `24` directional channels로 통일**, final 출력은 binary mask로 BCE+Dice supervision, distance affinity는 보조(supervision)로 유지 | 있음(single-class CHASE 손실 경로) |
 | 평가/메트릭 | `solver.py` | dist 평가를 `pred_score > 0`에서 분리/개선하여 **`dist_score_to_binary(..., >0.5)`** 적용, GT는 `(y>0)` 기준으로 이진화 | 있음(single-class CHASE eval 경로) |
 | 실행 스크립트 | `scripts/chasedb1_train.sh` (single launcher) | CHASE 학습 진입점을 단일 스크립트로 유지 (`conn_num`, `label_mode`, `dist_aux_loss`, `dist_sf_l1_gamma`, `epochs`) | 없음(추가 스크립트) |
 | 디버그/아티팩트 | `scripts/rebuild_dist_signed_artifacts.py` 등 | collapse/투표/체크포인트 진단 및 리포트 생성 흐름 정리 | 없음(유틸리티) |
@@ -48,8 +48,14 @@
 
 ## 6) 문서/도움말 정합성 (2026-04-12 반영)
 
-- `train.py --label_mode` 도움말은 실제 지원값(`binary`, `dist_signed`, `dist_inverted`)과 일치
-- 저장 경로 설명은 실제 동작(`output_dir/label_mode_conn_num`)과 일치
+- `train.py --label_mode` 도움말은 실제 지원값(`binary`, `dist`, `dist_inverted`)과 일치
+- 저장 경로 설명은 실제 동작과 일치:
+  - `binary` -> `output_dir/<fold_scope>/binary_<conn_num>_bce`
+  - `dist_*` -> `output_dir/<fold_scope>/<label_mode>_<conn_num>_<dist_aux_loss>`
+- `scripts/chasedb1_train.sh --help`는 `output/5folds/...`와 `output/1fold/...` 예시를 포함
+- `scripts/multi_train.sh`는 5-fold batch 실행을 명시적으로 `--folds 5`로 고정
+- `scripts/aggregate_kfold_results.py` 기본 `--input-root`는 `output`
+- `scripts/aggregate_kfold_results.py`는 `output/{1fold,5folds}/...`를 함께 감지해 동일 실행에서 둘 다 집계
 - 본 문서와 `modification.md`의 dist 손실 설명은 최신 구현(최종 출력 BCE+Dice, affinity/bicon은 `SmoothL1` 또는 선택적 `GJML + SF-L1` 보조, CHASE dist에서는 bicon 제외) 기준으로 동기화
 
 ## 7) 기존 모델 대비 변경점 (파일/함수 단위)
@@ -57,10 +63,12 @@
 ### train.py
 
 - `parse_args()`
-  - `--label_mode` 추가: `binary`, `dist_signed`, `dist_inverted`
+  - `--label_mode` 추가: `binary`, `dist`, `dist_inverted`
   - `--tau`, `--sigma` 추가: distance affinity 관련 하이퍼파라미터 전달
   - `--dist_aux_loss`, `--dist_sf_l1_gamma` 추가: distance auxiliary regression loss 선택
-  - `--output_dir` 추가 및 `args.save = output_dir/label_mode_conn_num` 규칙 적용
+  - `--output_dir` 추가 및 저장 경로 규칙 적용:
+    - `binary` -> `output_dir/<fold_scope>/binary_<conn_num>_bce`
+    - `dist_*` -> `output_dir/<fold_scope>/<label_mode>_<conn_num>_<dist_aux_loss>`
 - `main(args)`
   - CHASE dataloader 생성 시 `label_mode` 전달
   - `Solver.train(...)` 호출 시 `label_mode` 전달
@@ -69,13 +77,13 @@
 
 - `default_DRIVE_loader(..., label_mode='binary')`
   - `binary`와 `dist_*` 분기 로딩 지원
-  - `dist_signed`/`dist_inverted`에서 `.npy` distance GT 로딩
+  - `dist`/`dist_inverted`에서 `.npy` distance GT 로딩
 - `MyDataset_CHASE.__init__(..., label_mode='binary')`
   - `label_mode`에 따라 GT 경로/타입 선택
 
 ### connect_loss.py
 
-- `distance_affinity_matrix(dist_map, sigma=2.0)`
+- `distance_affinity_matrix(dist_map, conn_num, sigma=2.0)`
   - distance map으로부터 directional affinity target 생성
 - `connect_loss.__init__(..., label_mode=None, conn_num=8, sigma=2.0)`
   - distance 분기 제어를 위한 설정값 보관
@@ -113,14 +121,14 @@
 - repo root 기준 실행 보장
 - 통합 인자 지원:
   - `--conn_num`
-  - `--label_mode` (`binary`, `dist_signed`, `dist_inverted`)
+  - `--label_mode` (`binary`, `dist`, `dist_inverted`)
   - `--dist_aux_loss` (`smooth_l1`, `gjml_sf_l1`)
   - `--dist_sf_l1_gamma`
   - `--epochs` (미지정 시 정책값 자동 적용, 지정 시 직접 override)
 - 기본 epoch 정책:
   - `binary + conn_num=8` -> `130`
-  - `binary + conn_num=25` -> `390`
-  - `dist_signed/dist_inverted` -> `260`
+  - `binary + conn_num=24` -> `390`
+  - `dist/dist_inverted` -> `260`
 
 ### Wrapper scripts
 

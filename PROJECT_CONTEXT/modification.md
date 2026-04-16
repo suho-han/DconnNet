@@ -1,5 +1,30 @@
 # Modification Status (as of 2026-04-08)
 
+## Updated on 2026-04-16 (`final_results` 중심 eval 저장/집계로 정렬)
+
+- Scope classification:
+  - upstream baseline path affected: YES (`solver.py`, `train.py` shared train/eval flow)
+  - fork extension path affected: YES (`scripts/aggregate_kfold_results.py` 집계 입력 기준)
+- Implemented:
+  - `solver.py`
+    - `val_loader is None`인 경우 epoch validation을 건너뛰고 학습 종료 후 final eval만 수행
+    - best summary tail(`best_epoch,best_dice`) append를 제거하고, 최종 성능은 `final_results_<exp_id>.csv`에 저장
+    - `val_loader`가 있는 경우 epoch별 `results_<exp_id>.csv`에 val metric 기록을 유지
+    - final eval 결과 저장을 `final_results_<exp_id>.csv`로 통일 (`result_type=final`, `evaluated_split`, `eval_epoch`, `elapsed_hms` 포함)
+    - final eval 체크포인트 선택:
+      - val 기반 best model이 있으면 해당 가중치로 final eval
+      - val이 없으면 last epoch 가중치로 final eval
+  - `train.py`
+    - `val_loader`, `test_loader` 초기화/생성 경로를 명시해 loader 미정의 상태를 방지
+    - `testset`이 있으면 항상 `test_loader`를 전달
+    - 별도 test split이 없는 경우 `test_loader <- val_loader` fallback으로 기존 실행 경로 호환 유지
+  - `scripts/aggregate_kfold_results.py`
+    - 기본 입력을 `final_results_{fold}.csv`로 변경
+    - fold 자동 탐색 패턴을 `final_results_<fold>.csv` 기준으로 변경
+    - `final_results` 포맷(`dice/jac/cldice/...`)을 직접 파싱해 집계하도록 추가
+- Notes:
+  - `results_<exp_id>.csv`는 epoch 추적(특히 val 성능 추세) 용도로 유지되며, 교차 fold 최종 집계 기준은 `final_results_<fold>.csv`로 일원화됨
+
 ## Updated on 2026-04-13 (sample visualization RGB/BGR handling hardening)
 
 - Scope classification:
