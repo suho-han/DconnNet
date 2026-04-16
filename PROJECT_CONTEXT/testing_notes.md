@@ -1,5 +1,62 @@
 # Testing Notes
 
+## Updated on 2026-04-16 (dataset-specific table-header verification)
+
+- Validation target:
+  - confirm fold-level and experiment-mean LaTeX tables use dataset-specific columns
+  - confirm direct dataset roots (`output/chase`, `output/isic`) resolve dataset names correctly
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output/chase --output-dir output/summary_metric_check/chase --sample-vis-count 0` completed (with unfinished-experiment warning)
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output/isic --output-dir output/summary_metric_check/isic --sample-vis-count 0` completed (with unfinished-experiment warning)
+  - header grep over generated TeX files passed
+- Verified output:
+  - CHASE fold summary header:
+    - `Fold & Best Epoch & Dice & IoU & clDice & B0 error & B1 error & Train Time \\`
+  - CHASE experiment-mean header:
+    - `Experiment & Conn & Loss & #Folds & Dice & IoU & clDice & B0 error & B1 error \\`
+  - ISIC fold summary header:
+    - `Fold & Best Epoch & Dice & IoU & Accuracy & Precision & Train Time \\`
+
+## Updated on 2026-04-16 (`solver.py` ISIC precision/accuracy output update)
+
+- Validation target:
+  - verify edited `solver.py` remains syntactically valid after adding precision/accuracy calculations and CSV columns
+- Executed checks:
+  - `.venv/bin/python -m py_compile solver.py` passed
+
+## Updated on 2026-04-16 (suppress top-level experiment-means CSV/PDF smoke)
+
+- Validation target:
+  - confirm `output/summary/kfold_summary_experiment_means.csv` and `.pdf` are no longer produced
+  - confirm dataset-specific outputs still render
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output --output-dir output/summary_no_overall_check --sample-vis-count 0` passed
+- Verified output:
+  - `output/summary_no_overall_check/kfold_summary_experiment_means.csv` absent
+  - `output/summary_no_overall_check/kfold_summary_experiment_means.pdf` absent
+  - dataset bundle still produced:
+    - `output/summary_no_overall_check/dump/kfold_summary_experiment_means_datasets.tex`
+    - `output/summary_no_overall_check/kfold_summary_experiment_means_datasets.pdf`
+
+## Updated on 2026-04-16 (`aggregate_kfold_results.py` DRIVE/ISIC legacy results fallback smoke)
+
+- Validation target:
+  - verify aggregation works from dataset roots that only have legacy `results_<fold>.csv`
+  - keep existing CHASE aggregation behavior unchanged
+- Executed checks:
+  - `.venv/bin/python -m py_compile scripts/aggregate_kfold_results.py` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output/chase --output-dir output/summary_tmp2 --output-stem chase_test --sample-vis-count 0` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output/drive --output-dir output/summary_tmp2 --output-stem drive_test --sample-vis-count 0` passed
+  - `.venv/bin/python scripts/aggregate_kfold_results.py --input-root output/isic --output-dir output/summary_tmp2 --output-stem isic_test --sample-vis-count 0` passed
+- Verified output:
+  - CHASE: `output/summary_tmp2/chase_test_experiment_means.pdf` and related dump CSV/TEX generated
+  - DRIVE: `output/summary_tmp2/drive_test.pdf` and `output/summary_tmp2/dump/drive_test.csv` generated
+  - ISIC: `output/summary_tmp2/isic_test.pdf` and `output/summary_tmp2/dump/isic_test.csv` generated
+- Notes:
+  - all three dataset roots completed with expected missing-fold warnings (`2,3,4,5`) and auto-detected fold `1`
+
 ## Updated on 2026-04-16 (launcher all-exit Telegram alert path)
 
 - Validation target:

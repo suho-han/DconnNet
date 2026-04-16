@@ -1,5 +1,128 @@
 # Modification Status (as of 2026-04-08)
 
+## Updated on 2026-04-16 (dataset-specific table headers finalized for CHASE/DRIVE/ISIC)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (result aggregation utility only)
+- Implemented in `scripts/aggregate_kfold_results.py`:
+  - fixed dataset detection for direct dataset roots:
+    - `--input-root output/isic` now resolves dataset as `isic` (not experiment folder names like `binary_8_bce`)
+  - finalized fold-level LaTeX metric columns by dataset:
+    - CHASE/DRIVE: `Dice`, `IoU`, `clDice`, `B0 error`, `B1 error`
+    - ISIC: `Dice`, `IoU`, `Accuracy`, `Precision`
+  - unified duplicate `write_latex(...)` definitions to a single implementation to prevent signature/shadowing regressions
+  - updated cross-experiment LaTeX writer to use dataset-specific metric sets (instead of fixed `Jac/clDice/Betti` columns)
+
+## Updated on 2026-04-16 (ISIC precision/accuracy metric persistence in solver outputs)
+
+- Scope classification:
+  - upstream baseline path affected: YES (`solver.py` shared evaluation/output path)
+  - fork extension path affected: YES (ISIC-focused metric extension)
+- Implemented in `solver.py`:
+  - added `precision`, `accuracy` metric columns to persisted outputs:
+    - epoch history CSV: `results_<exp_id>.csv`
+    - final summary CSV: `final_results_<exp_id>.csv`
+    - per-sample CSV: `models/<exp_id>/<split>_sample_metrics.csv`
+  - added ISIC-aware precision/accuracy calculation in `test_epoch`:
+    - binary path: pixel-level precision/accuracy from predicted mask vs GT mask
+    - multi-class path: macro precision over foreground classes + pixel accuracy
+  - preserved existing stored metrics (`dice`, `jac`, `cldice`, `betti_error_0`, `betti_error_1`, losses) without removal
+  - added TensorBoard epoch logging for `epoch/precision`, `epoch/accuracy` when finite
+
+## Updated on 2026-04-16 (remove top-level experiment-means CSV/PDF outputs)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (result aggregation utility only)
+- Implemented in `scripts/aggregate_kfold_results.py`:
+  - stopped writing the top-level cross-experiment mean artifacts:
+    - `output/summary/kfold_summary_experiment_means.csv`
+    - `output/summary/kfold_summary_experiment_means.pdf`
+  - kept dump-level overall mean artifacts and dataset-specific CSV/PDF outputs
+  - dataset-grouped TeX/PDF remains available via `*_experiment_means_datasets.tex/.pdf`
+- Notes:
+  - the script now warns and skips unfinished roots without `final_results_*.csv`
+
+## Updated on 2026-04-16 (aggregation LaTeX split by dataset)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (result aggregation utility only)
+- Implemented in `scripts/aggregate_kfold_results.py`:
+  - cross-experiment LaTeX output now groups rows by dataset instead of fold scope
+  - dataset names are derived from the output tree and skip scope folders like `1fold` / `5folds`
+  - generated LaTeX/PDF now uses a dedicated dataset bundle:
+    - `kfold_summary_experiment_means_datasets.tex`
+    - `kfold_summary_experiment_means_datasets.pdf`
+  - each dataset gets its own subsection/table, for example `chase`, `drive`, `isic`
+- Notes:
+  - CSV aggregation remains unchanged; only LaTeX/PDF grouping changed
+
+## Updated on 2026-04-16 (`aggregate_kfold_results.py` dataset-root legacy fallback for DRIVE/ISIC)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (result aggregation utility only)
+- Implemented in `scripts/aggregate_kfold_results.py`:
+  - fold CSV resolution now checks both current default and legacy names automatically:
+    - `final_results_{fold}.csv` (default)
+    - `results_{fold}.csv` (legacy fallback)
+  - fold discovery now recognizes legacy root files (`results_<fold>.csv`) in addition to `final_results_<fold>.csv`
+  - numeric fold-directory probing now uses the same multi-candidate resolver
+  - updated `--input-name` help text to document the automatic legacy fallback
+- Motivation:
+  - some dataset roots (for example `output/drive`, `output/isic`) currently only contain `results_1.csv` and not `final_results_1.csv`
+  - this change keeps CHASE behavior while enabling the same CLI flow on DRIVE/ISIC without manual `--input-name` override
+
+## Updated on 2026-04-16 (DRIVE `num_samples=0` fix + notebook-side diagnostics)
+
+- Scope classification:
+  - upstream baseline path affected: YES (`scripts/drive_train.sh` launcher path/option text)
+  - fork extension path affected: YES (`notebooks/distance_map_drive.ipynb` validation section)
+- Implemented:
+  - fixed Linux case-sensitive data root in `scripts/drive_train.sh`:
+    - `--data_root 'data/drive'` -> `--data_root 'data/DRIVE'`
+  - aligned DRIVE launcher help/default policy text with current label mode names:
+    - `dist_signed` -> `dist`
+    - updated dist-mode examples and epoch-policy branch text accordingly
+  - updated `notebooks/distance_map_drive.ipynb` MyDataset validation section to use real loader contract directly:
+    - direct roots: `data/DRIVE/train`, `data/DRIVE/test`
+    - direct labels: `masks_dist/*_dist.npy`, `masks_dist_inverted/*_dist_inverted.npy`
+    - added path-case diagnostic (`data/DRIVE` vs `data/drive`) and per-mode dataset length checks
+- Validation:
+  - dataset probe confirmed `len>0` for all split/mode combinations:
+    - train/test x binary/dist/dist_inverted all length `20`
+  - `bash -n scripts/drive_train.sh` passed
+  - notebook JSON syntax validation passed
+
+## Updated on 2026-04-16 (added DRIVE distance-map generation notebook)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (notebook utility only)
+- Implemented:
+  - added `notebooks/distance_map_drive.ipynb`
+  - notebook mirrors CHASE distance-map workflow for DRIVE split structure:
+    - input masks: `data/DRIVE/{train,test}/masks/*.gif`
+    - output signed maps: `data/DRIVE/{train,test}/masks_dist/*_dist.npy`
+    - output inverted maps: `data/DRIVE/{train,test}/masks_dist_inverted/*_dist_inverted.npy`
+  - includes optional preview PNG export and sample visualization cells
+- Notes:
+  - notebook was added only; no cells were executed as part of this change
+
+## Updated on 2026-04-16 (added `MyDataset_DRIVE` validation section in DRIVE notebook)
+
+- Scope classification:
+  - upstream baseline path affected: NO
+  - fork extension path affected: YES (notebook utility only)
+- Implemented:
+  - updated `notebooks/distance_map_drive.ipynb` with a dedicated `MyDataset_DRIVE` validation section
+  - added compatibility bridge logic for DRIVE distance labels so `MyDataset_DRIVE` naming convention (`*_dist.gif`, `*_dist_inverted.gif`) can be validated against generated `.npy` files
+  - added validation loop for all label modes (`binary`, `dist`, `dist_inverted`) across both `train` and `test` splits
+- Notes:
+  - validation code was added to notebook cells; cells were not auto-executed in this change
+
 ## Updated on 2026-04-16 (`final_results` 중심 eval 저장/집계로 정렬)
 
 - Scope classification:
@@ -426,6 +549,7 @@
 1. distance mode 추가 smoke 실행으로 현재 기본 하이퍼파라미터 안정성 재확인.
 2. dist 보조 손실 가중치/`sigma` 튜닝 실험 설계 및 기준값 확정.
 3. multi-class distance 확장 필요 여부 결정(필요 시 별도 fork 모듈로 추가).
+
 ## 확인된 검증
 
 - `python3 -m py_compile connect_loss.py` 통과(문법 기준).
