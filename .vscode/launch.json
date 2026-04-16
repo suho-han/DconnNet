@@ -60,7 +60,7 @@
                 "--folds",
                 "5",
                 "--label_mode",
-                "dist_signed",
+                "dist",
             ]
         }
     ]

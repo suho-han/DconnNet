@@ -140,7 +140,7 @@ class SDE_module(nn.Module):
         # self.att7 = DANetHead(self.inter_channels, self.inter_channels)
         # self.att8 = DANetHead(self.inter_channels, self.inter_channels)
 
-        # For conn_num values that do not divide in_channels (e.g., 25 for 512),
+        # For conn_num values that do not divide in_channels (e.g., 24 for 512),
         # concatenated directional features have conn_num * inter_channels channels.
         self.final_conv = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(self.inter_channels * self.conn_num, out_channels, 1))
         # self.encoder_block = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(in_channels, 32, 1))

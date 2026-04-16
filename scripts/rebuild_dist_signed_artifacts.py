@@ -8,18 +8,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from connect_loss import Bilateral_voting, distance_affinity_matrix
+from connect_loss import Bilateral_voting, Bilateral_voting_kxk, distance_affinity_matrix, resolve_connectivity_layout
 from data_loader.GetDataset_CHASE import MyDataset_CHASE
 from model.DconnNet import DconnNet
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 @dataclass
@@ -52,15 +52,16 @@ def parse_args():
     p = argparse.ArgumentParser(
         "Unified dist debug: single-checkpoint analysis + epochwise CSV + markdown report"
     )
-    p.add_argument("--output_root", type=str, default="output/dist_signed")
+    p.add_argument("--output_root", type=str, default="output/dist")
     p.add_argument("--exp_index", type=int, default=1, help="models/<exp_index>")
     p.add_argument("--data_root", type=str, default="data/chase")
-    p.add_argument("--label_mode", type=str, default="dist_signed",
-                   choices=["binary", "dist_signed", "dist_inverted"])
+    p.add_argument("--label_mode", type=str, default="dist",
+                   choices=["binary", "dist", "dist_inverted"])
     p.add_argument("--exp_id", type=int, default=0, help="CHASE split id (0-based)")
     p.add_argument("--split", type=str, default="test", choices=["train", "test"])
     p.add_argument("--resize", type=int, nargs=2, default=[960, 960])
     p.add_argument("--num_class", type=int, default=1)
+    p.add_argument("--conn_num", type=int, default=8, choices=[8, 24])
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--max_batches", type=int, default=6)
@@ -109,6 +110,23 @@ def pair_alignment_scores(class_pred_bin: torch.Tensor) -> np.ndarray:
     p2 = float((a[:, 2:3] * shift_2d(a[:, 5:6], dy=1, dx=-1)).mean().item())
     p3 = float((a[:, 3:4] * shift_2d(a[:, 4:5], dy=0, dx=1)).mean().item())
     return np.array([p0, p1, p2, p3], dtype=np.float64)
+
+
+def apply_connectivity_voting(
+    conn_map: torch.Tensor,
+    hori: torch.Tensor,
+    vert: torch.Tensor,
+    conn_num: int,
+):
+    layout = resolve_connectivity_layout(conn_num)
+    if conn_num == 8:
+        return Bilateral_voting(conn_map, hori, vert)
+    return Bilateral_voting_kxk(
+        conn_map,
+        hori,
+        vert,
+        conn_num=layout['kernel_size'],
+    )
 
 
 def build_translation(num_class: int, h: int, w: int, device: torch.device):
@@ -187,6 +205,7 @@ def evaluate_epoch_checkpoint(
     device: torch.device,
     hori: torch.Tensor,
     vert: torch.Tensor,
+    conn_num: int,
     max_batches: int,
 ) -> EpochResult:
     state = torch.load(ckpt_path, map_location="cpu")
@@ -212,13 +231,15 @@ def evaluate_epoch_checkpoint(
             y = y.float().to(device)
             out, _ = model(x)
             sig = torch.sigmoid(out)
-            cp_sig = sig.view([x.shape[0], -1, 8, x.shape[2], x.shape[3]])
-            cp_logit = out.view([x.shape[0], -1, 8, x.shape[2], x.shape[3]])
+            cp_sig = sig.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
+            cp_logit = out.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
             bin_sig = (cp_sig > 0.5).float()
             bin_logit = (cp_logit > 0).float()
 
-            pred_sig_raw, _ = Bilateral_voting(bin_sig, hori.repeat(x.shape[0], 1, 1, 1), vert.repeat(x.shape[0], 1, 1, 1))
-            pred_logit_raw, _ = Bilateral_voting(bin_logit, hori.repeat(x.shape[0], 1, 1, 1), vert.repeat(x.shape[0], 1, 1, 1))
+            hori_batch = hori.repeat(x.shape[0], 1, 1, 1)
+            vert_batch = vert.repeat(x.shape[0], 1, 1, 1)
+            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num)
+            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num)
             pred_sig = (pred_sig_raw > 0).float()
             pred_logit = (pred_logit_raw > 0).float()
 
@@ -281,6 +302,7 @@ def evaluate_single_checkpoint_detailed(
     device: torch.device,
     hori: torch.Tensor,
     vert: torch.Tensor,
+    conn_num: int,
     max_batches: int,
     tau: float,
     sigma: float,
@@ -313,13 +335,15 @@ def evaluate_single_checkpoint_detailed(
 
             out, _ = model(x)
             sig = torch.sigmoid(out)
-            cp_sig = sig.view([x.shape[0], -1, 8, x.shape[2], x.shape[3]])
-            cp_logit = out.view([x.shape[0], -1, 8, x.shape[2], x.shape[3]])
+            cp_sig = sig.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
+            cp_logit = out.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
             bin_sig = (cp_sig > 0.5).float()
             bin_logit = (cp_logit > 0).float()
 
-            pred_sig_raw, _ = Bilateral_voting(bin_sig, hori.repeat(x.shape[0], 1, 1, 1), vert.repeat(x.shape[0], 1, 1, 1))
-            pred_logit_raw, _ = Bilateral_voting(bin_logit, hori.repeat(x.shape[0], 1, 1, 1), vert.repeat(x.shape[0], 1, 1, 1))
+            hori_batch = hori.repeat(x.shape[0], 1, 1, 1)
+            vert_batch = vert.repeat(x.shape[0], 1, 1, 1)
+            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num)
+            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num)
             pred_sig = (pred_sig_raw > 0).float()
             pred_logit = (pred_logit_raw > 0).float()
 
@@ -335,9 +359,9 @@ def evaluate_single_checkpoint_detailed(
             pair_sig05.append(pair_alignment_scores(bin_sig))
             pair_logit0.append(pair_alignment_scores(bin_logit))
 
-            if label_mode in ["dist_signed", "dist_inverted"]:
+            if label_mode in ["dist", "dist_inverted"]:
                 score_target = 1.0 - torch.exp(-y / tau)
-                affinity_target = distance_affinity_matrix(y, sigma=sigma)
+                affinity_target = distance_affinity_matrix(y, conn_num=conn_num, sigma=sigma)
                 score_target_mean.append(float(score_target.mean().item()))
                 affinity_target_mean.append(float(affinity_target.mean().item()))
 
@@ -461,7 +485,7 @@ def main():
     if not ckpts:
         raise RuntimeError(f"No checkpoints found in {ckpt_dir}")
 
-    model = DconnNet(num_class=args.num_class).to(device)
+    model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).to(device)
     h, w = args.resize
     hori, vert = build_translation(args.num_class, h, w, device)
 
@@ -477,6 +501,7 @@ def main():
             device=device,
             hori=hori,
             vert=vert,
+            conn_num=args.conn_num,
             max_batches=args.max_batches,
         )
         epochwise_rows.append(row)
@@ -507,6 +532,7 @@ def main():
         device=device,
         hori=hori,
         vert=vert,
+        conn_num=args.conn_num,
         max_batches=args.max_batches,
         tau=args.tau,
         sigma=args.sigma,

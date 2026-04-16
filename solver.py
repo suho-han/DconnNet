@@ -1,6 +1,7 @@
 import csv
 import math
 import os
+import time
 from contextlib import contextmanager
 from random import shuffle
 
@@ -32,8 +33,9 @@ except Exception:
         def close(self):
             pass
 
-from connect_loss import Bilateral_voting, Bilateral_voting_kxk, connect_loss
+from connect_loss import Bilateral_voting, Bilateral_voting_kxk, connect_loss, resolve_connectivity_layout
 from lr_update import get_lr
+from metrics.cal_betti import getBettiErrors
 from metrics.cldice import clDice
 
 try:
@@ -76,7 +78,86 @@ class Solver(object):
 
         results_csv = 'results_' + str(exp_id) + '.csv'
         with open(os.path.join(self.args.save, results_csv), 'w') as f:
-            f.write('epoch,train_loss,val_loss,dice,Jac,clDice\n')
+            f.write(
+                'epoch,train_loss,val_loss,dice,Jac,clDice,betti_error_0,betti_error_1,elapsed_hms\n'
+            )
+
+    def _format_elapsed_hms(self, elapsed_seconds):
+        if elapsed_seconds is None or math.isnan(float(elapsed_seconds)):
+            return ''
+
+        total_seconds = max(0, int(round(float(elapsed_seconds))))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+    def _write_epoch_result_row(self, exp_id, epoch, metrics, elapsed_hms=''):
+        results_csv = 'results_' + str(exp_id) + '.csv'
+        with open(os.path.join(self.args.save, results_csv), 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    f'{int(epoch):03d}',
+                    f'{float(metrics["train_loss"]):0.6f}',
+                    f'{float(metrics["val_loss"]):0.6f}',
+                    f'{float(metrics["dice"]):0.6f}',
+                    f'{float(metrics["jac"]):0.6f}',
+                    f'{float(metrics["cldice"]):0.6f}',
+                    f'{float(metrics["betti_error_0"]):0.6f}',
+                    f'{float(metrics["betti_error_1"]):0.6f}',
+                    elapsed_hms or '',
+                ]
+            )
+
+    def _write_eval_summary(
+        self,
+        exp_id,
+        split_name,
+        metrics,
+        checkpoint_name='',
+        evaluated_split='',
+        eval_epoch='',
+        elapsed_hms='',
+    ):
+        summary_csv = os.path.join(
+            self.args.save,
+            f'{split_name}_results_{exp_id}.csv',
+        )
+        with open(summary_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    'result_type',
+                    'evaluated_split',
+                    'eval_epoch',
+                    'checkpoint',
+                    'train_loss',
+                    'eval_loss',
+                    'dice',
+                    'jac',
+                    'cldice',
+                    'betti_error_0',
+                    'betti_error_1',
+                    'elapsed_hms',
+                ]
+            )
+            writer.writerow(
+                [
+                    split_name,
+                    evaluated_split,
+                    eval_epoch,
+                    checkpoint_name,
+                    f'{float(metrics["train_loss"]):0.6f}',
+                    f'{float(metrics["val_loss"]):0.6f}',
+                    f'{float(metrics["dice"]):0.6f}',
+                    f'{float(metrics["jac"]):0.6f}',
+                    f'{float(metrics["cldice"]):0.6f}',
+                    f'{float(metrics["betti_error_0"]):0.6f}',
+                    f'{float(metrics["betti_error_1"]):0.6f}',
+                    elapsed_hms or '',
+                ]
+            )
 
     def save_checkpoint_batch_triplet(self, images, preds, masks, exp_id, epoch, batch_idx):
         base_dir = os.path.join(
@@ -185,9 +266,9 @@ class Solver(object):
 
         IMPORTANT:
             If your signed distance map defines foreground as negative values,
-            change the 'dist_signed' branch from (x > 0) to (x < 0).
+            change the 'dist' branch from (x > 0) to (x < 0).
         """
-        if label_mode in ['dist_signed', 'dist_inverted']:
+        if label_mode in ['dist', 'dist_inverted']:
             return (x > 0).float()
 
         else:
@@ -208,12 +289,11 @@ class Solver(object):
         """
         Convert directional affinity / connectivity maps to a voted score map.
         """
+        layout = resolve_connectivity_layout(self.args.conn_num)
         if self.args.conn_num == 8:
             pred_map, vote_map = Bilateral_voting(conn_map, hori_translation, verti_translation)
-        elif self.args.conn_num == 25:
-            kxk_size = int(math.sqrt(self.args.conn_num))
-            if kxk_size * kxk_size != self.args.conn_num:
-                raise ValueError(f"conn_num={self.args.conn_num} is not a perfect square for kxk voting")
+        elif self.args.conn_num == 24:
+            kxk_size = layout['kernel_size']
             pred_map, vote_map = Bilateral_voting_kxk(
                 conn_map,
                 hori_translation,
@@ -221,7 +301,7 @@ class Solver(object):
                 conn_num=kxk_size,
             )
         else:
-            raise ValueError(f"Unsupported conn_num {self.args.conn_num}, only 8 and 25 are supported")
+            raise ValueError(f"Unsupported conn_num {self.args.conn_num}, only 8 and 24 are supported")
         return pred_map, vote_map
 
     def connectivity_to_mask(self, conn_map, hori_translation, verti_translation):
@@ -235,7 +315,7 @@ class Solver(object):
         pred_mask = (pred_mask > 0).float()
         return pred_mask
 
-    def train(self, model, train_loader, val_loader, exp_id, num_epochs=10, label_mode='binary'):
+    def train(self, model, train_loader, val_loader, exp_id, num_epochs=10, label_mode='binary', test_loader=None):
         optim = self.optim(model.parameters(), lr=self.lr)
 
         print('START TRAIN.')
@@ -289,14 +369,43 @@ class Solver(object):
             scheduled = False
 
         if self.args.test_only:
-            self.test_epoch(net, val_loader, 0, exp_id)
+            eval_split_name = 'test' if test_loader is not None else 'val'
+            print(f'START {eval_split_name.upper()}-ONLY EVAL.')
+            test_metrics = self.test_epoch(
+                net,
+                val_loader if test_loader is None else test_loader,
+                0,
+                exp_id,
+                split_name=eval_split_name,
+            )
+            self._write_epoch_result_row(exp_id, 1, test_metrics, elapsed_hms='')
+            self._write_eval_summary(
+                exp_id,
+                'final',
+                test_metrics,
+                checkpoint_name=os.path.basename(self.args.pretrained) if self.args.pretrained else '',
+                evaluated_split=eval_split_name,
+                eval_epoch=1,
+                elapsed_hms='',
+            )
             writer.close()
         else:
             global_step = 0
+            train_start_time = time.perf_counter()
+            epoch_metrics = {
+                'dice': float('nan'),
+                'jac': float('nan'),
+                'cldice': float('nan'),
+                'betti_error_0': float('nan'),
+                'betti_error_1': float('nan'),
+                'val_loss': float('nan'),
+                'train_loss': float('nan'),
+                'val_loss_terms': {},
+            }
             for epoch in range(self.args.epochs):
                 net.train()
                 train_loss_epoch = []
-                if label_mode in ['dist_signed', 'dist_inverted'] and hasattr(self.loss_func, 'reset_dist_edge_stats'):
+                if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'reset_dist_edge_stats'):
                     self.loss_func.reset_dist_edge_stats()
 
                 if scheduled:
@@ -323,10 +432,10 @@ class Solver(object):
                     optim.zero_grad()
                     output, aux_out = net(X)
 
-                    if label_mode in ['dist_signed', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
+                    if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
                         self.loss_func.set_dist_edge_stat_collection(True)
                     loss_main, loss_main_dict = self.loss_func(output, y, return_details=True)
-                    if label_mode in ['dist_signed', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
+                    if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
                         self.loss_func.set_dist_edge_stat_collection(False)
                     loss_aux, loss_aux_dict = self.loss_func(aux_out, y, return_details=True)
                     loss = loss_main + 0.3 * loss_aux
@@ -351,28 +460,48 @@ class Solver(object):
                 mean_train_loss = float(np.mean(train_loss_epoch)) if train_loss_epoch else float('nan')
                 should_save_batch_triplet = ((epoch + 1) % self.args.save_per_epochs == 0)
 
-                epoch_metrics = self.test_epoch(
-                    net,
-                    val_loader,
-                    epoch,
-                    exp_id,
-                    train_loss=mean_train_loss,
-                    save_batch_triplet=should_save_batch_triplet,
-                )
+                epoch_metrics = {
+                    'dice': float('nan'),
+                    'jac': float('nan'),
+                    'cldice': float('nan'),
+                    'betti_error_0': float('nan'),
+                    'betti_error_1': float('nan'),
+                    'val_loss': float('nan'),
+                    'train_loss': mean_train_loss,
+                    'val_loss_terms': {},
+                }
 
-                dice_p = epoch_metrics['dice']
-                if best_p < dice_p:
-                    best_p = dice_p
-                    best_epo = epoch
-                    best_model_dir = os.path.join(self.args.save, 'models', str(exp_id))
-                    torch.save(model.state_dict(), os.path.join(best_model_dir, 'best_model.pth'))
-                    with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
-                        f.write(f'best_epoch={epoch + 1}\n')
-                        f.write(f'best_dice={best_p:.6f}\n')
-                        f.write(f'best_train_loss={epoch_metrics["train_loss"]:.6f}\n')
-                        f.write(f'best_val_loss={epoch_metrics["val_loss"]:.6f}\n')
-                        f.write(f'best_jac={epoch_metrics["jac"]:.6f}\n')
-                        f.write(f'best_clDice={epoch_metrics["cldice"]:.6f}\n')
+                if val_loader is not None:
+                    print('RUN VALIDATION ON validation split.')
+
+                    epoch_metrics = self.test_epoch(
+                        net,
+                        val_loader,
+                        epoch,
+                        exp_id,
+                        train_loss=mean_train_loss,
+                        save_batch_triplet=should_save_batch_triplet,
+                        split_name='val',
+                    )
+                    dice_p = epoch_metrics['dice']
+                    if best_p < dice_p:
+                        best_p = dice_p
+                        best_epo = epoch
+                        best_model_dir = os.path.join(self.args.save, 'models', str(exp_id))
+                        torch.save(model.state_dict(), os.path.join(best_model_dir, 'best_model.pth'))
+                        with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
+                            f.write(f'best_epoch={epoch + 1}\n')
+                            f.write(f'best_dice={best_p:.6f}\n')
+                            f.write(f'best_train_loss={epoch_metrics["train_loss"]:.6f}\n')
+                            f.write(f'best_val_loss={epoch_metrics["val_loss"]:.6f}\n')
+                            f.write(f'best_jac={epoch_metrics["jac"]:.6f}\n')
+                            f.write(f'best_clDice={epoch_metrics["cldice"]:.6f}\n')
+                            f.write(
+                                f'best_betti_error_0={epoch_metrics["betti_error_0"]:.6f}\n'
+                            )
+                            f.write(
+                                f'best_betti_error_1={epoch_metrics["betti_error_1"]:.6f}\n'
+                            )
 
                 if (epoch + 1) % self.args.save_per_epochs == 0:
                     torch.save(
@@ -380,15 +509,31 @@ class Solver(object):
                         os.path.join(self.args.save, 'models', str(exp_id), str(epoch + 1) + '_model.pth')
                     )
 
-                if label_mode in ['dist_signed', 'dist_inverted'] and hasattr(self.loss_func, 'get_dist_edge_stats'):
+                if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'get_dist_edge_stats'):
                     dist_edge_stats = self.loss_func.get_dist_edge_stats()
                 else:
                     dist_edge_stats = None
                 writer.add_scalar('epoch/train_loss', float(mean_train_loss), epoch + 1)
-                writer.add_scalar('epoch/val_loss', float(epoch_metrics['val_loss']), epoch + 1)
-                writer.add_scalar('epoch/dice', float(epoch_metrics['dice']), epoch + 1)
-                writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), epoch + 1)
-                writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['val_loss'])):
+                    writer.add_scalar('epoch/val_loss', float(epoch_metrics['val_loss']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['dice'])):
+                    writer.add_scalar('epoch/dice', float(epoch_metrics['dice']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['jac'])):
+                    writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['cldice'])):
+                    writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), epoch + 1)
+                if not math.isnan(float(epoch_metrics['betti_error_0'])):
+                    writer.add_scalar(
+                        'epoch/betti_error_0',
+                        float(epoch_metrics['betti_error_0']),
+                        epoch + 1,
+                    )
+                if not math.isnan(float(epoch_metrics['betti_error_1'])):
+                    writer.add_scalar(
+                        'epoch/betti_error_1',
+                        float(epoch_metrics['betti_error_1']),
+                        epoch + 1,
+                    )
                 for key, value in epoch_metrics.get('val_loss_terms', {}).items():
                     writer.add_scalar(f'val/{key}', float(value), epoch + 1)
                 if dist_edge_stats is not None:
@@ -406,26 +551,65 @@ class Solver(object):
                             dist_edge_stats['edge_nonzero_ratio'],
                         )
                     )
+                elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
+                self._write_epoch_result_row(exp_id, epoch + 1, epoch_metrics, elapsed_hms)
 
-            results_csv = 'results_' + str(exp_id) + '.csv'
-            with open(os.path.join(self.args.save, results_csv), 'a') as f:
-                f.write('%03d,%0.6f \n' % (
-                    best_epo,
-                    best_p
-                ))
+            final_eval_split = 'test' if test_loader is not None else 'val'
+            final_eval_loader = test_loader if test_loader is not None else val_loader
+            if final_eval_loader is None:
+                raise ValueError('Final evaluation requires test_loader or val_loader, but both are None.')
+            best_model_path = os.path.join(self.args.save, 'models', str(exp_id), 'best_model.pth')
+            final_checkpoint_name = ''
+            if val_loader is not None and os.path.exists(best_model_path):
+                print(f'LOAD BEST MODEL FOR FINAL {final_eval_split.upper()} EVAL: {best_model_path}')
+                net.load_state_dict(torch.load(best_model_path, map_location=torch.device('cpu')))
+                net = net.cuda()
+                final_checkpoint_name = 'best_model.pth'
+            else:
+                if val_loader is None:
+                    print(f'VAL LOADER IS NONE; SKIP BEST MODEL SELECTION. USE LAST EPOCH MODEL FOR FINAL {final_eval_split.upper()} EVAL.')
+                else:
+                    print(f'BEST MODEL NOT FOUND; USE LAST EPOCH MODEL FOR FINAL {final_eval_split.upper()} EVAL.')
+                final_checkpoint_name = 'last_epoch_model'
+
+            print(f'RUN FINAL {final_eval_split.upper()} EVAL AFTER TRAINING.')
+            final_eval_epoch = epoch + 1
+            total_elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
+            final_eval_metrics = self.test_epoch(
+                net,
+                final_eval_loader,
+                epoch,
+                exp_id,
+                train_loss=epoch_metrics['train_loss'],
+                save_batch_triplet=True,
+                split_name=final_eval_split,
+            )
+            self._write_eval_summary(
+                exp_id,
+                'final',
+                final_eval_metrics,
+                checkpoint_name=final_checkpoint_name,
+                evaluated_split=final_eval_split,
+                eval_epoch=final_eval_epoch,
+                elapsed_hms=total_elapsed_hms,
+            )
 
             print('FINISH.')
             writer.close()
 
-    def test_epoch(self, model, loader, epoch, exp_id, train_loss=float('nan'), save_batch_triplet=False):
+    def test_epoch(self, model, loader, epoch, exp_id, train_loss=float('nan'), save_batch_triplet=False, split_name='test'):
         model.eval()
         self.dice_ls = []
         self.Jac_ls = []
         self.cldc_ls = []
+        self.betti_error_0_ls = []
+        self.betti_error_1_ls = []
         self.val_loss_ls = []
         sample_metric_rows = []
 
-        sample_csv = os.path.join(self.args.save, 'models', str(exp_id), 'test_sample_metrics.csv')
+        sample_csv = os.path.join(
+            self.args.save, 'models', str(exp_id), f'{split_name}_sample_metrics.csv'
+        )
         os.makedirs(os.path.dirname(sample_csv), exist_ok=True)
 
         with torch.no_grad():
@@ -456,7 +640,7 @@ class Solver(object):
                 verti_translation = self.verti_translation.repeat(batch, 1, 1, 1).cuda()
 
                 if self.args.num_class == 1:
-                    if self.loss_func.label_mode in ['dist_signed', 'dist_inverted']:
+                    if self.loss_func.label_mode in ['dist', 'dist_inverted']:
                         # Keep eval path aligned with the distance training path:
                         # sigmoid affinity -> bilateral voting -> mask-probability threshold.
                         pred_conn_prob = torch.sigmoid(output_test).view(
@@ -485,12 +669,25 @@ class Solver(object):
 
                     dice, Jac = self.per_class_dice(pred, gt_mask)
                     sample_cldc = []
+                    sample_betti_error_0 = []
+                    sample_betti_error_1 = []
                     for b_idx in range(batch):
                         pred_np = pred[b_idx, 0].detach().cpu().numpy()
                         target_np = gt_mask[b_idx, 0].detach().cpu().numpy()
                         cldc = float(clDice(pred_np, target_np))
                         sample_cldc.append(cldc)
                         self.cldc_ls.append(cldc)
+                        betti0_error_ls, betti1_error_ls = getBettiErrors(
+                            pred[b_idx, 0], gt_mask[b_idx, 0]
+                        )
+                        sample_betti_error_0.append(
+                            float(np.mean(betti0_error_ls)) if len(betti0_error_ls) > 0 else float('nan')
+                        )
+                        sample_betti_error_1.append(
+                            float(np.mean(betti1_error_ls)) if len(betti1_error_ls) > 0 else float('nan')
+                        )
+                        self.betti_error_0_ls.append(sample_betti_error_0[-1])
+                        self.betti_error_1_ls.append(sample_betti_error_1[-1])
                 else:
                     # multi-class branch
                     y_test = y_test_raw.long()
@@ -506,6 +703,10 @@ class Solver(object):
 
                     dice, Jac = self.per_class_dice(pred, y_test)
                     sample_cldc = [float('nan')] * batch
+                    sample_betti_error_0 = [float('nan')] * batch
+                    sample_betti_error_1 = [float('nan')] * batch
+                    self.betti_error_0_ls += sample_betti_error_0
+                    self.betti_error_1_ls += sample_betti_error_1
 
                 if save_batch_triplet:
                     self.save_checkpoint_batch_triplet(
@@ -534,6 +735,8 @@ class Solver(object):
                         'dice': float(sample_dice[b_idx].item()),
                         'jac': float(sample_jac[b_idx].item()),
                         'cldice': float(sample_cldc[b_idx]),
+                        'betti_error_0': float(sample_betti_error_0[b_idx]),
+                        'betti_error_1': float(sample_betti_error_1[b_idx]),
                     })
 
                 if j_batch % (max(1, int(len(loader) / 5))) == 0:
@@ -547,25 +750,33 @@ class Solver(object):
             total_dice = np.mean(dice_ls)
             total_val_loss = float(np.mean(self.val_loss_ls)) if self.val_loss_ls else float('nan')
             total_cldice = float(np.mean(self.cldc_ls)) if len(self.cldc_ls) > 0 else float('nan')
+            total_betti_error_0 = (
+                float(np.mean(self.betti_error_0_ls))
+                if len(self.betti_error_0_ls) > 0 else float('nan')
+            )
+            total_betti_error_1 = (
+                float(np.mean(self.betti_error_1_ls))
+                if len(self.betti_error_1_ls) > 0 else float('nan')
+            )
             if 'val_term_counts' in locals() and val_term_counts > 0:
                 val_loss_terms = {k: (v / val_term_counts) for k, v in val_term_sums.items()}
             else:
                 val_loss_terms = {}
 
-            results_csv = 'results_' + str(exp_id) + '.csv'
-            with open(os.path.join(self.args.save, results_csv), 'a') as f:
-                f.write('%03d,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f\n' % (
-                    (epoch + 1),
-                    train_loss,
-                    total_val_loss,
-                    total_dice,
-                    np.mean(Jac_ls),
-                    total_cldice
-                ))
-
             write_header = not os.path.exists(sample_csv)
             with open(sample_csv, 'a', newline='') as f:
-                fieldnames = ['epoch', 'batch', 'sample_in_batch', 'sample_name', 'val_loss', 'dice', 'jac', 'cldice']
+                fieldnames = [
+                    'epoch',
+                    'batch',
+                    'sample_in_batch',
+                    'sample_name',
+                    'val_loss',
+                    'dice',
+                    'jac',
+                    'cldice',
+                    'betti_error_0',
+                    'betti_error_1',
+                ]
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if write_header:
                     writer.writeheader()
@@ -575,6 +786,8 @@ class Solver(object):
                 'dice': float(np.mean(self.dice_ls)),
                 'jac': float(np.mean(Jac_ls)),
                 'cldice': total_cldice,
+                'betti_error_0': total_betti_error_0,
+                'betti_error_1': total_betti_error_1,
                 'val_loss': float(total_val_loss),
                 'train_loss': float(train_loss),
                 'val_loss_terms': val_loss_terms,

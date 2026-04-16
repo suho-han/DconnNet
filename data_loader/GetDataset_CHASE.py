@@ -147,7 +147,7 @@ def default_DRIVE_loader(img_path, mask_path, train=False, label_mode='binary'):
     img = cv2.resize(img, (960, 960))
     if label_mode == 'binary':
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    elif label_mode in ['dist_signed', 'dist_inverted']:
+    elif label_mode in ['dist', 'dist_inverted']:
         mask = np.load(mask_path, allow_pickle=True)
     # mask = np.array(Image.open(mask_path))
     # print(img.shape,mask.shape)
@@ -174,7 +174,7 @@ def default_DRIVE_loader(img_path, mask_path, train=False, label_mode='binary'):
         mask = mask / 255.0
         mask[mask >= 0.5] = 1
         mask[mask <= 0.5] = 0
-    elif label_mode in ['dist_signed', 'dist_inverted']:
+    elif label_mode in ['dist', 'dist_inverted']:
         # Distance maps are already normalized in [0, 1]; avoid extra /255 scaling.
         pass
     # mask = abs(mask-1)
@@ -255,9 +255,9 @@ class MyDataset_CHASE(data.Dataset):
 
         if self.label_mode == 'binary':
             label_postfix = '_1stHO.png'
-        elif self.label_mode == 'dist_signed':
-            gt_path = train_root+'/gt_dist_signed/'
-            label_postfix = '_1stHO_dist_signed.npy'
+        elif self.label_mode == 'dist':
+            gt_path = train_root+'/gt_dist/'
+            label_postfix = '_1stHO_dist.npy'
         elif self.label_mode == 'dist_inverted':
             gt_path = train_root+'/gt_dist_inverted/'
             label_postfix = '_1stHO_dist_inverted.npy'

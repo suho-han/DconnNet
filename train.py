@@ -22,6 +22,12 @@ from solver import Solver
 torch.cuda.set_device(1)  # GPU id
 
 
+def get_experiment_output_name(args):
+    if args.label_mode == 'binary':
+        return f'binary_{args.conn_num}_bce'
+    return f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='DconnNet Training With Pytorch')
@@ -35,7 +41,7 @@ def parse_args():
     parser.add_argument('--resize', type=int, default=[256, 256], nargs='+',
                         help='image size: [height, width]')
     parser.add_argument('--label_mode', type=str, default='binary',
-                        help='label mode (used in CHASE): binary, dist_signed, dist_inverted')
+                        help='label mode (used in CHASE): binary, dist, dist_inverted')
 
     # network option & hyper-parameters
     parser.add_argument('--num-class', type=int, default=4, metavar='N',
@@ -55,17 +61,19 @@ def parse_args():
 
     parser.add_argument('--use_SDL', action='store_true', default=False,
                         help='set as True if use SDL loss; only for Retouch dataset in this code. If you use it with other dataset please define your own path of label distribution in solver.py')
-    parser.add_argument('--folds', type=int, default=3,
+    parser.add_argument('--folds', type=int, default=1,
                         help='define folds number K for K-fold validation')
-    parser.add_argument('--conn_num', type=int, default=8,
-                        help='the number of connections for DconnNet')
+    parser.add_argument('--target_fold', type=int, default=None,
+                        help='1-based fold index to run; default runs all folds')
+    parser.add_argument('--conn_num', type=int, default=8, choices=[8, 24],
+                        help='the number of connections for DconnNet (supported: 8, 24)')
     parser.add_argument('--tau', type=float, default=3.0,
                         help='the temperature parameter tau for the distance connectivity loss')
     parser.add_argument('--sigma', type=float, default=2.0,
                         help='the weight parameter sigma for the distance connectivity loss')
     parser.add_argument('--dist_aux_loss', type=str, default='smooth_l1',
                         choices=['smooth_l1', 'gjml_sf_l1'],
-                        help='auxiliary regression loss for dist_signed/dist_inverted affinity targets')
+                        help='auxiliary regression loss for dist/dist_inverted affinity targets')
     parser.add_argument('--dist_sf_l1_gamma', type=float, default=1.0,
                         help='gamma for Stable Focal-L1 when --dist_aux_loss=gjml_sf_l1')
 
@@ -77,9 +85,9 @@ def parse_args():
     parser.add_argument('--save', default='save',
                         help='Directory for saving checkpoint models')
     parser.add_argument('--output_dir', type=str, default='output/',
-                        help='base output directory; save path becomes output_dir/label_mode_conn_num')
+                        help='base output directory; save path becomes output_dir/<fold_scope>/<experiment_name> (binary: binary_conn_bce, dist: label_mode_conn_dist_aux_loss)')
 
-    parser.add_argument('--save-per-epochs', type=int, default=15,
+    parser.add_argument('--save-per-epochs', type=int, default=50,
                         help='per epochs to save')
 
     # evaluation only
@@ -88,10 +96,17 @@ def parse_args():
     args = parser.parse_args()
 
     if args.output_dir:
-        args.save = os.path.join(args.output_dir, f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}")
+        args.save = os.path.join(
+            args.output_dir,
+            args.dataset,
+            get_experiment_output_name(args),
+        )
 
-    if not os.path.isdir(args.save):
-        os.makedirs(args.save)
+    os.makedirs(args.save, exist_ok=True)
+
+    if args.target_fold is not None:
+        if args.target_fold < 1 or args.target_fold > args.folds:
+            parser.error('--target_fold must be within [1, --folds]')
 
     return args
 
@@ -99,13 +114,25 @@ def parse_args():
 def main(args):
 
     ## K-fold cross validation ##
-    for exp_id in range(args.folds):
+    if args.target_fold is None:
+        exp_indices = range(args.folds)
+    else:
+        exp_indices = [args.target_fold - 1]
+
+    for exp_id in exp_indices:
+        validset = None
+        testset = None
+        val_loader = None
+        test_loader = None
 
         if args.dataset == 'isic':
-            trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='train',
-                                        with_name=False)
-            validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='test',
-                                        with_name=False)
+            if args.folds == 1:
+                trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='train', with_name=False)
+                validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='validation', with_name=False)
+                testset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='test', with_name=False)
+            else:
+                trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='train', with_name=False)
+                validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='test', with_name=False)
         elif 'retouch' in args.dataset:
             device_name = args.dataset.split('-')[1]
             path = args.data_root + '/'+device_name + '/train'
@@ -140,25 +167,35 @@ def main(args):
         elif args.dataset == 'chase':
             overall_id = ['01', '02', '03', '04', '05', '06',
                           '07', '08', '09', '10', '11', '12', '13', '14']
-            test_id = overall_id[3*exp_id:3*(exp_id+1)]
-            train_id = list(set(overall_id)-set(test_id))
+            if args.folds == 1:
+                train_id = overall_id[:10]
+                test_id = overall_id[10:]
+            else:
+                test_id = overall_id[3*exp_id:3*(exp_id+1)]
+                train_id = list(set(overall_id)-set(test_id))
             # print(train_id)
             trainset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=train_id, mode='train', label_mode=args.label_mode)
-            validset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
+            # CHASE uses the held-out fold as the evaluation split during training
+            # and for the final post-training evaluation.
+            testset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
 
         else:
             ####  define how you get the data on your own dataset ######
             pass
 
-        train_loader = torch.utils.data.DataLoader(
-            dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=6)
-        val_loader = torch.utils.data.DataLoader(
-            dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
-
+        train_loader = torch.utils.data.DataLoader(dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=6)
         print("Train batch number: %i" % len(train_loader))
-        print("Test batch number: %i" % len(val_loader))
+        if validset is not None:
+            val_loader = torch.utils.data.DataLoader(dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+            print("Validation batch number: %i" % len(val_loader))
+        if testset is not None:
+            test_loader = torch.utils.data.DataLoader(dataset=testset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+            print("Test batch number: %i" % len(test_loader))
+        elif val_loader is not None:
+            # Backward-compatible fallback for datasets that expose only one held-out split.
+            test_loader = val_loader
 
-        #### Above: define how you get the data on your own dataset ######
+            #### Above: define how you get the data on your own dataset ######
         model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).cuda()
 
         if args.pretrained:
@@ -169,7 +206,8 @@ def main(args):
         solver = Solver(args)
 
         solver.train(model, train_loader, val_loader,
-                     exp_id+1, num_epochs=args.epochs, label_mode=args.label_mode)
+                     exp_id+1, num_epochs=args.epochs, label_mode=args.label_mode,
+                     test_loader=test_loader)
 
 
 if __name__ == '__main__':

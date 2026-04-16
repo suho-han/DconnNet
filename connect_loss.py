@@ -10,6 +10,73 @@ from skimage.io import imread, imsave
 from torch.autograd import Function, Variable
 from torch.nn.modules.loss import _Loss
 
+CANONICAL_8_OFFSETS = [
+    (1, 1),
+    (1, 0),
+    (1, -1),
+    (0, 1),
+    (0, -1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+]
+
+
+def build_center_excluding_offsets(radius):
+    offsets = [
+        offset for offset in CANONICAL_8_OFFSETS
+        if abs(offset[0]) <= radius and abs(offset[1]) <= radius
+    ]
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            if (dy, dx) not in offsets:
+                offsets.append((dy, dx))
+    return offsets
+
+
+CONNECTIVITY_5X5_OFFSETS = build_center_excluding_offsets(radius=2)
+
+
+def resolve_connectivity_layout(conn_num):
+    if conn_num == 8:
+        return {
+            'conn_num': 8,
+            'kernel_size': 3,
+            'include_center': False,
+            'offsets': CANONICAL_8_OFFSETS,
+        }
+    if conn_num == 24:
+        return {
+            'conn_num': 24,
+            'kernel_size': 5,
+            'include_center': False,
+            'offsets': CONNECTIVITY_5X5_OFFSETS,
+        }
+    raise ValueError(f"Unsupported conn_num {conn_num}, only 8 and 24 are supported")
+
+
+def _shift_tensor(x, dy, dx):
+    out = torch.zeros_like(x)
+
+    if dy >= 0:
+        src_y = slice(0, x.shape[2] - dy)
+        dst_y = slice(dy, x.shape[2])
+    else:
+        src_y = slice(-dy, x.shape[2])
+        dst_y = slice(0, x.shape[2] + dy)
+
+    if dx >= 0:
+        src_x = slice(0, x.shape[3] - dx)
+        dst_x = slice(dx, x.shape[3])
+    else:
+        src_x = slice(-dx, x.shape[3])
+        dst_x = slice(0, x.shape[3] + dx)
+
+    out[:, :, dst_y, dst_x] = x[:, :, src_y, src_x]
+    return out
+
 
 def connectivity_matrix(multimask, class_num):
 
@@ -59,38 +126,15 @@ def connectivity_matrix(multimask, class_num):
 
 def connectivity_matrix_5x5(multimask, class_num):
 
-    ##### converting segmentation masks to directional affinity maps ####
+    ##### converting segmentation masks to 24-channel 5x5 directional affinity maps ####
 
     [batch, _, rows, cols] = multimask.shape
-    # batch = 1
-    conn = torch.zeros([batch, class_num*25, rows, cols]).cuda()
+    offsets = resolve_connectivity_layout(24)['offsets']
+    conn = torch.zeros([batch, class_num * len(offsets), rows, cols]).cuda()
     for i in range(class_num):
-        mask = multimask[:, i, :, :]
-        # fill all 25 neighbors from a 5x5 window using offsets (dr, dc) in [2..-2]
-        channel_idx = 0
-        for dr in range(2, -3, -1):
-            for dc in range(2, -3, -1):
-                shifted = torch.zeros([batch, rows, cols]).cuda()
-
-                if dr >= 0:
-                    src_r0, src_r1 = 0, rows - dr
-                    dst_r0, dst_r1 = dr, rows
-                else:
-                    src_r0, src_r1 = -dr, rows
-                    dst_r0, dst_r1 = 0, rows + dr
-
-                if dc >= 0:
-                    src_c0, src_c1 = 0, cols - dc
-                    dst_c0, dst_c1 = dc, cols
-                else:
-                    src_c0, src_c1 = -dc, cols
-                    dst_c0, dst_c1 = 0, cols + dc
-
-                if src_r1 > src_r0 and src_c1 > src_c0:
-                    shifted[:, dst_r0:dst_r1, dst_c0:dst_c1] = mask[:, src_r0:src_r1, src_c0:src_c1]
-
-                conn[:, (i*25)+channel_idx, :, :] = mask * shifted
-                channel_idx += 1
+        mask = multimask[:, i:i + 1, :, :]
+        for channel_idx, shifted in enumerate(shift_n_directions(mask, 24)):
+            conn[:, (i * len(offsets)) + channel_idx, :, :] = (mask * shifted).squeeze(1)
 
     conn = conn.float()
     conn = conn.squeeze()
@@ -101,38 +145,16 @@ def connectivity_matrix_5x5(multimask, class_num):
     return conn
 
 
-def shift_8_directions(x):
+def shift_n_directions(x, conn_num):
     # x: (B, 1, H, W)
-    up = torch.zeros_like(x)
-    down = torch.zeros_like(x)
-    left = torch.zeros_like(x)
-    right = torch.zeros_like(x)
-    up_left = torch.zeros_like(x)
-    up_right = torch.zeros_like(x)
-    down_left = torch.zeros_like(x)
-    down_right = torch.zeros_like(x)
-
-    up[:, :, :-1, :] = x[:, :, 1:, :]
-    down[:, :, 1:, :] = x[:, :, :-1, :]
-    left[:, :, :, :-1] = x[:, :, :, 1:]
-    right[:, :, :, 1:] = x[:, :, :, :-1]
-
-    up_left[:, :, :-1, :-1] = x[:, :, 1:, 1:]
-    up_right[:, :, :-1, 1:] = x[:, :, 1:, :-1]
-    down_left[:, :, 1:, :-1] = x[:, :, :-1, 1:]
-    down_right[:, :, 1:, 1:] = x[:, :, :-1, :-1]
-
-    return [
-        down_right, down, down_left,
-        right, left,
-        up_right, up, up_left
-    ]
+    offsets = resolve_connectivity_layout(conn_num)['offsets']
+    return [_shift_tensor(x, dy, dx) for dy, dx in offsets]
 
 
-def distance_affinity_matrix(dist_map, sigma=2.0):
+def distance_affinity_matrix(dist_map, conn_num, sigma=2.0):
     """
     dist_map : (B, H, W) distance map for each class
-    return: (B, 8*C, H, W) directional affinity map for each class
+    return: (B, conn_num, H, W) directional affinity map for each class
 
     우선 single-class만 구현
     """
@@ -146,14 +168,14 @@ def distance_affinity_matrix(dist_map, sigma=2.0):
 
     D = dist_map.unsqueeze(1)  # (B,1,H,W)
 
-    neighbors_D = shift_8_directions(D)
+    neighbors_D = shift_n_directions(D, conn_num)
 
     conn_list = []
     for D_k in neighbors_D:
         Ck = D * D_k * torch.exp(-torch.abs(D - D_k) / sigma)
         conn_list.append(Ck)
 
-    conn = torch.cat(conn_list, dim=1)   # (B,8,H,W)
+    conn = torch.cat(conn_list, dim=1)   # (B,conn_num,H,W)
     return conn
 
 
@@ -261,14 +283,18 @@ def Bilateral_voting_kxk(affinity_map, hori_translation, verti_translation, conn
             f"got K={K}, expected {without_center_k} or {full_k}"
         )
 
-    # Channel order is aligned with connectivity_matrix_5x5 loop order:
-    # dr from +radius to -radius, dc from +radius to -radius.
-    offsets = []
-    for dy in range(radius, -radius - 1, -1):
-        for dx in range(radius, -radius - 1, -1):
+    offsets = [
+        offset for offset in CANONICAL_8_OFFSETS
+        if abs(offset[0]) <= radius and abs(offset[1]) <= radius
+    ]
+    if include_center and (0, 0) not in offsets:
+        offsets.append((0, 0))
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
             if not include_center and dy == 0 and dx == 0:
                 continue
-            offsets.append((dy, dx))
+            if (dy, dx) not in offsets:
+                offsets.append((dy, dx))
 
     if K != len(offsets):
         raise ValueError(f"Internal offset size mismatch: K={K}, offsets={len(offsets)}")
@@ -452,7 +478,10 @@ class connect_loss(nn.Module):
         # Rebuild binary connectivity from the derived vessel mask before
         # computing the edge target. This keeps the edge definition aligned with
         # the binary path instead of reinterpreting raw distance affinity values.
-        binary_affinity_target = connectivity_matrix(mask_target, self.args.num_class)
+        if self.conn_num == 8:
+            binary_affinity_target = connectivity_matrix(mask_target, self.args.num_class)
+        else:
+            binary_affinity_target = connectivity_matrix_5x5(mask_target, self.args.num_class)
         edge = self.binary_edge_target_from_affinity(binary_affinity_target)
         return self.edge_loss(vote_out, edge), edge
 
@@ -471,6 +500,8 @@ class connect_loss(nn.Module):
         # affinity_map: (B, 8*C, H, W), B: batch, C: class number
         # target: (B, H, W)
         #######
+        if self.conn_num != 8:
+            raise ValueError("multi-class mode currently supports only conn_num=8")
         target = target.type(torch.LongTensor).cuda()
         batch_num = affinity_map.shape[0]
         onehotmask = F.one_hot(target.long(), self.args.num_class)  # change it to your class number if needed
@@ -536,15 +567,17 @@ class connect_loss(nn.Module):
         if self.label_mode == 'binary':
             if self.conn_num == 8:
                 con_target = connectivity_matrix(target, self.args.num_class)  # (B, 8, H, W)
-            elif self.conn_num == 25:
-                con_target = connectivity_matrix_5x5(target, self.args.num_class)  # (B, 25, H, W)
+            elif self.conn_num == 24:
+                con_target = connectivity_matrix_5x5(target, self.args.num_class)  # (B, 24, H, W)
             else:
-                raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 25 are supported")
+                raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 24 are supported")
             affinity_target = con_target
         else:
-            if self.conn_num != 8:
-                raise ValueError("distance label modes currently support only conn_num=8")
-            affinity_target = distance_affinity_matrix(target, sigma=self.sigma)  # (B, 8, H, W)
+            affinity_target = distance_affinity_matrix(
+                target,
+                conn_num=self.conn_num,
+                sigma=self.sigma,
+            )
 
         # matrix for shifting
         hori_translation = self.hori_translation.repeat(batch_num, 1, 1, 1).cuda()
@@ -564,13 +597,11 @@ class connect_loss(nn.Module):
         class_pred = c_map.view([c_map.shape[0], self.args.num_class, self.conn_num, c_map.shape[2], c_map.shape[3]])
         if self.conn_num == 8:
             pred, bicon_map = Bilateral_voting(class_pred, hori_translation, verti_translation)
-        elif self.conn_num == 25:
-            kxk_size = int(math.sqrt(self.conn_num))
-            if kxk_size * kxk_size != self.conn_num:
-                raise ValueError(f"conn_num={self.conn_num} is not a perfect square for kxk voting")
+        elif self.conn_num == 24:
+            kxk_size = resolve_connectivity_layout(self.conn_num)['kernel_size']
             pred, bicon_map = Bilateral_voting_kxk(class_pred, hori_translation, verti_translation, conn_num=kxk_size)
         else:
-            raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 25 are supported")
+            raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 24 are supported")
 
         if self.label_mode == 'binary':
             edge = torch.where((sum_conn < self.conn_num) & (sum_conn > 0), torch.full_like(sum_conn, 1), torch.full_like(sum_conn, 0))
@@ -595,7 +626,7 @@ class connect_loss(nn.Module):
                 'dice': dice_l,
             }
 
-        elif self.label_mode in ['dist_signed', 'dist_inverted']:
+        elif self.label_mode in ['dist', 'dist_inverted']:
             mask_target = self.dist_target_to_mask(target)
             edge_l, edge = self.dist_edge_loss(bicon_map, mask_target)
 
@@ -609,7 +640,7 @@ class connect_loss(nn.Module):
             # Binary path predicts the final vessel mask; keep that property for
             # distance mode as well, while using the distance map as an affinity
             # regression target.
-            vote_loss = self.BCEloss(pred, mask_target).mean()
+            vote_loss = self.dist_aux_regression_loss(pred, mask_target).mean()
             dice_l = self.dice_loss(pred[:, 0], mask_target[:, 0])
             affinity_l = self.dist_aux_regression_loss(c_map, affinity_target)
 

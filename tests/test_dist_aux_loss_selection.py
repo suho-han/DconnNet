@@ -31,7 +31,7 @@ def _make_loss_module(dataset='chase', dist_aux_loss='smooth_l1', gamma=1.0, siz
         args,
         _build_shift_matrix(size),
         _build_shift_matrix(size),
-        label_mode='dist_signed',
+        label_mode='dist',
         conn_num=8,
         sigma=2.0,
     )
