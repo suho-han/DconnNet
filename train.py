@@ -13,13 +13,11 @@ from skimage.io import imread, imsave
 from torch.autograd import Variable
 from torchvision import datasets, transforms
 
-from data_loader.GetDataset_CHASE import MyDataset_CHASE
+from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE
 from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
 from data_loader.GetDataset_Retouch import MyDataset
 from model.DconnNet import DconnNet
 from solver import Solver
-
-torch.cuda.set_device(1)  # GPU id
 
 
 def get_experiment_output_name(args):
@@ -32,9 +30,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='DconnNet Training With Pytorch')
 
+    parser.add_argument('--device', type=int, default=1,)
+
     # dataset info
     parser.add_argument('--dataset', type=str, default='retouch-Spectrailis',
-                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase')
+                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive')
 
     parser.add_argument('--data_root', type=str, default='/retouch',
                         help='dataset directory')
@@ -80,7 +80,7 @@ def parse_args():
     # checkpoint and log
     parser.add_argument('--pretrained', type=str, default=None,
                         help='put the path to resuming file if needed')
-    parser.add_argument('--weights', type=str, default='/home/ziyun/Desktop/project/BiconNet_codes/DconnNet/general/data_loader/retouch_weights/',
+    parser.add_argument('--weights', type=str, default='/data_loader/retouch_weights/',
                         help='path of SDL weights')
     parser.add_argument('--save', default='save',
                         help='Directory for saving checkpoint models')
@@ -113,6 +113,7 @@ def parse_args():
 
 def main(args):
 
+    torch.cuda.set_device(args.device)  # GPU id
     ## K-fold cross validation ##
     if args.target_fold is None:
         exp_indices = range(args.folds)
@@ -179,17 +180,20 @@ def main(args):
             # and for the final post-training evaluation.
             testset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
 
+        elif args.dataset == 'drive':
+            trainset = MyDataset_DRIVE(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
+            testset = MyDataset_DRIVE(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
         else:
-            ####  define how you get the data on your own dataset ######
+            raise ValueError(f"Unsupported dataset: {args.dataset}")
             pass
 
-        train_loader = torch.utils.data.DataLoader(dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=6)
+        train_loader = torch.utils.data.DataLoader(dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=8)
         print("Train batch number: %i" % len(train_loader))
         if validset is not None:
-            val_loader = torch.utils.data.DataLoader(dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+            val_loader = torch.utils.data.DataLoader(dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=8)
             print("Validation batch number: %i" % len(val_loader))
         if testset is not None:
-            test_loader = torch.utils.data.DataLoader(dataset=testset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+            test_loader = torch.utils.data.DataLoader(dataset=testset, batch_size=1, shuffle=False, pin_memory=True, num_workers=8)
             print("Test batch number: %i" % len(test_loader))
         elif val_loader is not None:
             # Backward-compatible fallback for datasets that expose only one held-out split.
