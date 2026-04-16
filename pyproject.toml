@@ -9,6 +9,7 @@ dependencies = [
     "autopep8>=2.3.2",
     "autorootcwd>=1.0.1",
     "isort>=8.0.1",
+    "kaggle>=2.0.1",
     "matplotlib>=3.10.8",
     "nibabel>=5.4.2",
     "numpy>=2.4.4",

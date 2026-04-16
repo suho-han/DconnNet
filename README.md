@@ -51,10 +51,26 @@ Please store the each dataset in the following path:
 The resized data we used and the training pipeline in our paper follows [this site](https://github.com/duweidai/Ms-RED) with following hyperparameters:
 
 ```
-/ISIC2018_npy_all_224_320
+/ISIC2018_img
+  /train
+    /images
+    /labels
+  /val
+    /images
+    /labels
+  /test
+    /images
+    /labels
+
+/ISIC2018
   /image
   /label
+```
 
+Run `scripts/prepare_isic2018_npy.py` once to migrate the raw split tree into `ISIC2018_img` and build the resized `(224, 320)` `.npy` artifacts under `ISIC2018`.
+`scripts/isic2018_train.sh` now assumes that prepared flat dataset already exists under `data/ISIC2018/{image,label}` and does not rebuild it during training.
+
+```
 Image size: (224, 320)
 batch size: 10
 epoch: 200

@@ -68,15 +68,11 @@ class ISIC2018_dataset(Dataset):
 
         if self.train_type in ['train', 'validation', 'test']:
             # this is for cross validation
-            with open(join(self.folder_file, self.folder_file.split('/')[-1] + '_' + self.train_type + '.list'),
-                      'r') as f:
+            with open(join(self.folder_file, self.folder_file.split('/')[-1] + '_' + self.train_type + '.list'), 'r') as f:
                 self.image_list = f.readlines()
-            self.image_list = [item.replace('\n', '')
-                               for item in self.image_list]
-            self.folder = [join(dataset_folder, 'image', x)
-                           for x in self.image_list]
-            self.mask = [join(dataset_folder, 'label', x.split(
-                '.')[0] + '_segmentation.npy') for x in self.image_list]
+            self.image_list = [item.replace('\n', '') for item in self.image_list]
+            self.folder = [join(dataset_folder, 'image', x) for x in self.image_list]
+            self.mask = [join(dataset_folder, 'label', x.split('.')[0] + '_segmentation.npy') for x in self.image_list]
             # self.folder = sorted([join(dataset_folder, self.train_type, 'image', x) for x in
             #                       listdir(join(dataset_folder, self.train_type, 'image'))])
             # self.mask = sorted([join(dataset_folder, self.train_type, 'label', x) for x in
