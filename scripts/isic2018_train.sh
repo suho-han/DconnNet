@@ -34,6 +34,7 @@ LABEL_MODE="binary"
 DIST_AUX_LOSS="smooth_l1"
 DIST_SF_L1_GAMMA="1.0"
 EPOCHS_OVERRIDE=""
+DEVICE_OVERRIDE=""
 
 print_help() {
   cat <<EOF
@@ -43,6 +44,7 @@ Unified ISIC2018 training launcher.
 Put primary options before extra train.py args.
 
 Primary options:
+  --device <int>                        (optional GPU index; passed to train.py --device)
   --conn_num <int>                      (default: 8; supported: 8, 24)
   --label_mode <binary|dist_signed|dist_inverted> (default: binary)
   --dist_aux_loss <smooth_l1|gjml_sf_l1>          (default: smooth_l1)
@@ -92,6 +94,18 @@ while [ "$#" -gt 0 ]; do
       ;;
     --conn_num=*)
       CONN_NUM="${1#*=}"
+      shift
+      ;;
+    --device)
+      if [ "$#" -lt 2 ]; then
+        echo "Missing value for --device" >&2
+        exit 2
+      fi
+      DEVICE_OVERRIDE="$2"
+      shift 2
+      ;;
+    --device=*)
+      DEVICE_OVERRIDE="${1#*=}"
       shift
       ;;
     --label_mode)
@@ -153,6 +167,15 @@ if [ "${CONN_NUM}" != "8" ] && [ "${CONN_NUM}" != "24" ]; then
   exit 2
 fi
 
+if [ -n "${DEVICE_OVERRIDE}" ]; then
+  case "${DEVICE_OVERRIDE}" in
+    ''|*[!0-9]*)
+      echo "Unsupported --device: ${DEVICE_OVERRIDE} (expected non-negative integer)" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 if [ -n "${EPOCHS_OVERRIDE}" ]; then
   EPOCHS="${EPOCHS_OVERRIDE}"
 else
@@ -160,6 +183,11 @@ else
 fi
 
 cd "${REPO_ROOT}"
+
+DEVICE_ARGS=""
+if [ -n "${DEVICE_OVERRIDE}" ]; then
+  DEVICE_ARGS="--device ${DEVICE_OVERRIDE}"
+fi
 
 if [ ! -d "${REPO_ROOT}/data/ISIC2018/image" ] || [ ! -d "${REPO_ROOT}/data/ISIC2018/label" ]; then
   echo "Missing prepared ISIC2018 npy dataset under data/ISIC2018/{image,label}" >&2
@@ -172,7 +200,7 @@ fi
   --data_root 'data/ISIC2018' \
   --resize 224 320 \
   --num-class 1 \
-  --batch-size 16 \
+  --batch-size 64 \
   --epochs "${EPOCHS}" \
   --lr 0.0038 \
   --lr-update 'poly' \
@@ -181,4 +209,5 @@ fi
   --label_mode "${LABEL_MODE}" \
   --dist_aux_loss "${DIST_AUX_LOSS}" \
   --dist_sf_l1_gamma "${DIST_SF_L1_GAMMA}" \
+  ${DEVICE_ARGS} \
   "$@"

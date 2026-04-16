@@ -17,30 +17,7 @@ EPOCHS="${MULTI_TRAIN_EPOCHS:-500}"
 FOLDS="${MULTI_TRAIN_FOLDS:-1}"
 EXTRA_ARGS=("$@")
 
-for conn_num in 8 24; do
-    for dist_aux_loss in gjml_sf_l1 smooth_l1; do
-        for label_mode in dist dist_inverted; do
-            bash scripts/chasedb1_train.sh \
-                --conn_num "${conn_num}" \
-                --label_mode "${label_mode}" \
-                --epochs "${EPOCHS}" \
-                --dist_aux_loss "${dist_aux_loss}" \
-                --dist_sf_l1_gamma 1.0 \
-                --folds "${FOLDS}" \
-                "${EXTRA_ARGS[@]}"
-        done
-    done
-done
-
-for conn_num in 8 24; do
-    bash scripts/chasedb1_train.sh \
-        --conn_num "${conn_num}" \
-        --label_mode binary \
-        --epochs "${EPOCHS}" \
-        --folds "${FOLDS}" \
-        "${EXTRA_ARGS[@]}"
-done
-
+ 
 
 for conn_num in 8 24; do
     bash scripts/isic2018_train.sh \
@@ -48,6 +25,7 @@ for conn_num in 8 24; do
         --label_mode binary \
         --epochs "${EPOCHS}" \
         --folds "${FOLDS}" \
+        --device 1 \
         "${EXTRA_ARGS[@]}"
 done
 
@@ -61,6 +39,7 @@ for conn_num in 8 24; do
                 --dist_aux_loss "${dist_aux_loss}" \
                 --dist_sf_l1_gamma 1.0 \
                 --folds "${FOLDS}" \
+                --device 1 \
                 "${EXTRA_ARGS[@]}"
         done
     done

@@ -2,7 +2,7 @@
 cd ..
 python train.py \
 --dataset 'retouch-Cirrus' \
---data_root '/home/ziyun/Desktop/project/retouch/dataset' \
+--data_root '/retouch/dataset' \
 --resize 256 256 \
 --num-class 4 \
 --batch-size 8 \
