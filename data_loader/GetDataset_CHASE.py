@@ -18,9 +18,7 @@ from skimage.io import imread, imsave
 from torchvision import transforms
 
 
-def randomHueSaturationValue(image, hue_shift_limit=(-180, 180),
-                             sat_shift_limit=(-255, 255),
-                             val_shift_limit=(-255, 255), u=0.5):
+def randomHueSaturationValue(image, hue_shift_limit=(-180, 180), sat_shift_limit=(-255, 255), val_shift_limit=(-255, 255), u=0.5):
     if np.random.random() < u:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(image)
@@ -40,12 +38,7 @@ def randomHueSaturationValue(image, hue_shift_limit=(-180, 180),
     return image
 
 
-def randomShiftScaleRotate(image, mask,
-                           shift_limit=(-0.0, 0.0),
-                           scale_limit=(-0.0, 0.0),
-                           rotate_limit=(-0.0, 0.0),
-                           aspect_limit=(-0.0, 0.0),
-                           borderMode=cv2.BORDER_CONSTANT, u=0.5):
+def randomShiftScaleRotate(image, mask, shift_limit=(-0.0, 0.0), scale_limit=(-0.0, 0.0), rotate_limit=(-0.0, 0.0), aspect_limit=(-0.0, 0.0), borderMode=cv2.BORDER_CONSTANT, u=0.5):
     if np.random.random() < u:
         height, width, channel = image.shape
 
@@ -69,14 +62,8 @@ def randomShiftScaleRotate(image, mask,
         box0 = box0.astype(np.float32)
         box1 = box1.astype(np.float32)
         mat = cv2.getPerspectiveTransform(box0, box1)
-        image = cv2.warpPerspective(image, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=borderMode,
-                                    borderValue=(
-                                        0, 0,
-                                        0,))
-        mask = cv2.warpPerspective(mask, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=borderMode,
-                                   borderValue=(
-                                       0, 0,
-                                       0,))
+        image = cv2.warpPerspective(image, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=borderMode, borderValue=(0, 0, 0,))
+        mask = cv2.warpPerspective(mask, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=borderMode, borderValue=(0, 0, 0,))
 
     return image, mask
 
@@ -115,16 +102,9 @@ def default_loader(img_path, mask_path):
 
     mask = 255. - cv2.resize(mask, (448, 448))
 
-    img = randomHueSaturationValue(img,
-                                   hue_shift_limit=(-30, 30),
-                                   sat_shift_limit=(-5, 5),
-                                   val_shift_limit=(-15, 15))
+    img = randomHueSaturationValue(img, hue_shift_limit=(-30, 30), sat_shift_limit=(-5, 5), val_shift_limit=(-15, 15))
 
-    img, mask = randomShiftScaleRotate(img, mask,
-                                       shift_limit=(-0.1, 0.1),
-                                       scale_limit=(-0.1, 0.1),
-                                       aspect_limit=(-0.1, 0.1),
-                                       rotate_limit=(-0, 0))
+    img, mask = randomShiftScaleRotate(img, mask, shift_limit=(-0.1, 0.1), scale_limit=(-0.1, 0.1), aspect_limit=(-0.1, 0.1), rotate_limit=(-0, 0))
     img, mask = randomHorizontalFlip(img, mask)
     img, mask = randomVerticleFlip(img, mask)
     img, mask = randomRotate90(img, mask)
@@ -153,16 +133,9 @@ def default_DRIVE_loader(img_path, mask_path, train=False, label_mode='binary'):
     # print(img.shape,mask.shape)
     mask = cv2.resize(mask, (960, 960))
     if train:
-        img = randomHueSaturationValue(img,
-                                       hue_shift_limit=(-30, 30),
-                                       sat_shift_limit=(-5, 5),
-                                       val_shift_limit=(-15, 15))
+        img = randomHueSaturationValue(img, hue_shift_limit=(-30, 30), sat_shift_limit=(-5, 5), val_shift_limit=(-15, 15))
 
-        img, mask = randomShiftScaleRotate(img, mask,
-                                           shift_limit=(-0.1, 0.1),
-                                           scale_limit=(-0.1, 0.1),
-                                           aspect_limit=(-0.1, 0.1),
-                                           rotate_limit=(-0, 0))
+        img, mask = randomShiftScaleRotate(img, mask, shift_limit=(-0.1, 0.1), scale_limit=(-0.1, 0.1), aspect_limit=(-0.1, 0.1), rotate_limit=(-0, 0))
         img, mask = randomHorizontalFlip(img, mask)
         img, mask = randomVerticleFlip(img, mask)
         img, mask = randomRotate90(img, mask)
@@ -240,7 +213,6 @@ def _resize_image(image, target):
     return cv2.resize(image, dsize=(target[0], target[1]), interpolation=cv2.INTER_LINEAR)
 
 
-# root = '/home/ziyun/Desktop/Project/Mice_seg/Data_train'
 class MyDataset_CHASE(data.Dataset):
     def __init__(self, args, train_root, pat_ls, mode='train', label_mode='binary'):
         train = True if mode == 'train' else False
@@ -305,7 +277,69 @@ class MyDataset_CHASE(data.Dataset):
         # print(img.max())
         return img.squeeze(0), mask, self.name_ls[index]
 
-    def __len__(self):  # 这个函数也必须要写，它返回的是数据集的长度，也就是多少张图片，要和loader的长度作区分
+    def __len__(self):
+        return len(self.img_ls)
+
+
+class MyDataset_DRIVE(data.Dataset):
+    def __init__(self, args, train_root, mode='train', label_mode='binary'):
+        train = True if mode == 'train' else False
+        self.args = args
+        self.label_mode = label_mode
+        img_path = train_root+'/'+mode+'/images/'
+        gt_path = train_root+'/'+mode+'/masks/'
+
+        img_ls = []
+        mask_ls = []
+        name_ls = []
+
+        if self.label_mode == 'binary':
+            label_postfix = '.gif'
+        elif self.label_mode == 'dist':
+            gt_path = train_root+'/'+mode+'/masks_dist/'
+            label_postfix = '_dist.npy'
+        elif self.label_mode == 'dist_inverted':
+            gt_path = train_root+'/'+mode+'/masks_dist_inverted/'
+            label_postfix = '_dist_inverted.npy'
+
+        img_list = glob.glob(img_path+'*.tif')
+        for img_id in img_list:
+            img = img_path+str(img_id.split('/')[-1])
+            gt = gt_path+str(img_id.split('/')[-1].split('.tif')[0])+label_postfix
+            name = str(img_id.split('/')[-1].split('.tif')[0])
+            img_ls.append(img)
+            mask_ls.append(gt)
+            name_ls.append(name)
+
+        self.train = train
+        # print(file)
+
+        self.name_ls = name_ls
+        self.img_ls = img_ls
+
+        self.mask_ls = mask_ls
+
+        self.normalize = Normalize()
+        self.randomcrop = RandomCrop()
+        self.randomflip = RandomFlip()
+
+        self.totensor = ToTensor()
+
+    def __getitem__(self, index):
+
+        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], self.train, self.label_mode)
+
+        img = torch.Tensor(img)
+        mask = torch.Tensor(mask)
+        # mask = torch.where(mask>0.5,1,0)
+        # conn = connectivity_matrix(mask.unsqueeze(0))
+        # if self.args.resize:
+        #     img = Resize(img[0], None,512,512)
+        # print(img.shape,mask.shape,conn.shape)
+        # print(img.max())
+        return img.squeeze(0), mask, self.name_ls[index]
+
+    def __len__(self):
         return len(self.img_ls)
 
 
