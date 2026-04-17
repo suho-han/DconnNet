@@ -66,12 +66,12 @@ class Solver(object):
         self.hori_translation = self.hori_translation.float()
         self.verti_translation = self.verti_translation.float()
 
-    def create_exp_directory(self, exp_id):
-        exp_model_dir = os.path.join(self.args.save, 'models', str(exp_id))
+    def create_exp_directory(self):
+        exp_model_dir = os.path.join(self.args.save, 'models')
         if not os.path.exists(exp_model_dir):
             os.makedirs(exp_model_dir)
 
-        results_csv = 'results_' + str(exp_id) + '.csv'
+        results_csv = 'results.csv'
         with open(os.path.join(self.args.save, results_csv), 'w') as f:
             f.write(
                 'epoch,train_loss,val_loss,dice,Jac,clDice,precision,accuracy,betti_error_0,betti_error_1,elapsed_hms\n'
@@ -87,8 +87,8 @@ class Solver(object):
         seconds = total_seconds % 60
         return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
-    def _write_epoch_result_row(self, exp_id, epoch, metrics, elapsed_hms=''):
-        results_csv = 'results_' + str(exp_id) + '.csv'
+    def _write_epoch_result_row(self, epoch, metrics, elapsed_hms=''):
+        results_csv = 'results.csv'
         with open(os.path.join(self.args.save, results_csv), 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -109,7 +109,6 @@ class Solver(object):
 
     def _write_eval_summary(
         self,
-        exp_id,
         split_name,
         metrics,
         checkpoint_name='',
@@ -119,7 +118,7 @@ class Solver(object):
     ):
         summary_csv = os.path.join(
             self.args.save,
-            f'{split_name}_results_{exp_id}.csv',
+            f'{split_name}_results.csv',
         )
         with open(summary_csv, 'w', newline='') as f:
             writer = csv.writer(f)
@@ -199,9 +198,9 @@ class Solver(object):
 
         return torch.stack(precision_vals), torch.stack(accuracy_vals)
 
-    def save_checkpoint_batch_triplet(self, images, preds, masks, exp_id, epoch, batch_idx):
+    def save_checkpoint_batch_triplet(self, images, preds, masks, epoch, batch_idx):
         base_dir = os.path.join(
-            self.args.save, 'models', str(exp_id), 'checkpoint_batches', f'epoch_{epoch:03d}'
+            self.args.save, 'models', 'checkpoint_batches', f'epoch_{epoch:03d}'
         )
         image_dir = os.path.join(base_dir, 'image')
         pred_dir = os.path.join(base_dir, 'pred')
@@ -355,12 +354,12 @@ class Solver(object):
         pred_mask = (pred_mask > 0).float()
         return pred_mask
 
-    def train(self, model, train_loader, val_loader, exp_id, num_epochs=10, label_mode='binary', test_loader=None):
+    def train(self, model, train_loader, val_loader, num_epochs=10, label_mode='binary', test_loader=None):
         optim = self.optim(model.parameters(), lr=self.lr)
 
         print('START TRAIN.')
-        self.create_exp_directory(exp_id)
-        tb_dir = os.path.join(self.args.save, 'tensorboard', f'exp_{exp_id}')
+        self.create_exp_directory()
+        tb_dir = os.path.join(self.args.save, 'tensorboard', f'exp')
         writer = SummaryWriter(log_dir=tb_dir)
 
         if self.args.use_SDL:
@@ -370,7 +369,7 @@ class Solver(object):
             )
             device_name = self.args.dataset.split('retouch-')[1]
             pos_cnt = np.load(
-                self.args.weights + device_name + '/training_positive_pixel_' + str(exp_id) + '.npy',
+                self.args.weights + device_name + '/training_positive_pixel.npy',
                 allow_pickle=True
             )
             density, val_in_bin, bin_wide = self.get_density(pos_cnt)
@@ -414,12 +413,10 @@ class Solver(object):
                 net,
                 val_loader if test_loader is None else test_loader,
                 0,
-                exp_id,
                 split_name=eval_split_name,
             )
-            self._write_epoch_result_row(exp_id, 1, test_metrics, elapsed_hms='')
+            self._write_epoch_result_row(1, test_metrics, elapsed_hms='')
             self._write_eval_summary(
-                exp_id,
                 'final',
                 test_metrics,
                 checkpoint_name=os.path.basename(self.args.pretrained) if self.args.pretrained else '',
@@ -521,7 +518,6 @@ class Solver(object):
                         net,
                         val_loader,
                         epoch,
-                        exp_id,
                         train_loss=mean_train_loss,
                         save_batch_triplet=should_save_batch_triplet,
                         split_name='val',
@@ -529,7 +525,7 @@ class Solver(object):
                     dice_p = epoch_metrics['dice']
                     if best_p < dice_p:
                         best_p = dice_p
-                        best_model_dir = os.path.join(self.args.save, 'models', str(exp_id))
+                        best_model_dir = os.path.join(self.args.save, 'models')
                         torch.save(model.state_dict(), os.path.join(best_model_dir, 'best_model.pth'))
                         with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
                             f.write(f'best_epoch={epoch + 1}\n')
@@ -548,7 +544,7 @@ class Solver(object):
                 if (epoch + 1) % self.args.save_per_epochs == 0:
                     torch.save(
                         model.state_dict(),
-                        os.path.join(self.args.save, 'models', str(exp_id), str(epoch + 1) + '_model.pth')
+                        os.path.join(self.args.save, 'models', str(epoch + 1) + '_model.pth')
                     )
 
                 if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'get_dist_edge_stats'):
@@ -599,13 +595,13 @@ class Solver(object):
                     )
                 elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
                 if val_loader is not None:
-                    self._write_epoch_result_row(exp_id, epoch + 1, epoch_metrics, elapsed_hms)
+                    self._write_epoch_result_row(epoch + 1, epoch_metrics, elapsed_hms)
 
             final_eval_split = 'test' if test_loader is not None else 'val'
             final_eval_loader = test_loader if test_loader is not None else val_loader
             if final_eval_loader is None:
                 raise ValueError('Final evaluation requires test_loader or val_loader, but both are None.')
-            best_model_path = os.path.join(self.args.save, 'models', str(exp_id), 'best_model.pth')
+            best_model_path = os.path.join(self.args.save, 'models', 'best_model.pth')
             final_checkpoint_name = ''
             if val_loader is not None and os.path.exists(best_model_path):
                 print(f'LOAD BEST MODEL FOR FINAL {final_eval_split.upper()} EVAL: {best_model_path}')
@@ -626,13 +622,11 @@ class Solver(object):
                 net,
                 final_eval_loader,
                 epoch,
-                exp_id,
                 train_loss=epoch_metrics['train_loss'],
                 save_batch_triplet=True,
                 split_name=final_eval_split,
             )
             self._write_eval_summary(
-                exp_id,
                 'final',
                 final_eval_metrics,
                 checkpoint_name=final_checkpoint_name,
@@ -644,7 +638,7 @@ class Solver(object):
             print('FINISH.')
             writer.close()
 
-    def test_epoch(self, model, loader, epoch, exp_id, train_loss=float('nan'), save_batch_triplet=False, split_name='test'):
+    def test_epoch(self, model, loader, epoch, train_loss=float('nan'), save_batch_triplet=False, split_name='test'):
         model.eval()
         self.dice_ls = []
         self.Jac_ls = []
@@ -657,7 +651,7 @@ class Solver(object):
         sample_metric_rows = []
 
         sample_csv = os.path.join(
-            self.args.save, 'models', str(exp_id), f'{split_name}_sample_metrics.csv'
+            self.args.save, 'models', f'{split_name}_sample_metrics.csv'
         )
         os.makedirs(os.path.dirname(sample_csv), exist_ok=True)
 
@@ -779,7 +773,7 @@ class Solver(object):
 
                 if save_batch_triplet:
                     self.save_checkpoint_batch_triplet(
-                        X_test, pred_to_save, mask_to_save, exp_id, epoch + 1, j_batch
+                        X_test, pred_to_save, mask_to_save, epoch + 1, j_batch
                     )
 
                 # For multi-class segmentation, exclude BG class from averaged metrics

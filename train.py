@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import random
 
 # from GetDataset import MyDataset
 import cv2
@@ -26,11 +27,33 @@ def get_experiment_output_name(args):
     return f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
 
 
+def seed_everything(seed):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='DconnNet Training With Pytorch')
 
     parser.add_argument('--device', type=int, default=1,)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='global random seed for reproducible training/evaluation')
 
     # dataset info
     parser.add_argument('--dataset', type=str, default='retouch-Spectrailis',
@@ -114,104 +137,126 @@ def parse_args():
 def main(args):
 
     torch.cuda.set_device(args.device)  # GPU id
+    seed_everything(args.seed)
+
     ## K-fold cross validation ##
     if args.target_fold is None:
         exp_indices = range(args.folds)
     else:
         exp_indices = [args.target_fold - 1]
 
-    for exp_id in exp_indices:
-        validset = None
-        testset = None
-        val_loader = None
-        test_loader = None
+    seed_everything(args.seed)
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
 
-        if args.dataset == 'isic':
-            if args.folds == 1:
-                trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='train', with_name=False)
-                validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='validation', with_name=False)
-                testset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='test', with_name=False)
-            else:
-                trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='train', with_name=False)
-                validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=exp_id+1, train_type='test', with_name=False)
-        elif 'retouch' in args.dataset:
-            device_name = args.dataset.split('-')[1]
-            path = args.data_root + '/'+device_name + '/train'
-            pat_ls = glob.glob(path+'/*')
+    validset = None
+    testset = None
+    val_loader = None
+    test_loader = None
 
-            # for Cirrus
-            if device_name == 'Cirrus':
-                total_id = [i for i in range(24)]
-                test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
+    if args.dataset == 'isic':
+        trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='train', with_name=False)
+        validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='validation', with_name=False)
+        testset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='test', with_name=False)
 
-            # for Spectrailis
-            if device_name == 'Spectrailis':
-                total_id = [i for i in range(24)]
-                test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
+    elif 'retouch' in args.dataset:
+        raise NotImplementedError("Retouch dataset loading is not implemented in this code. Please implement your own data loading logic based on the commented-out code below or your specific data organization.")
+        # TODO: change when data is ready
+        # device_name = args.dataset.split('-')[1]
+        # path = args.data_root + '/'+device_name + '/train'
+        # pat_ls = glob.glob(path+'/*')
 
-            # for Topcon
-            if device_name == 'Topcon':
-                total_id = [i for i in range(22)]
-                if exp_id < 2:
-                    test_id = [i for i in range(exp_id*7, (exp_id+1)*7)]
-                else:
-                    test_id = [i for i in range(14, 22)]
+        # # for Cirrus
+        # if device_name == 'Cirrus':
+        #     # total_id = [i for i in range(24)]
+        #     # test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
 
-            train_id = set(total_id) - set(test_id)
-            test_root = [pat_ls[i] for i in test_id]
-            train_root = [pat_ls[i] for i in train_id]
-            # print(train_root)
+        # if device_name == 'Spectrailis':
+        # total_id = [i for i in range(24)]
+        # test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
 
-            trainset = MyDataset(args, train_root=train_root, mode='train')
-            validset = MyDataset(args, train_root=test_root, mode='test')
+        # if device_name == 'Topcon':
 
-        elif args.dataset == 'chase':
-            overall_id = ['01', '02', '03', '04', '05', '06',
-                          '07', '08', '09', '10', '11', '12', '13', '14']
-            if args.folds == 1:
-                train_id = overall_id[:10]
-                test_id = overall_id[10:]
-            else:
-                test_id = overall_id[3*exp_id:3*(exp_id+1)]
-                train_id = list(set(overall_id)-set(test_id))
-            # print(train_id)
-            trainset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=train_id, mode='train', label_mode=args.label_mode)
-            # CHASE uses the held-out fold as the evaluation split during training
-            # and for the final post-training evaluation.
-            testset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
+        # total_id = [i for i in range(22)]
+        # if exp_id < 2:
+        #     test_id = [i for i in range(exp_id*7, (exp_id+1)*7)]
+        # else:
+        #     test_id = [i for i in range(14, 22)]
 
-        elif args.dataset == 'drive':
-            trainset = MyDataset_DRIVE(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
-            testset = MyDataset_DRIVE(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
-        else:
-            raise ValueError(f"Unsupported dataset: {args.dataset}")
-            pass
+        # train_id = set(total_id) - set(test_id)
+        # test_root = [pat_ls[i] for i in test_id]
+        # train_root = [pat_ls[i] for i in train_id]
 
-        train_loader = torch.utils.data.DataLoader(dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=8)
-        print("Train batch number: %i" % len(train_loader))
-        if validset is not None:
-            val_loader = torch.utils.data.DataLoader(dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=8)
-            print("Validation batch number: %i" % len(val_loader))
-        if testset is not None:
-            test_loader = torch.utils.data.DataLoader(dataset=testset, batch_size=1, shuffle=False, pin_memory=True, num_workers=8)
-            print("Test batch number: %i" % len(test_loader))
-        elif val_loader is not None:
-            # Backward-compatible fallback for datasets that expose only one held-out split.
-            test_loader = val_loader
+        # trainset = MyDataset(args, train_root=train_root, mode='train')
+        # validset = MyDataset(args, train_root=test_root, mode='test')
 
-            #### Above: define how you get the data on your own dataset ######
-        model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).cuda()
+    elif args.dataset == 'chase':
+        overall_id = ['01', '02', '03', '04', '05', '06',
+                      '07', '08', '09', '10', '11', '12', '13', '14']
+        train_id = overall_id[:10]
+        test_id = overall_id[10:]
+        # print(train_id)
+        trainset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=train_id, mode='train', label_mode=args.label_mode)
+        # CHASE uses the held-out fold as the evaluation split during training
+        # and for the final post-training evaluation.
+        testset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
 
-        if args.pretrained:
-            model.load_state_dict(torch.load(
-                args.pretrained, map_location=torch.device('cpu')))
-            model = model.cuda()
+    elif args.dataset == 'drive':
+        trainset = MyDataset_DRIVE(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
+        testset = MyDataset_DRIVE(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+        pass
 
-        solver = Solver(args)
+    train_loader = torch.utils.data.DataLoader(
+        dataset=trainset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=8,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
+    )
+    print("Train batch number: %i" % len(train_loader))
+    if validset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            dataset=validset,
+            batch_size=1,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=8,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
+        )
+        print("Validation batch number: %i" % len(val_loader))
+    if testset is not None:
+        test_loader = torch.utils.data.DataLoader(
+            dataset=testset,
+            batch_size=1,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=8,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
+        )
+        print("Test batch number: %i" % len(test_loader))
+    elif val_loader is not None:
+        # Backward-compatible fallback for datasets that expose only one held-out split.
+        test_loader = val_loader
 
-        solver.train(model, train_loader, val_loader,
-                     exp_id+1, num_epochs=args.epochs, label_mode=args.label_mode,
-                     test_loader=test_loader)
+        #### Above: define how you get the data on your own dataset ######
+    model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).cuda()
+
+    if args.pretrained:
+        model.load_state_dict(torch.load(
+            args.pretrained, map_location=torch.device('cpu')))
+        model = model.cuda()
+
+    solver = Solver(args)
+
+    solver.train(model, train_loader, val_loader,
+                 num_epochs=args.epochs, label_mode=args.label_mode,
+                 test_loader=test_loader)
 
 
 if __name__ == '__main__':
