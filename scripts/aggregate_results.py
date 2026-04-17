@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
 import argparse
 import csv
 import math
@@ -12,20 +9,23 @@ import subprocess
 from typing import Dict, List, Optional, Set, Tuple
 
 import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
 
 matplotlib.use("Agg")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Aggregate K-fold DconnNet results and export CSV/LaTeX/PDF."
+        description="Aggregate DconnNet results and export CSV/LaTeX/PDF."
     )
     parser.add_argument(
         "--input-root",
         type=str,
         default="output",
         help=(
-            "K-fold result root directory. Supported layouts: "
+            "Result root directory. Supported layouts: "
             "<input-root>/<experiment>/<fold>/<input-name>, "
             "<input-root>/<experiment>/final_results_<fold>.csv, "
             "<input-root>/<scope>/<experiment>/final_results_<fold>.csv "
@@ -36,14 +36,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=str,
-        default="1,2,3,4,5",
+        default="1",
         help="Comma-separated fold ids to aggregate (example: 1,2,3,4,5).",
     )
     parser.add_argument(
         "--input-name",
         type=str,
         default="final_results_{fold}.csv",
-        help="Input CSV file name pattern in each fold directory/root.",
+        help=(
+            "Input CSV file name pattern in each fold directory/root. "
+            "If missing, legacy results_{fold}.csv is also checked automatically."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -54,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-stem",
         type=str,
-        default="kfold_summary",
+        default="summary",
         help="Output file stem (without extension).",
     )
     parser.add_argument(
@@ -116,6 +119,17 @@ def _row_float_from_header(
     return _to_float(value)
 
 
+def _dict_row_float(
+    row: Dict[str, str],
+    key: str,
+    default: float = float("nan"),
+) -> float:
+    value = str(row.get(key, "")).strip()
+    if value == "":
+        return default
+    return _to_float(value)
+
+
 def parse_hms_duration(value: str) -> float:
     value = value.strip()
     if value == "":
@@ -172,6 +186,8 @@ def parse_final_summary_csv(path: str) -> Optional[Dict[str, object]]:
         "best_dice": _to_float(str(row.get("dice", "nan"))),
         "best_jac": _to_float(str(row.get("jac", "nan"))),
         "best_cldice": _to_float(str(row.get("cldice", "nan"))),
+        "best_precision": _dict_row_float(row, "precision"),
+        "best_accuracy": _dict_row_float(row, "accuracy"),
         "best_betti_error_0": _to_float(str(row.get("betti_error_0", "nan"))),
         "best_betti_error_1": _to_float(str(row.get("betti_error_1", "nan"))),
         "train_elapsed_seconds": elapsed_seconds,
@@ -225,6 +241,8 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
                     dice = _to_float(row[header_map["dice"]])
                     jac = _to_float(row[header_map["jac"]])
                     cldice = _to_float(row[header_map["cldice"]])
+                    precision = _row_float_from_header(row, header_map, "precision")
+                    accuracy = _row_float_from_header(row, header_map, "accuracy")
                     betti_error_0 = _row_float_from_header(row, header_map, "betti_error_0")
                     betti_error_1 = _row_float_from_header(row, header_map, "betti_error_1")
                     if (
@@ -238,6 +256,8 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
                         "dice": dice,
                         "jac": jac,
                         "cldice": cldice,
+                        "precision": precision,
+                        "accuracy": accuracy,
                         "betti_error_0": betti_error_0,
                         "betti_error_1": betti_error_1,
                     }
@@ -247,12 +267,16 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
                 dice = _to_float(row[1])
                 jac = _to_float(row[2])
                 cldice = _to_float(row[3])
+                precision = float("nan")
+                accuracy = float("nan")
                 betti_error_0 = _to_float(row[6]) if len(row) >= 7 and row[6] != "" else float("nan")
                 betti_error_1 = _to_float(row[7]) if len(row) >= 8 and row[7] != "" else float("nan")
                 epoch_rows[epoch] = {
                     "dice": dice,
                     "jac": jac,
                     "cldice": cldice,
+                    "precision": precision,
+                    "accuracy": accuracy,
                     "betti_error_0": betti_error_0,
                     "betti_error_1": betti_error_1,
                 }
@@ -261,7 +285,8 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
                 summary_dice = _to_float(row[1])
 
     if not epoch_rows:
-        raise ValueError(f"No epoch rows found in: {path}")
+        print(f"No epoch rows found in: {path}")
+        return None
 
     if summary_epoch is None or summary_dice is None:
         best_epoch, best_metrics = max(
@@ -270,6 +295,8 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
         best_dice = best_metrics["dice"]
         best_jac = best_metrics["jac"]
         best_cldice = best_metrics["cldice"]
+        best_precision = best_metrics.get("precision", float("nan"))
+        best_accuracy = best_metrics.get("accuracy", float("nan"))
         best_betti_error_0 = best_metrics["betti_error_0"]
         best_betti_error_1 = best_metrics["betti_error_1"]
     else:
@@ -278,10 +305,13 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
         if best_epoch in epoch_rows:
             best_jac = epoch_rows[best_epoch]["jac"]
             best_cldice = epoch_rows[best_epoch]["cldice"]
+            best_precision = epoch_rows[best_epoch].get("precision", float("nan"))
+            best_accuracy = epoch_rows[best_epoch].get("accuracy", float("nan"))
             best_betti_error_0 = epoch_rows[best_epoch]["betti_error_0"]
             best_betti_error_1 = epoch_rows[best_epoch]["betti_error_1"]
         else:
             best_jac, best_cldice = float("nan"), float("nan")
+            best_precision, best_accuracy = float("nan"), float("nan")
             best_betti_error_0, best_betti_error_1 = float("nan"), float("nan")
 
     return {
@@ -289,6 +319,8 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
         "best_dice": best_dice,
         "best_jac": best_jac,
         "best_cldice": best_cldice,
+        "best_precision": best_precision,
+        "best_accuracy": best_accuracy,
         "best_betti_error_0": best_betti_error_0,
         "best_betti_error_1": best_betti_error_1,
         "train_elapsed_seconds": last_elapsed_seconds,
@@ -296,38 +328,93 @@ def parse_fold_csv(path: str) -> Dict[str, object]:
     }
 
 
-def resolve_fold_csv_path(input_root: str, fold: str, input_name: str) -> str:
-    default_path = os.path.join(input_root, fold, input_name)
-    if os.path.isfile(default_path):
-        return default_path
-
-    candidates = [
-        os.path.join(input_root, f"final_results_{fold}.csv"),
-    ]
+def build_fold_input_name_candidates(
+    input_name: str,
+    fold: str,
+    allow_legacy_results: bool = True,
+) -> List[str]:
+    candidates: List[str] = []
     if "{fold}" in input_name:
-        candidates.append(os.path.join(input_root, input_name.format(fold=fold)))
+        candidates.append(input_name.format(fold=fold))
     else:
-        candidates.append(os.path.join(input_root, input_name))
+        candidates.append(input_name)
 
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
+    # Keep backward compatibility with legacy per-epoch result summaries.
+    candidates.append(f"final_results_{fold}.csv")
+    if allow_legacy_results:
+        candidates.append(f"results_{fold}.csv")
+    if str(fold) == "1":
+        candidates.append("final_results.csv")
+        if allow_legacy_results:
+            candidates.append("results.csv")
 
-    checked = [default_path] + candidates
+    unique_candidates: List[str] = []
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique_candidates.append(name)
+    return unique_candidates
+
+
+def resolve_fold_csv_path(
+    input_root: str,
+    fold: str,
+    input_name: str,
+    allow_legacy_results: bool = True,
+) -> str:
+    checked: List[str] = []
+    candidate_names = build_fold_input_name_candidates(
+        input_name,
+        fold,
+        allow_legacy_results=allow_legacy_results,
+    )
+
+    for candidate_name in candidate_names:
+        fold_dir_candidate = os.path.join(input_root, fold, candidate_name)
+        checked.append(fold_dir_candidate)
+        if os.path.isfile(fold_dir_candidate):
+            return fold_dir_candidate
+
+    for candidate_name in candidate_names:
+        root_candidate = os.path.join(input_root, candidate_name)
+        checked.append(root_candidate)
+        if os.path.isfile(root_candidate):
+            return root_candidate
+
     raise FileNotFoundError(
         "Missing fold CSV for fold "
         f"{fold}. Checked: {', '.join(checked)}"
     )
 
 
-def discover_available_folds(input_root: str, input_name: str) -> List[str]:
+def discover_available_folds(
+    input_root: str,
+    input_name: str,
+    allow_legacy_results: bool = True,
+) -> List[str]:
     discovered = set()
     if not os.path.isdir(input_root):
         return []
 
+    single_run_candidates = ["final_results.csv"]
+    if allow_legacy_results:
+        single_run_candidates.append("results.csv")
+    if any(os.path.isfile(os.path.join(input_root, name)) for name in single_run_candidates):
+        discovered.add("1")
+
     for entry in os.listdir(input_root):
         entry_path = os.path.join(input_root, entry)
-        if entry.isdigit() and os.path.isfile(os.path.join(entry_path, input_name)):
+        if not entry.isdigit() or not os.path.isdir(entry_path):
+            continue
+
+        candidate_names = build_fold_input_name_candidates(
+            input_name,
+            entry,
+            allow_legacy_results=allow_legacy_results,
+        )
+        if any(os.path.isfile(os.path.join(entry_path, name)) for name in candidate_names):
             discovered.add(entry)
 
     if "{fold}" in input_name:
@@ -341,8 +428,15 @@ def discover_available_folds(input_root: str, input_name: str) -> List[str]:
 
     for entry in os.listdir(input_root):
         if not entry.startswith("final_results_") or not entry.endswith(".csv"):
-            continue
-        fold = entry[len("final_results_"):-len(".csv")]
+            if allow_legacy_results:
+                match = re.fullmatch(r"results_(\d+)\.csv", entry)
+                if match is None:
+                    continue
+                fold = match.group(1)
+            else:
+                continue
+        else:
+            fold = entry[len("final_results_"):-len(".csv")]
         if fold.isdigit():
             discovered.add(fold)
 
@@ -466,21 +560,35 @@ def discover_target_roots(input_root: str, folds: List[str], input_name: str) ->
     )
 
 
+def root_has_completed_final_results(input_root: str, folds: List[str], input_name: str) -> bool:
+    for fold in folds:
+        try:
+            resolve_fold_csv_path(
+                input_root,
+                fold,
+                input_name,
+                allow_legacy_results=False,
+            )
+        except FileNotFoundError:
+            return False
+    return True
+
+
 def resolve_folds_for_root(input_root: str, requested_folds: List[str], input_name: str) -> List[str]:
     missing = []
     for fold in requested_folds:
         try:
-            resolve_fold_csv_path(input_root, fold, input_name)
+            resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=False)
         except FileNotFoundError:
             missing.append(fold)
 
     if not missing:
         return requested_folds
 
-    auto_folds = discover_available_folds(input_root, input_name)
+    auto_folds = discover_available_folds(input_root, input_name, allow_legacy_results=False)
     if not auto_folds:
         raise FileNotFoundError(
-            f"No usable folds in '{input_root}'. Missing requested folds: {', '.join(missing)}"
+            f"No completed folds in '{input_root}'. Missing requested folds: {', '.join(missing)}"
         )
     scope_name, scope_fold_count = extract_scope_info(input_root)
     log_tag = "WARN"
@@ -498,8 +606,11 @@ def resolve_folds_for_root(input_root: str, requested_folds: List[str], input_na
 def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[List[Dict[str, object]], Dict[str, object], Dict[str, object]]:
     fold_rows: List[Dict[str, object]] = []
     for fold in folds:
-        csv_path = resolve_fold_csv_path(input_root, fold, input_name)
+        csv_path = resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=False)
         metrics = parse_fold_csv(csv_path)
+        if metrics is None:
+            print(f"[WARN] {input_root} fold {fold}: failed to parse metrics from CSV: {csv_path}")
+            continue
         metrics["fold"] = float(fold)
         fold_rows.append(metrics)
 
@@ -507,6 +618,8 @@ def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[
     dices = [row["best_dice"] for row in fold_rows]
     jacs = [row["best_jac"] for row in fold_rows]
     cldices = [row["best_cldice"] for row in fold_rows]
+    precisions = [row["best_precision"] for row in fold_rows]
+    accuracies = [row["best_accuracy"] for row in fold_rows]
     betti_error_0s = [row["best_betti_error_0"] for row in fold_rows]
     betti_error_1s = [row["best_betti_error_1"] for row in fold_rows]
     elapsed_seconds = [float(row["train_elapsed_seconds"]) for row in fold_rows]
@@ -519,6 +632,8 @@ def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[
         "best_dice": _safe_mean(dices),
         "best_jac": _safe_mean(jacs),
         "best_cldice": _safe_mean(cldices),
+        "best_precision": _safe_mean(precisions),
+        "best_accuracy": _safe_mean(accuracies),
         "best_betti_error_0": _safe_mean(betti_error_0s),
         "best_betti_error_1": _safe_mean(betti_error_1s),
         "train_elapsed_seconds": elapsed_mean_seconds,
@@ -529,6 +644,8 @@ def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[
         "best_dice": _safe_std(dices, mean_row["best_dice"]),
         "best_jac": _safe_std(jacs, mean_row["best_jac"]),
         "best_cldice": _safe_std(cldices, mean_row["best_cldice"]),
+        "best_precision": _safe_std(precisions, mean_row["best_precision"]),
+        "best_accuracy": _safe_std(accuracies, mean_row["best_accuracy"]),
         "best_betti_error_0": _safe_std(betti_error_0s, mean_row["best_betti_error_0"]),
         "best_betti_error_1": _safe_std(betti_error_1s, mean_row["best_betti_error_1"]),
         "train_elapsed_seconds": elapsed_std_seconds,
@@ -591,6 +708,8 @@ def find_fold_row(fold_rows: List[Dict[str, object]], fold: int) -> Optional[Dic
 def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, object]) -> Dict[str, object]:
     fold = int(fold_row["fold"])
     model_dir = os.path.join(str(summary["root"]), "models", str(fold))
+    if not os.path.isdir(model_dir):
+        model_dir = os.path.join(str(summary["root"]), "models")
     sample_csv = os.path.join(model_dir, "test_sample_metrics.csv")
     sample_rows = parse_sample_metrics_csv(sample_csv) if os.path.isfile(sample_csv) else []
     best_epoch = int(fold_row["best_epoch"])
@@ -1101,6 +1220,42 @@ def sanitize_scope_name_for_filename(scope_name: str) -> str:
     return sanitized if sanitized else "unknown_scope"
 
 
+def canonical_dataset_name(text: str) -> Optional[str]:
+    name = text.lower()
+    if name in {"chase", "chasedb1"}:
+        return "chase"
+    if name == "drive":
+        return "drive"
+    if name.startswith("isic"):
+        return "isic"
+    return None
+
+
+def extract_dataset_name(root: str, input_root: str) -> str:
+    input_dataset = canonical_dataset_name(os.path.basename(os.path.normpath(input_root)))
+    if input_dataset is not None:
+        return input_dataset
+
+    rel_path = os.path.relpath(root, input_root)
+    if rel_path == ".":
+        root_dataset = canonical_dataset_name(os.path.basename(os.path.normpath(root)))
+        if root_dataset is not None:
+            return root_dataset
+        return os.path.basename(os.path.normpath(root))
+
+    rel_parts = os.path.normpath(rel_path).split(os.sep)
+    for part in rel_parts:
+        dataset_name = canonical_dataset_name(part)
+        if dataset_name is not None:
+            return dataset_name
+
+    for part in rel_parts:
+        if parse_scope_fold_count(part) is None:
+            return part
+
+    return os.path.basename(os.path.normpath(input_root))
+
+
 def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
     tokens = root_name.split("_")
     loss = "unknown"
@@ -1182,6 +1337,8 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
                 "best_dice_mean",
                 "best_jac_mean",
                 "best_cldice_mean",
+                "best_precision_mean",
+                "best_accuracy_mean",
                 "best_betti_error_0_mean",
                 "best_betti_error_1_mean",
                 "train_elapsed_mean_hms",
@@ -1197,6 +1354,8 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
                     _fmt_float(row["best_dice"]),
                     _fmt_float(row["best_jac"]),
                     _fmt_float(row["best_cldice"]),
+                    _fmt_float(row.get("best_precision", float("nan"))),
+                    _fmt_float(row.get("best_accuracy", float("nan"))),
                     _fmt_float(row["best_betti_error_0"]),
                     _fmt_float(row["best_betti_error_1"]),
                     _fmt_duration_csv(row.get("train_elapsed_hms", "")),
@@ -1204,7 +1363,16 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
             )
 
 
-def write_latex(path: str, title: str, fold_rows: List[Dict[str, object]], mean_row: Dict[str, object], std_row: Dict[str, object]) -> None:
+def write_latex(
+    path: str,
+    title: str,
+    fold_rows: List[Dict[str, object]],
+    mean_row: Dict[str, object],
+    std_row: Dict[str, object],
+    dataset_name: str,
+) -> None:
+    metric_specs = dataset_fold_metric_specs(dataset_name)
+    table_columns = 3 + len(metric_specs)
     lines = [
         r"\documentclass[11pt]{article}",
         r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
@@ -1214,51 +1382,34 @@ def write_latex(path: str, title: str, fold_rows: List[Dict[str, object]], mean_
         rf"\section*{{{title}}}",
         r"\begin{table}[H]",
         r"\centering",
-        r"\begin{tabular}{lccccccc}",
+        rf"\begin{{tabular}}{{{'l' + 'c' * (table_columns - 1)}}}",
         r"\toprule",
-        r"Fold & Best Epoch & Dice & Jac & clDice & Betti Err (0) & Betti Err (1) & Train Time \\",
+        "Fold & Best Epoch & " + " & ".join(label for _, label in metric_specs) + r" & Train Time \\",
         r"\midrule",
     ]
 
     for row in fold_rows:
-        jac_txt = f'{row["best_jac"]:.4f}' if not math.isnan(
-            row["best_jac"]) else "nan"
-        cld_txt = f'{row["best_cldice"]:.4f}' if not math.isnan(
-            row["best_cldice"]) else "nan"
-        betti_0_txt = f'{row["best_betti_error_0"]:.4f}' if not math.isnan(
-            row["best_betti_error_0"]) else "nan"
-        betti_1_txt = f'{row["best_betti_error_1"]:.4f}' if not math.isnan(
-            row["best_betti_error_1"]) else "nan"
         time_txt = _fmt_duration_latex(row.get("train_elapsed_hms", ""))
+        metric_vals = []
+        for key, _ in metric_specs:
+            metric_vals.append(_fmt_float(float(row.get(key, float("nan")))))
         lines.append(
-            f'{int(row["fold"])} & {int(row["best_epoch"])} & {row["best_dice"]:.4f} & {jac_txt} & {cld_txt} & {betti_0_txt} & {betti_1_txt} & {time_txt} \\\\'
+            f'{int(row["fold"])} & {int(row["best_epoch"])} & '
+            + " & ".join(metric_vals)
+            + f' & {time_txt} \\\\'
         )
 
-    mean_jac = f'{mean_row["best_jac"]:.4f}' if not math.isnan(
-        mean_row["best_jac"]) else "nan"
-    mean_cld = f'{mean_row["best_cldice"]:.4f}' if not math.isnan(
-        mean_row["best_cldice"]) else "nan"
-    std_jac = f'{std_row["best_jac"]:.4f}' if not math.isnan(
-        std_row["best_jac"]) else "nan"
-    std_cld = f'{std_row["best_cldice"]:.4f}' if not math.isnan(
-        std_row["best_cldice"]) else "nan"
-    mean_betti_0 = f'{mean_row["best_betti_error_0"]:.4f}' if not math.isnan(
-        mean_row["best_betti_error_0"]) else "nan"
-    mean_betti_1 = f'{mean_row["best_betti_error_1"]:.4f}' if not math.isnan(
-        mean_row["best_betti_error_1"]) else "nan"
-    std_betti_0 = f'{std_row["best_betti_error_0"]:.4f}' if not math.isnan(
-        std_row["best_betti_error_0"]) else "nan"
-    std_betti_1 = f'{std_row["best_betti_error_1"]:.4f}' if not math.isnan(
-        std_row["best_betti_error_1"]) else "nan"
+    mean_metrics = [_fmt_float(float(mean_row.get(key, float("nan")))) for key, _ in metric_specs]
+    std_metrics = [_fmt_float(float(std_row.get(key, float("nan")))) for key, _ in metric_specs]
     mean_time = _fmt_duration_latex(mean_row.get("train_elapsed_hms", ""))
     std_time = _fmt_duration_latex(std_row.get("train_elapsed_hms", ""))
     lines += [
         r"\midrule",
-        f'Mean & {mean_row["best_epoch"]:.4f} & {mean_row["best_dice"]:.4f} & {mean_jac} & {mean_cld} & {mean_betti_0} & {mean_betti_1} & {mean_time} \\\\',
-        f'Std & {std_row["best_epoch"]:.4f} & {std_row["best_dice"]:.4f} & {std_jac} & {std_cld} & {std_betti_0} & {std_betti_1} & {std_time} \\\\',
+        f'Mean & {mean_row["best_epoch"]:.4f} & ' + " & ".join(mean_metrics) + f' & {mean_time} \\\\',
+        f'Std & {std_row["best_epoch"]:.4f} & ' + " & ".join(std_metrics) + f' & {std_time} \\\\',
         r"\bottomrule",
         r"\end{tabular}",
-        r"\caption{K-fold final result summary}",
+        r"\caption{final result summary}",
         r"\end{table}",
         r"\end{document}",
     ]
@@ -1316,6 +1467,96 @@ def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, o
     ]
 
 
+def dataset_metric_specs(dataset_name: str) -> List[Tuple[str, str, bool]]:
+    name = dataset_name.lower()
+    if name in {"chase", "drive"}:
+        return [
+            ("best_dice", "Dice", True),
+            ("best_jac", "IoU", True),
+            ("best_cldice", "clDice", True),
+            ("best_betti_error_0", "B0 error", False),
+            ("best_betti_error_1", "B1 error", False),
+        ]
+    if name == "isic":
+        return [
+            ("best_dice", "Dice", True),
+            ("best_jac", "IoU", True),
+            ("best_accuracy", "Accuracy", True),
+            ("best_precision", "Precision", True),
+        ]
+
+    return [
+        ("best_dice", "Dice", True),
+        ("best_jac", "IoU", True),
+        ("best_cldice", "clDice", True),
+        ("best_betti_error_0", "B0 error", False),
+        ("best_betti_error_1", "B1 error", False),
+    ]
+
+
+def dataset_fold_metric_specs(dataset_name: str) -> List[Tuple[str, str]]:
+    name = dataset_name.lower()
+    if name == "isic":
+        return [
+            ("best_dice", "Dice"),
+            ("best_jac", "IoU"),
+            ("best_accuracy", "Accuracy"),
+            ("best_precision", "Precision"),
+        ]
+
+    return [
+        ("best_dice", "Dice"),
+        ("best_jac", "IoU"),
+        ("best_cldice", "clDice"),
+        ("best_betti_error_0", "B0 error"),
+        ("best_betti_error_1", "B1 error"),
+    ]
+
+
+def _append_dataset_mean_table_lines(
+    lines: List[str],
+    rows: List[Dict[str, object]],
+    dataset_name: str,
+) -> None:
+    metric_specs = dataset_metric_specs(dataset_name)
+    rank_map = {
+        key: _rank_row_indices(rows, key, higher_is_better=higher_is_better)
+        for key, _, higher_is_better in metric_specs
+    }
+
+    table_columns = 4 + len(metric_specs)
+    lines += [
+        r"\begin{table}[H]",
+        r"\centering",
+        rf"\begin{{tabular}}{{{'l' + 'c' * (table_columns - 1)}}}",
+        r"\toprule",
+        r"Experiment & Conn & Loss & \#Folds & " + " & ".join(label for _, label, _ in metric_specs) + r" \\",
+        r"\midrule",
+    ]
+
+    for idx, row in enumerate(rows):
+        metric_cells: List[str] = []
+        for key, _, _ in metric_specs:
+            best_indices, second_indices = rank_map[key]
+            metric_cells.append(
+                _fmt_latex_ranked_value(
+                    float(row.get(key, float("nan"))),
+                    idx in best_indices,
+                    idx in second_indices,
+                )
+            )
+
+        lines.append(
+            f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
+            f'& {escape_latex_text(str(row["loss"]))} '
+            f'& {int(row["num_folds"])} & ' + " & ".join(metric_cells) + r" \\")
+
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}",
+    ]
+
+
 def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, object]]) -> None:
     lines = [
         r"\documentclass[11pt]{article}",
@@ -1326,11 +1567,28 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
         rf"\section*{{{title}}}",
     ]
 
-    _append_experiment_mean_table_lines(
-        lines,
-        rows,
-        "Cross-experiment mean summary from k-fold runs",
-    )
+    rows_by_dataset: Dict[str, List[Dict[str, object]]] = {}
+    for row in rows:
+        dataset_name = str(row.get("dataset", "unknown_dataset"))
+        rows_by_dataset.setdefault(dataset_name, []).append(row)
+
+    if len(rows_by_dataset) == 1:
+        dataset_name, dataset_rows = next(iter(rows_by_dataset.items()))
+        _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
+        lines += [
+            rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
+            r"\end{table}",
+        ]
+    else:
+        for dataset_name, dataset_rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
+            if len(dataset_rows) == 0:
+                continue
+            lines.append(rf"\subsection*{{Dataset: {escape_latex_text(dataset_name)}}}")
+            _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
+            lines += [
+                rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
+                r"\end{table}",
+            ]
 
     lines += [
         r"\end{document}",
@@ -1340,10 +1598,10 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
         f.write("\n".join(lines) + "\n")
 
 
-def write_experiment_mean_scope_tables_latex(
+def write_experiment_mean_dataset_tables_latex(
     path: str,
     title: str,
-    rows_by_scope: Dict[str, List[Dict[str, object]]],
+    rows_by_dataset: Dict[str, List[Dict[str, object]]],
 ) -> None:
     lines = [
         r"\documentclass[11pt]{article}",
@@ -1354,15 +1612,15 @@ def write_experiment_mean_scope_tables_latex(
         rf"\section*{{{title}}}",
     ]
 
-    for scope_name, rows in sorted(rows_by_scope.items(), key=lambda item: natural_sort_key(item[0])):
+    for dataset_name, rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
         if len(rows) == 0:
             continue
-        lines.append(rf"\subsection*{{Scope: {escape_latex_text(scope_name)}}}")
-        _append_experiment_mean_table_lines(
-            lines,
-            rows,
-            f"Cross-experiment mean summary ({escape_latex_text(scope_name)})",
-        )
+        lines.append(rf"\subsection*{{Dataset: {escape_latex_text(dataset_name)}}}")
+        _append_dataset_mean_table_lines(lines, rows, dataset_name)
+        lines.extend([
+            rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
+            r"\end{table}",
+        ])
 
     lines += [
         r"\end{document}",
@@ -1458,6 +1716,14 @@ def main() -> None:
     root_summaries: List[Dict[str, object]] = []
 
     for root in target_roots:
+        if not root_has_completed_final_results(root, requested_folds, args.input_name):
+            display_name = root_display_name(root, args.input_root)
+            print(
+                f"[WARN] {root}: no final_results_*.csv found for requested folds; "
+                f"skipping unfinished experiment ({display_name})."
+            )
+            continue
+
         folds = resolve_folds_for_root(root, requested_folds, args.input_name)
         fold_rows, mean_row, std_row = aggregate_root(root, folds, args.input_name)
         experiment_root_name = os.path.basename(os.path.normpath(root))
@@ -1476,6 +1742,7 @@ def main() -> None:
         exp_meta = parse_experiment_metadata(experiment_root_name)
         experiment_mean_rows.append(
             {
+                "dataset": extract_dataset_name(root, args.input_root),
                 "experiment": exp_meta["experiment"],
                 "conn_num": exp_meta["conn_num"],
                 "loss": exp_meta["loss"],
@@ -1485,6 +1752,8 @@ def main() -> None:
                 "best_dice": mean_row["best_dice"],
                 "best_jac": mean_row["best_jac"],
                 "best_cldice": mean_row["best_cldice"],
+                "best_precision": mean_row["best_precision"],
+                "best_accuracy": mean_row["best_accuracy"],
                 "best_betti_error_0": mean_row["best_betti_error_0"],
                 "best_betti_error_1": mean_row["best_betti_error_1"],
                 "train_elapsed_seconds": mean_row["train_elapsed_seconds"],
@@ -1494,22 +1763,19 @@ def main() -> None:
 
         if len(target_roots) == 1:
             output_stem = args.output_stem
-            title = "K-fold Final Metrics"
+            title = "Final Metrics"
         else:
             output_stem = f"{root_output_label(root, args.input_root)}_{args.output_stem}"
-            title = f"K-fold Final Metrics ({escape_latex_text(display_name)})"
+            title = f"Final Metrics ({escape_latex_text(display_name)})"
+        dataset_name = extract_dataset_name(root, args.input_root)
 
         csv_out = os.path.join(dump_dir, f"{output_stem}.csv")
         tex_out = os.path.join(dump_dir, f"{output_stem}.tex")
         pdf_out = os.path.join(args.output_dir, f"{output_stem}.pdf")
 
         write_summary_csv(csv_out, fold_rows, mean_row, std_row)
-        write_latex(tex_out, title, fold_rows, mean_row, std_row)
+        write_latex(tex_out, title, fold_rows, mean_row, std_row, dataset_name)
         build_pdf(tex_out, pdf_out)
-
-        print(f"[{root}] CSV: {csv_out}")
-        print(f"[{root}] LaTeX: {tex_out}")
-        print(f"[{root}] PDF: {pdf_out}")
 
     maybe_write_sample_visualization(
         dump_dir,
@@ -1519,61 +1785,55 @@ def main() -> None:
         args.sample_vis_count,
     )
 
-    if len(experiment_mean_rows) > 1:
+    if len(experiment_mean_rows) >= 1:
         experiment_mean_rows = sorted(
             experiment_mean_rows,
             key=experiment_sort_key,
         )
         agg_stem = f"{args.output_stem}_experiment_means"
         agg_csv_out = os.path.join(dump_dir, f"{agg_stem}.csv")
-        agg_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}.csv")
         agg_tex_out = os.path.join(dump_dir, f"{agg_stem}.tex")
-        agg_pdf_out = os.path.join(args.output_dir, f"{agg_stem}.pdf")
 
         write_experiment_mean_csv(agg_csv_out, experiment_mean_rows)
-        write_experiment_mean_csv(agg_csv_summary_out, experiment_mean_rows)
         write_experiment_mean_latex(
             agg_tex_out,
             "Cross-experiment Mean Summary",
             experiment_mean_rows,
         )
-        build_pdf(agg_tex_out, agg_pdf_out)
 
         print(f"[ALL] CSV: {agg_csv_out}")
-        print(f"[ALL] CSV (summary): {agg_csv_summary_out}")
         print(f"[ALL] LaTeX: {agg_tex_out}")
-        print(f"[ALL] PDF: {agg_pdf_out}")
 
-        rows_by_scope: Dict[str, List[Dict[str, object]]] = {}
+        rows_by_dataset: Dict[str, List[Dict[str, object]]] = {}
         for row in experiment_mean_rows:
-            scope_name = str(row.get("fold_scope", "direct"))
-            rows_by_scope.setdefault(scope_name, []).append(row)
+            dataset_name = str(row.get("dataset", "unknown_dataset"))
+            rows_by_dataset.setdefault(dataset_name, []).append(row)
 
-        for scope_name, scope_rows in sorted(
-            rows_by_scope.items(),
+        for dataset_name, dataset_rows in sorted(
+            rows_by_dataset.items(),
             key=lambda item: natural_sort_key(item[0]),
         ):
-            scope_suffix = sanitize_scope_name_for_filename(scope_name)
-            scope_csv_out = os.path.join(dump_dir, f"{agg_stem}_{scope_suffix}.csv")
-            scope_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}_{scope_suffix}.csv")
-            write_experiment_mean_csv(scope_csv_out, scope_rows)
-            write_experiment_mean_csv(scope_csv_summary_out, scope_rows)
-            print(f"[ALL:{scope_name}] CSV: {scope_csv_out}")
-            print(f"[ALL:{scope_name}] CSV (summary): {scope_csv_summary_out}")
+            dataset_suffix = sanitize_scope_name_for_filename(dataset_name)
+            dataset_csv_out = os.path.join(dump_dir, f"{agg_stem}_{dataset_suffix}.csv")
+            dataset_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}_{dataset_suffix}.csv")
+            write_experiment_mean_csv(dataset_csv_out, dataset_rows)
+            write_experiment_mean_csv(dataset_csv_summary_out, dataset_rows)
+            print(f"[ALL:{dataset_name}] CSV: {dataset_csv_out}")
+            print(f"[ALL:{dataset_name}] CSV (summary): {dataset_csv_summary_out}")
 
-        if len(rows_by_scope) > 1:
-            scoped_tex_out = os.path.join(dump_dir, f"{agg_stem}_scopes.tex")
-            scoped_pdf_out = os.path.join(args.output_dir, f"{agg_stem}_scopes.pdf")
+        if len(rows_by_dataset) >= 1:
+            dataset_tex_out = os.path.join(dump_dir, f"{agg_stem}_datasets.tex")
+            dataset_pdf_out = os.path.join(args.output_dir, f"{agg_stem}_datasets.pdf")
 
-            write_experiment_mean_scope_tables_latex(
-                scoped_tex_out,
-                "Cross-experiment Mean Summary by Scope",
-                rows_by_scope,
+            write_experiment_mean_dataset_tables_latex(
+                dataset_tex_out,
+                "Cross-experiment Mean Summary by Dataset",
+                rows_by_dataset,
             )
-            build_pdf(scoped_tex_out, scoped_pdf_out)
+            build_pdf(dataset_tex_out, dataset_pdf_out)
 
-            print(f"[ALL:SCOPES] LaTeX: {scoped_tex_out}")
-            print(f"[ALL:SCOPES] PDF: {scoped_pdf_out}")
+            print(f"[ALL:DATASETS] LaTeX: {dataset_tex_out}")
+            print(f"[ALL:DATASETS] PDF: {dataset_pdf_out}")
 
 
 if __name__ == "__main__":
