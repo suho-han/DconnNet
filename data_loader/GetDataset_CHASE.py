@@ -122,16 +122,16 @@ def default_loader(img_path, mask_path):
     return img, mask
 
 
-def default_DRIVE_loader(img_path, mask_path, train=False, label_mode='binary'):
+def default_DRIVE_loader(img_path, mask_path, resize_shape=(960, 960), train=False, label_mode='binary'):
     img = cv2.imread(img_path)
-    img = cv2.resize(img, (960, 960))
+    img = cv2.resize(img, resize_shape)
     if label_mode == 'binary':
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     elif label_mode in ['dist', 'dist_inverted']:
         mask = np.load(mask_path, allow_pickle=True)
     # mask = np.array(Image.open(mask_path))
     # print(img.shape,mask.shape)
-    mask = cv2.resize(mask, (960, 960))
+    mask = cv2.resize(mask, resize_shape)
     if train:
         img = randomHueSaturationValue(img, hue_shift_limit=(-30, 30), sat_shift_limit=(-5, 5), val_shift_limit=(-15, 15))
 
@@ -328,6 +328,68 @@ class MyDataset_DRIVE(data.Dataset):
     def __getitem__(self, index):
 
         img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], self.train, self.label_mode)
+
+        img = torch.Tensor(img)
+        mask = torch.Tensor(mask)
+        # mask = torch.where(mask>0.5,1,0)
+        # conn = connectivity_matrix(mask.unsqueeze(0))
+        # if self.args.resize:
+        #     img = Resize(img[0], None,512,512)
+        # print(img.shape,mask.shape,conn.shape)
+        # print(img.max())
+        return img.squeeze(0), mask, self.name_ls[index]
+
+    def __len__(self):
+        return len(self.img_ls)
+
+
+class MyDataset_OCTA500(data.Dataset):
+    def __init__(self, args, train_root, mode='train', label_mode='binary'):
+        train = True if mode == 'train' else False
+        self.args = args
+        self.label_mode = label_mode
+        img_path = train_root+'/'+mode+'/images/'
+        gt_path = train_root+'/'+mode+'/labels/'
+
+        img_ls = []
+        mask_ls = []
+        name_ls = []
+
+        if self.label_mode == 'binary':
+            label_postfix = '.bmp'
+        elif self.label_mode == 'dist':
+            gt_path = train_root+'/'+mode+'/labels_dist/'
+            label_postfix = '_dist.npy'
+        elif self.label_mode == 'dist_inverted':
+            gt_path = train_root+'/'+mode+'/labels_dist_inverted/'
+            label_postfix = '_dist_inverted.npy'
+
+        img_list = glob.glob(img_path+'*.bmp')
+        for img_id in img_list:
+            img = img_path+str(img_id.split('/')[-1])
+            gt = gt_path+str(img_id.split('/')[-1].split('.bmp')[0])+label_postfix
+            name = str(img_id.split('/')[-1].split('.bmp')[0])
+            img_ls.append(img)
+            mask_ls.append(gt)
+            name_ls.append(name)
+
+        self.train = train
+        # print(file)
+
+        self.name_ls = name_ls
+        self.img_ls = img_ls
+
+        self.mask_ls = mask_ls
+
+        self.normalize = Normalize()
+        self.randomcrop = RandomCrop()
+        self.randomflip = RandomFlip()
+
+        self.totensor = ToTensor()
+
+    def __getitem__(self, index):
+
+        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape=(512, 512), train=self.train, label_mode=self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)

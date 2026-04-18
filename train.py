@@ -14,7 +14,7 @@ from skimage.io import imread, imsave
 from torch.autograd import Variable
 from torchvision import datasets, transforms
 
-from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE
+from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE, MyDataset_OCTA500
 from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
 from data_loader.GetDataset_Retouch import MyDataset
 from model.DconnNet import DconnNet
@@ -23,8 +23,14 @@ from solver import Solver
 
 def get_experiment_output_name(args):
     if args.label_mode == 'binary':
-        return f'binary_{args.conn_num}_bce'
-    return f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
+        base_name = f'binary_{args.conn_num}_bce'
+    else:
+        base_name = f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
+
+    if getattr(args, 'direction_grouping', 'none') != 'none':
+        base_name = f"{base_name}_{args.direction_grouping}_{args.direction_fusion}"
+
+    return base_name
 
 
 def seed_everything(seed):
@@ -57,14 +63,14 @@ def parse_args():
 
     # dataset info
     parser.add_argument('--dataset', type=str, default='retouch-Spectrailis',
-                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive')
+                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive, octa500')
 
     parser.add_argument('--data_root', type=str, default='/retouch',
                         help='dataset directory')
     parser.add_argument('--resize', type=int, default=[256, 256], nargs='+',
                         help='image size: [height, width]')
     parser.add_argument('--label_mode', type=str, default='binary',
-                        help='label mode (used in CHASE): binary, dist, dist_inverted')
+                        help='label mode: binary, dist, dist_inverted')
 
     # network option & hyper-parameters
     parser.add_argument('--num-class', type=int, default=4, metavar='N',
@@ -90,6 +96,12 @@ def parse_args():
                         help='1-based fold index to run; default runs all folds')
     parser.add_argument('--conn_num', type=int, default=8, choices=[8, 24],
                         help='the number of connections for DconnNet (supported: 8, 24)')
+    parser.add_argument('--direction_grouping', type=str, default='none',
+                        choices=['none', 'coarse24to8'],
+                        help='optional fork-specific directional grouping path; coarse24to8 compresses 24 proto-directions into the canonical 8-direction output layout')
+    parser.add_argument('--direction_fusion', type=str, default='weighted_sum',
+                        choices=['mean', 'weighted_sum', 'conv1x1', 'attention_gating'],
+                        help='fusion block used when --direction_grouping=coarse24to8')
     parser.add_argument('--tau', type=float, default=3.0,
                         help='the temperature parameter tau for the distance connectivity loss')
     parser.add_argument('--sigma', type=float, default=2.0,
@@ -130,6 +142,9 @@ def parse_args():
     if args.target_fold is not None:
         if args.target_fold < 1 or args.target_fold > args.folds:
             parser.error('--target_fold must be within [1, --folds]')
+
+    if args.direction_grouping == 'coarse24to8' and args.conn_num != 8:
+        parser.error('--direction_grouping=coarse24to8 requires --conn_num=8 because the grouped path feeds the canonical 8-direction branch')
 
     return args
 
@@ -204,6 +219,10 @@ def main(args):
     elif args.dataset == 'drive':
         trainset = MyDataset_DRIVE(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
         testset = MyDataset_DRIVE(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
+    elif args.dataset == 'octa500-6M' or args.dataset == 'octa500-3M':
+        trainset = MyDataset_OCTA500(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
+        validset = MyDataset_OCTA500(args, train_root=args.data_root, mode='val', label_mode=args.label_mode)
+        testset = MyDataset_OCTA500(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
         pass
@@ -245,7 +264,12 @@ def main(args):
         test_loader = val_loader
 
         #### Above: define how you get the data on your own dataset ######
-    model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).cuda()
+    model = DconnNet(
+        num_class=args.num_class,
+        conn_num=args.conn_num,
+        direction_grouping=args.direction_grouping,
+        direction_fusion=args.direction_fusion,
+    ).cuda()
 
     if args.pretrained:
         model.load_state_dict(torch.load(
