@@ -47,11 +47,29 @@ def first_env(keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def build_default_message(status: str, job: str) -> str:
+def resolve_folder_name(cwd: str) -> str:
+    folder = Path(cwd).resolve().name
+    if folder:
+        return folder
+    return cwd
+
+
+def build_alert_message(base_text: str, status: str, summary: str) -> str:
     timestamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     host = socket.gethostname()
     cwd = os.getcwd()
-    return f"[{status}] {job} finished.\nHost: {host}\nTime: {timestamp}\nPath: {cwd}"
+    folder = resolve_folder_name(cwd)
+    lines = [
+        base_text.strip(),
+        "",
+        f"Server: {host}",
+        f"Folder: {folder}",
+        f"Summary: {summary}",
+        f"Status: {status}",
+        f"Time: {timestamp}",
+        f"Path: {cwd}",
+    ]
+    return "\n".join(lines)
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
@@ -96,6 +114,11 @@ def parse_args() -> argparse.Namespace:
         help="Job/session name used in default message (default: job)",
     )
     parser.add_argument(
+        "--summary",
+        default="",
+        help="Short summary of completed work (default: same as --job).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the message and exit without sending.",
@@ -103,7 +126,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-session-alert",
         action="store_true",
-        help="Allow alerts even when job name includes 'session'.",
+        help="Deprecated compatibility flag; session alerts are allowed by default.",
+    )
+    parser.add_argument(
+        "--skip-session-alert",
+        action="store_true",
+        help="Skip alerts when job name includes 'session'.",
     )
     return parser.parse_args()
 
@@ -131,9 +159,14 @@ def main() -> int:
         )
         return 2
 
-    message = args.message if args.message else build_default_message(args.status, args.job)
+    summary = args.summary if args.summary else args.job
+    if args.message:
+        message = build_alert_message(args.message, args.status, summary)
+    else:
+        default_text = f"[{args.status}] {args.job} finished."
+        message = build_alert_message(default_text, args.status, summary)
 
-    if ("session" in args.job.lower()) and (not args.allow_session_alert):
+    if ("session" in args.job.lower()) and args.skip_session_alert:
         print("Session alert skipped by policy.")
         return 0
 
