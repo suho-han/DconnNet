@@ -1,0 +1,12 @@
+dataset: drive
+mode: multi
+device: 0
+direction_grouping: none
+direction_fusion: weighted_sum
+dist_sf_l1_gamma: 1.0
+multi:
+  epochs: 500
+  folds: 1
+  conn_nums: [8, 24]
+  label_modes: [binary, dist, dist_inverted]
+  dist_aux_losses: [gjml_sf_l1, smooth_l1]

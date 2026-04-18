@@ -1,0 +1,12 @@
+dataset: isic2018
+mode: single
+device: 0
+direction_grouping: none
+direction_fusion: weighted_sum
+dist_sf_l1_gamma: 1.0
+single:
+  conn_num: 8
+  label_mode: binary
+  dist_aux_loss: smooth_l1
+  folds: 1
+  epochs: 500
