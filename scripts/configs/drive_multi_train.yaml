@@ -1,12 +1,13 @@
-dataset: drive
+dataset: [ drive ]
 mode: multi
 device: 0
-direction_grouping: none
-direction_fusion: weighted_sum
+direction_grouping: 24to8
+direction_fusion: [ "mean", "conv1x1", "attention_gating" ]
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500
   folds: 1
-  conn_nums: [8, 24]
-  label_modes: [binary, dist, dist_inverted]
-  dist_aux_losses: [gjml_sf_l1, smooth_l1]
+  # octa_variants: [ 3M, 6M ]
+  conn_nums: [ 8 ]
+  label_modes: [ binary, dist, dist_inverted ]
+  dist_aux_losses: [ smooth_l1 ]

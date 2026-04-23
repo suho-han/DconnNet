@@ -1,0 +1,15 @@
+dataset: retouch
+mode: multi
+device: 0
+direction_grouping: none
+direction_fusion: weighted_sum
+dist_sf_l1_gamma: 1.0
+multi:
+  retouch_devices: [ Cirrus, Spectrailis, Topcon ]
+  retouch_data_root: data/retouch
+  retouch_target_folds: [ 1, 2, 3 ]
+  epochs: 50
+  folds: 3
+  conn_nums: [ 8 ]
+  label_modes: [ binary ]
+  dist_aux_losses: [ smooth_l1 ]

@@ -5,9 +5,15 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 HELPER_SCRIPT="${SCRIPT_DIR}/train_launcher_from_config.py"
+# Note: direction_fusion sweep (scalar/list in YAML) is handled by the helper.
 
 if [[ ! -f "${HELPER_SCRIPT}" ]]; then
   echo "Missing launcher helper: ${HELPER_SCRIPT}" >&2
+  exit 127
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Missing python interpreter: ${PYTHON_BIN}" >&2
+  echo "Create .venv first (used by launcher for all datasets including RETOUCH)." >&2
   exit 127
 fi
 
@@ -25,9 +31,18 @@ for ARG in "$@"; do
   PREV="${ARG}"
 done
 
-if [[ -n "${CONFIG_PATH}" && ! -f "${CONFIG_PATH}" ]]; then
-  echo "Config file not found: ${CONFIG_PATH}" >&2
-  exit 2
+if [[ -n "${CONFIG_PATH}" ]]; then
+  RESOLVED_CONFIG="${CONFIG_PATH}"
+  if [[ "${RESOLVED_CONFIG}" != /* && ! -f "${RESOLVED_CONFIG}" ]]; then
+    ALT_CONFIG="${REPO_ROOT}/${RESOLVED_CONFIG}"
+    if [[ -f "${ALT_CONFIG}" ]]; then
+      RESOLVED_CONFIG="${ALT_CONFIG}"
+    fi
+  fi
+  if [[ ! -f "${RESOLVED_CONFIG}" ]]; then
+    echo "Config file not found: ${CONFIG_PATH}" >&2
+    exit 2
+  fi
 fi
 
 exec "${PYTHON_BIN}" "${HELPER_SCRIPT}" "$@"

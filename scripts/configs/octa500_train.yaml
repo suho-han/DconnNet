@@ -1,6 +1,6 @@
 dataset: octa500
 mode: single
-device: 0
+device: 1
 direction_grouping: none
 direction_fusion: weighted_sum
 dist_sf_l1_gamma: 1.0
@@ -8,5 +8,5 @@ single:
   octa_variant: 6M
   conn_num: 8
   label_mode: binary
-  dist_aux_loss: smooth_l1
+  # dist_aux_loss: smooth_l1
   folds: 1

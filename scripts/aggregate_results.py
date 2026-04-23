@@ -16,6 +16,19 @@ from PIL import Image
 matplotlib.use("Agg")
 
 
+DIRECTION_GROUPING_SUFFIXES: List[Tuple[List[str], str]] = [
+    (["coarse24to8"], "24to8"),
+    (["24to8"], "24to8"),
+]
+
+DIRECTION_FUSION_SUFFIXES: List[Tuple[List[str], str]] = [
+    (["attention", "gating"], "attention_gating"),
+    (["weighted", "sum"], "weighted_sum"),
+    (["conv1x1"], "conv1x1"),
+    (["mean"], "mean"),
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Aggregate DconnNet results and export CSV/LaTeX/PDF."
@@ -567,7 +580,7 @@ def root_has_completed_final_results(input_root: str, folds: List[str], input_na
                 input_root,
                 fold,
                 input_name,
-                allow_legacy_results=False,
+                allow_legacy_results=True,
             )
         except FileNotFoundError:
             return False
@@ -578,7 +591,7 @@ def resolve_folds_for_root(input_root: str, requested_folds: List[str], input_na
     missing = []
     for fold in requested_folds:
         try:
-            resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=False)
+            resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=True)
         except FileNotFoundError:
             missing.append(fold)
 
@@ -606,7 +619,7 @@ def resolve_folds_for_root(input_root: str, requested_folds: List[str], input_na
 def aggregate_root(input_root: str, folds: List[str], input_name: str) -> Tuple[List[Dict[str, object]], Dict[str, object], Dict[str, object]]:
     fold_rows: List[Dict[str, object]] = []
     for fold in folds:
-        csv_path = resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=False)
+        csv_path = resolve_fold_csv_path(input_root, fold, input_name, allow_legacy_results=True)
         metrics = parse_fold_csv(csv_path)
         if metrics is None:
             print(f"[WARN] {input_root} fold {fold}: failed to parse metrics from CSV: {csv_path}")
@@ -724,6 +737,8 @@ def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, object
         "experiment": exp_meta["experiment"],
         "conn_num": exp_meta["conn_num"],
         "loss": exp_meta["loss"],
+        "direction_grouping": exp_meta["direction_grouping"],
+        "direction_fusion": exp_meta["direction_fusion"],
         "config_folds": config_folds,
         "fold": fold,
         "best_epoch": best_epoch,
@@ -883,14 +898,16 @@ def render_panel(
 
 def format_model_config_summary(model: Dict[str, object], multiline: bool = False) -> str:
     separator = "\n" if multiline else " | "
-    return separator.join(
-        [
-            f"Exp={model['experiment']}",
-            f"Conn={model['conn_num']}",
-            f"Loss={model['loss']}",
-            f"Folds={model['config_folds']}",
-        ]
-    )
+    fields = [
+        f"Exp={model['experiment']}",
+        f"Conn={model['conn_num']}",
+        f"Loss={model['loss']}",
+    ]
+    if str(model.get("direction_grouping", "none")) != "none":
+        fields.append(f"Group={model.get('direction_grouping', 'none')}")
+        fields.append(f"Fusion={model.get('direction_fusion', 'weighted_sum')}")
+    fields.append(f"Folds={model['config_folds']}")
+    return separator.join(fields)
 
 
 def build_sample_visualization_fieldnames(model_count: int) -> List[str]:
@@ -912,6 +929,8 @@ def build_sample_visualization_fieldnames(model_count: int) -> List[str]:
                 f"model{idx}_experiment",
                 f"model{idx}_conn_num",
                 f"model{idx}_loss",
+                f"model{idx}_direction_grouping",
+                f"model{idx}_direction_fusion",
                 f"model{idx}_folds",
                 f"model{idx}_fold",
                 f"model{idx}_best_epoch",
@@ -1025,6 +1044,8 @@ def maybe_write_sample_visualization(
             render_row[f"model{idx}_experiment"] = str(model["experiment"])
             render_row[f"model{idx}_conn_num"] = model["conn_num"]
             render_row[f"model{idx}_loss"] = str(model["loss"])
+            render_row[f"model{idx}_direction_grouping"] = str(model.get("direction_grouping", "none"))
+            render_row[f"model{idx}_direction_fusion"] = str(model.get("direction_fusion", "weighted_sum"))
             render_row[f"model{idx}_folds"] = model["config_folds"]
             render_row[f"model{idx}_fold"] = int(model["fold"])
             render_row[f"model{idx}_best_epoch"] = int(model["best_epoch"])
@@ -1159,6 +1180,8 @@ def _fmt_float(value: float) -> str:
 
 def infer_loss_tag_from_legacy_name(experiment: str) -> str:
     name = experiment.lower()
+    if "cl_dice" in name:
+        return "cl_dice"
     if "_gjml_sf_l1" in name:
         return "gjml_sf_l1"
     if "_gjml_sj_l1" in name:
@@ -1214,6 +1237,19 @@ def natural_sort_key(text: str) -> Tuple[object, ...]:
     return tuple(int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text))
 
 
+def _fmt_latex_ranked_mean_std_marginal(mean: float, std: float, is_best: bool, is_second: bool) -> str:
+    if math.isnan(mean):
+        return "--"
+    mean_txt = f"{mean:.4f}"
+    std_txt = f"{std:.4f}"
+    res = rf"{mean_txt} \pm {std_txt}"
+    if is_best:
+        return rf"\textbf{{${res}$}}"
+    if is_second:
+        return rf"\underline{{${res}$}}"
+    return rf"${res}$"
+
+
 def sanitize_scope_name_for_filename(scope_name: str) -> str:
     sanitized = scope_name.strip().replace(os.sep, "_")
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", sanitized).strip("_")
@@ -1228,6 +1264,8 @@ def canonical_dataset_name(text: str) -> Optional[str]:
         return "drive"
     if name.startswith("isic"):
         return "isic"
+    if name == "cremi":
+        return "cremi"
     return None
 
 
@@ -1256,14 +1294,41 @@ def extract_dataset_name(root: str, input_root: str) -> str:
     return os.path.basename(os.path.normpath(input_root))
 
 
+def _strip_direction_suffix_tokens(tokens: List[str]) -> Tuple[List[str], str, str]:
+    direction_grouping = "none"
+    direction_fusion = "weighted_sum"
+
+    for fusion_suffix_tokens, fusion_name in DIRECTION_FUSION_SUFFIXES:
+        if len(tokens) < len(fusion_suffix_tokens):
+            continue
+        if tokens[-len(fusion_suffix_tokens):] != fusion_suffix_tokens:
+            continue
+
+        prefix_tokens = tokens[:-len(fusion_suffix_tokens)]
+        for grouping_suffix_tokens, grouping_name in DIRECTION_GROUPING_SUFFIXES:
+            if len(prefix_tokens) < len(grouping_suffix_tokens):
+                continue
+            if prefix_tokens[-len(grouping_suffix_tokens):] != grouping_suffix_tokens:
+                continue
+            return (
+                prefix_tokens[:-len(grouping_suffix_tokens)],
+                grouping_name,
+                fusion_name,
+            )
+
+    return tokens, direction_grouping, direction_fusion
+
+
 def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
     tokens = root_name.split("_")
+    tokens, direction_grouping, direction_fusion = _strip_direction_suffix_tokens(tokens)
     loss = "unknown"
 
     loss_suffixes = [
         (["gjml", "sf", "l1"], "gjml_sf_l1"),
         (["gjml", "sj", "l1"], "gjml_sj_l1"),
         (["smooth", "l1"], "smooth_l1"),
+        (["cl", "dice"], "cl_dice"),
         (["bce"], "bce"),
     ]
     for suffix_tokens, loss_name in loss_suffixes:
@@ -1287,6 +1352,8 @@ def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
         "experiment": experiment,
         "conn_num": conn_num,
         "loss": loss,
+        "direction_grouping": direction_grouping,
+        "direction_fusion": direction_fusion,
     }
 
 
@@ -1305,10 +1372,24 @@ def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
     loss_order = {
         "bce": 0,
         "smooth_l1": 1,
-        "gjml_sf_l1": 2,
-        "gjml_sj_l1": 2,
+        "cl_dice": 2,
+        "gjml_sf_l1": 3,
+        "gjml_sj_l1": 3,
         "unknown": 9,
     }.get(loss, 9)
+
+    direction_grouping = str(row.get("direction_grouping", "none"))
+    direction_fusion = str(row.get("direction_fusion", "weighted_sum"))
+    direction_grouping_order = {
+        "none": 0,
+        "24to8": 1,
+    }.get(direction_grouping, 9)
+    direction_fusion_order = {
+        "weighted_sum": 0,
+        "mean": 1,
+        "conv1x1": 2,
+        "attention_gating": 3,
+    }.get(direction_fusion, 9)
 
     fold_scope = str(row.get("fold_scope", "direct"))
     fold_scope_count = row.get("fold_scope_count", "NA")
@@ -1320,6 +1401,10 @@ def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
         conn_sort,
         loss_order,
         loss.lower(),
+        direction_grouping_order,
+        direction_grouping.lower(),
+        direction_fusion_order,
+        direction_fusion.lower(),
         fold_scope_sort,
         fold_scope.lower(),
     )
@@ -1330,9 +1415,11 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
         writer = csv.writer(f)
         writer.writerow(
             [
-                "experiment",
+                "label_mode",
                 "conn_num",
                 "loss",
+                "direction_grouping",
+                "direction_fusion",
                 "num_folds",
                 "best_dice_mean",
                 "best_jac_mean",
@@ -1345,11 +1432,18 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
             ]
         )
         for row in rows:
+            grouping = str(row.get("direction_grouping", "none"))
+            fusion = str(row.get("direction_fusion", "weighted_sum"))
+            if grouping == "none":
+                grouping = "-"
+                fusion = "-"
             writer.writerow(
                 [
                     row["experiment"],
                     row["conn_num"],
                     row["loss"],
+                    grouping,
+                    fusion,
                     int(row["num_folds"]),
                     _fmt_float(row["best_dice"]),
                     _fmt_float(row["best_jac"]),
@@ -1428,9 +1522,9 @@ def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, o
     lines += [
         r"\begin{table}[H]",
         r"\centering",
-        r"\begin{tabular}{lccccccccc}",
+        r"\begin{tabular}{lccccccccccc}",
         r"\toprule",
-        r"Experiment & Conn & Loss & \#Folds & Dice & Jac & clDice & Err $(\beta_0)$ & Err $(\beta_1)$ & Train Time \\",
+        r"label\_mode & Conn & Loss & Grouping & Fusion & \#Folds & Dice & Jac & clDice & Err $(\beta_0)$ & Err $(\beta_1)$ & Train Time \\",
         r"\midrule",
     ]
 
@@ -1453,9 +1547,18 @@ def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, o
             idx in betti1_second,
         )
         time_txt = _fmt_duration_latex(row.get("train_elapsed_hms", ""))
+
+        grouping = str(row.get("direction_grouping", "none"))
+        fusion = str(row.get("direction_fusion", "weighted_sum"))
+        if grouping == "none":
+            grouping = "--"
+            fusion = "--"
+
         lines.append(
             f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
             f'& {escape_latex_text(str(row["loss"]))} '
+            f'& {escape_latex_text(grouping)} '
+            f'& {escape_latex_text(fusion)} '
             f'& {int(row["num_folds"])} & {dice_txt} & {jac_txt} & {cldice_txt} & {betti0_txt} & {betti1_txt} & {time_txt} \\\\'
         )
 
@@ -1477,7 +1580,7 @@ def dataset_metric_specs(dataset_name: str) -> List[Tuple[str, str, bool]]:
             ("best_betti_error_0", "B0 error", False),
             ("best_betti_error_1", "B1 error", False),
         ]
-    if name == "isic":
+    if name in {"isic", "cremi"}:
         return [
             ("best_dice", "Dice", True),
             ("best_jac", "IoU", True),
@@ -1496,7 +1599,7 @@ def dataset_metric_specs(dataset_name: str) -> List[Tuple[str, str, bool]]:
 
 def dataset_fold_metric_specs(dataset_name: str) -> List[Tuple[str, str]]:
     name = dataset_name.lower()
-    if name == "isic":
+    if name in {"isic", "cremi"}:
         return [
             ("best_dice", "Dice"),
             ("best_jac", "IoU"),
@@ -1524,13 +1627,13 @@ def _append_dataset_mean_table_lines(
         for key, _, higher_is_better in metric_specs
     }
 
-    table_columns = 4 + len(metric_specs)
+    table_columns = 6 + len(metric_specs)
     lines += [
         r"\begin{table}[H]",
         r"\centering",
         rf"\begin{{tabular}}{{{'l' + 'c' * (table_columns - 1)}}}",
         r"\toprule",
-        r"Experiment & Conn & Loss & \#Folds & " + " & ".join(label for _, label, _ in metric_specs) + r" \\",
+        r"label\_mode & Conn & Loss & Grouping & Fusion & \#Folds & " + " & ".join(label for _, label, _ in metric_specs) + r" \\",
         r"\midrule",
     ]
 
@@ -1546,9 +1649,17 @@ def _append_dataset_mean_table_lines(
                 )
             )
 
+        grouping = str(row.get("direction_grouping", "none"))
+        fusion = str(row.get("direction_fusion", "weighted_sum"))
+        if grouping == "none":
+            grouping = "--"
+            fusion = "--"
+
         lines.append(
             f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
             f'& {escape_latex_text(str(row["loss"]))} '
+            f'& {escape_latex_text(grouping)} '
+            f'& {escape_latex_text(fusion)} '
             f'& {int(row["num_folds"])} & ' + " & ".join(metric_cells) + r" \\")
 
     lines += [
@@ -1564,7 +1675,6 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
-        rf"\section*{{{title}}}",
     ]
 
     rows_by_dataset: Dict[str, List[Dict[str, object]]] = {}
@@ -1583,7 +1693,6 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
         for dataset_name, dataset_rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
             if len(dataset_rows) == 0:
                 continue
-            lines.append(rf"\subsection*{{Dataset: {escape_latex_text(dataset_name)}}}")
             _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
             lines += [
                 rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
@@ -1593,6 +1702,183 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
     lines += [
         r"\end{document}",
     ]
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
+    datasets = set()
+    for row in rows:
+        datasets.add(str(row.get("dataset", "unknown")))
+    dataset_list = sorted(list(datasets), key=natural_sort_key)
+
+    variable_groups = [
+        {
+            "name": "Label Mode",
+            "headers": ["Label Mode"],
+            "func": lambda r: (str(r.get("experiment", "unknown")),),
+        },
+        {
+            "name": "Loss",
+            "headers": ["Loss"],
+            "func": lambda r: (str(r.get("loss", "unknown")),),
+            "filter": lambda r: str(r.get("loss", "unknown")) != "bce",
+        },
+        {
+            "name": "Connectivity and Grouping-Fusion",
+            "headers": ["Connectivity", "Grouping -- Fusion"],
+            "func": lambda r: (
+                str(r.get("conn_num", "unknown")),
+                "--" if str(r.get("direction_grouping", "none")) == "none" else f"{r.get('direction_grouping')} -- {r.get('direction_fusion')}"
+            ),
+        }
+    ]
+
+    lines = [
+        r"\documentclass[11pt]{article}",
+        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{float}",
+        r"\usepackage{multirow}",
+        r"\begin{document}",
+        r"\section*{Ablation Studies (Marginal Averages)}",
+    ]
+
+    for v_group in variable_groups:
+        var_name = v_group["name"]
+        headers = v_group["headers"]
+        var_func = v_group["func"]
+        row_filter = v_group.get("filter", lambda r: True)
+
+        val_set = set()
+        for row in rows:
+            if row_filter(row):
+                val_set.add(var_func(row))
+
+        def tuple_sort_key(tup):
+            return [natural_sort_key(str(x)) for x in tup]
+
+        val_list = sorted(list(val_set), key=tuple_sort_key)
+
+        stats = {ds: {v: {"dice": [], "iou": []} for v in val_list} for ds in dataset_list}
+
+        for row in rows:
+            if not row_filter(row):
+                continue
+            ds = str(row.get("dataset", "unknown"))
+            val = var_func(row)
+            dice = float(row.get("best_dice", float("nan")))
+            iou = float(row.get("best_jac", float("nan")))
+            if not math.isnan(dice):
+                stats[ds][val]["dice"].append(dice)
+            if not math.isnan(iou):
+                stats[ds][val]["iou"].append(iou)
+
+        def get_ranks(values: List[float], higher_is_better: bool = True) -> Tuple[Set[int], Set[int]]:
+            valid_vals = [v for v in values if not math.isnan(v)]
+            if not valid_vals:
+                return set(), set()
+            ranked = sorted(set(valid_vals), reverse=higher_is_better)
+            best = ranked[0]
+            second = ranked[1] if len(ranked) > 1 else None
+            best_idx = {i for i, v in enumerate(values) if v == best}
+            second_idx = {i for i, v in enumerate(values) if v == second} if second is not None else set()
+            return best_idx, second_idx
+
+        avg_stats = {
+            ds: {
+                v: {
+                    "dice_mean": float("nan"),
+                    "dice_std": float("nan"),
+                    "iou_mean": float("nan"),
+                    "iou_std": float("nan"),
+                }
+                for v in val_list
+            }
+            for ds in dataset_list
+        }
+        dataset_metrics = {ds: {"dice": [], "iou": []} for ds in dataset_list}
+
+        for ds in dataset_list:
+            for v in val_list:
+                dice_list = stats[ds][v]["dice"]
+                iou_list = stats[ds][v]["iou"]
+                avg_dice = _safe_mean(dice_list)
+                avg_iou = _safe_mean(iou_list)
+                std_dice = _safe_std(dice_list, avg_dice)
+                std_iou = _safe_std(iou_list, avg_iou)
+                
+                avg_stats[ds][v]["dice_mean"] = avg_dice
+                avg_stats[ds][v]["dice_std"] = std_dice
+                avg_stats[ds][v]["iou_mean"] = avg_iou
+                avg_stats[ds][v]["iou_std"] = std_iou
+                
+                dataset_metrics[ds]["dice"].append(avg_dice)
+                dataset_metrics[ds]["iou"].append(avg_iou)
+
+        dataset_ranks = {}
+        for ds in dataset_list:
+            dice_b, dice_s = get_ranks(dataset_metrics[ds]["dice"], True)
+            iou_b, iou_s = get_ranks(dataset_metrics[ds]["iou"], True)
+            dataset_ranks[ds] = {"dice_best": dice_b, "dice_second": dice_s, "iou_best": iou_b, "iou_second": iou_s}
+
+        lines.extend([
+            r"\begin{table}[H]",
+            r"\centering",
+        ])
+
+        num_var_cols = len(headers)
+        col_str = "l" * num_var_cols + "cc" * len(dataset_list)
+        lines.append(rf"\begin{{tabular}}{{{col_str}}}")
+        lines.append(r"\toprule")
+
+        header1 = [rf"\multirow{{2}}{{*}}{{{escape_latex_text(h)}}}" for h in headers]
+        for ds in dataset_list:
+            header1.append(rf"\multicolumn{{2}}{{c}}{{{escape_latex_text(ds)}}}")
+        lines.append(" & ".join(header1) + r" \\")
+
+        cmidrules = []
+        current_col = num_var_cols + 1
+        for ds in dataset_list:
+            cmidrules.append(rf"\cmidrule(lr){{{current_col}-{current_col+1}}}")
+            current_col += 2
+        if cmidrules:
+            lines.append(" ".join(cmidrules))
+
+        header2 = [""] * num_var_cols
+        for ds in dataset_list:
+            header2.extend(["Dice", "IoU"])
+        lines.append(" & ".join(header2) + r" \\")
+        lines.append(r"\midrule")
+
+        for idx, v in enumerate(val_list):
+            row_str_parts = [escape_latex_text(str(x)) for x in v]
+            for ds in dataset_list:
+                dice_mean = avg_stats[ds][v]["dice_mean"]
+                dice_std = avg_stats[ds][v]["dice_std"]
+                iou_mean = avg_stats[ds][v]["iou_mean"]
+                iou_std = avg_stats[ds][v]["iou_std"]
+
+                dice_txt = _fmt_latex_ranked_mean_std_marginal(
+                    dice_mean, dice_std, idx in dataset_ranks[ds]["dice_best"], idx in dataset_ranks[ds]["dice_second"]
+                )
+                iou_txt = _fmt_latex_ranked_mean_std_marginal(
+                    iou_mean, iou_std, idx in dataset_ranks[ds]["iou_best"], idx in dataset_ranks[ds]["iou_second"]
+                )
+
+                row_str_parts.append(dice_txt)
+                row_str_parts.append(iou_txt)
+            lines.append(" & ".join(row_str_parts) + r" \\")
+
+        lines.extend([
+            r"\bottomrule",
+            r"\end{tabular}",
+            rf"\caption{{Ablation on {escape_latex_text(var_name)}}}",
+            r"\end{table}",
+        ])
+
+    lines.append(r"\end{document}")
 
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -1609,13 +1895,11 @@ def write_experiment_mean_dataset_tables_latex(
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
-        rf"\section*{{{title}}}",
     ]
 
     for dataset_name, rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
         if len(rows) == 0:
             continue
-        lines.append(rf"\subsection*{{Dataset: {escape_latex_text(dataset_name)}}}")
         _append_dataset_mean_table_lines(lines, rows, dataset_name)
         lines.extend([
             rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
@@ -1646,6 +1930,12 @@ def escape_latex_text(text: str) -> str:
     escaped = text
     for key, value in replacements.items():
         escaped = escaped.replace(key, value)
+
+    # Use \times for patterns like 1x1
+    escaped = re.sub(r'(\d)x(\d)', r'$\1\\times \2$', escaped)
+    # Use en-dash for octa500-3M etc to satisfy chktex
+    escaped = re.sub(r'([a-zA-Z0-9])-([a-zA-Z0-9])', r'\1--\2', escaped)
+
     return escaped
 
 
@@ -1746,6 +2036,8 @@ def main() -> None:
                 "experiment": exp_meta["experiment"],
                 "conn_num": exp_meta["conn_num"],
                 "loss": exp_meta["loss"],
+                "direction_grouping": exp_meta["direction_grouping"],
+                "direction_fusion": exp_meta["direction_fusion"],
                 "fold_scope": scope_name,
                 "fold_scope_count": scope_fold_count,
                 "num_folds": float(len(folds)),
@@ -1775,7 +2067,8 @@ def main() -> None:
 
         write_summary_csv(csv_out, fold_rows, mean_row, std_row)
         write_latex(tex_out, title, fold_rows, mean_row, std_row, dataset_name)
-        build_pdf(tex_out, pdf_out)
+        if len(target_roots) == 1:
+            build_pdf(tex_out, pdf_out)
 
     maybe_write_sample_visualization(
         dump_dir,
@@ -1786,6 +2079,20 @@ def main() -> None:
     )
 
     if len(experiment_mean_rows) >= 1:
+        unique_rows: Dict[Tuple, Dict[str, object]] = {}
+        for row in experiment_mean_rows:
+            key = (
+                row["dataset"],
+                row["experiment"],
+                row["conn_num"],
+                row["loss"],
+                row["direction_grouping"],
+                row["direction_fusion"],
+                row["fold_scope"],
+            )
+            unique_rows[key] = row
+        experiment_mean_rows = list(unique_rows.values())
+
         experiment_mean_rows = sorted(
             experiment_mean_rows,
             key=experiment_sort_key,
@@ -1834,6 +2141,14 @@ def main() -> None:
 
             print(f"[ALL:DATASETS] LaTeX: {dataset_tex_out}")
             print(f"[ALL:DATASETS] PDF: {dataset_pdf_out}")
+
+            ablation_tex_out = os.path.join(dump_dir, f"{agg_stem}_ablation.tex")
+            ablation_pdf_out = os.path.join(args.output_dir, f"{agg_stem}_ablation.pdf")
+            write_ablation_latex(ablation_tex_out, experiment_mean_rows)
+            build_pdf(ablation_tex_out, ablation_pdf_out)
+
+            print(f"[ALL:ABLATION] LaTeX: {ablation_tex_out}")
+            print(f"[ALL:ABLATION] PDF: {ablation_pdf_out}")
 
 
 if __name__ == "__main__":

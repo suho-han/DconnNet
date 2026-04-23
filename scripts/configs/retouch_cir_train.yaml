@@ -1,0 +1,14 @@
+dataset: retouch-Cirrus
+mode: single
+device: 0
+direction_grouping: none
+direction_fusion: weighted_sum
+dist_sf_l1_gamma: 1.0
+single:
+  retouch_data_root: data/retouch
+  conn_num: 8
+  label_mode: binary
+  dist_aux_loss: smooth_l1
+  folds: 3
+  target_folds: [1, 2, 3]
+  epochs: 50

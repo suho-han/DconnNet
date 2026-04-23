@@ -39,6 +39,19 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def resolve_env_file(path_arg: str) -> Path:
+    requested = Path(path_arg)
+    if requested.is_absolute():
+        return requested
+
+    cwd_candidate = Path.cwd() / requested
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    script_candidate = Path(__file__).resolve().parent.parent / requested
+    return script_candidate
+
+
 def first_env(keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = os.getenv(key)
@@ -138,7 +151,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    load_dotenv(Path(args.env_file))
+    load_dotenv(resolve_env_file(args.env_file))
 
     token = first_env(TOKEN_KEYS)
     chat_id = first_env(CHAT_ID_KEYS)
