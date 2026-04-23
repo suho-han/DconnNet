@@ -3,6 +3,7 @@ import glob
 import os
 import random
 
+import autorootcwd
 # from GetDataset import MyDataset
 import cv2
 import matplotlib.pyplot as plt
@@ -15,6 +16,7 @@ from torch.autograd import Variable
 from torchvision import datasets, transforms
 
 from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE, MyDataset_OCTA500
+from data_loader.GetDataset_CREMI import getdataset_cremi
 from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
 from data_loader.GetDataset_Retouch import MyDataset
 from model.DconnNet import DconnNet
@@ -53,6 +55,46 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
+def _resolve_retouch_case_roots(data_root, device_name):
+    device_root = os.path.join(data_root, device_name)
+    candidate_roots = [
+        os.path.join(device_root, 'all'),
+        os.path.join(device_root, 'train'),
+        device_root,
+    ]
+
+    for candidate in candidate_roots:
+        case_dirs = sorted(glob.glob(os.path.join(candidate, 'TRAIN*')))
+        case_dirs = [p for p in case_dirs if os.path.isdir(p)]
+        if case_dirs:
+            return case_dirs
+
+    searched = ', '.join(candidate_roots)
+    raise FileNotFoundError(
+        f'Could not find RETOUCH TRAIN* case folders for {device_name}. '
+        f'Searched: {searched}'
+    )
+
+
+def _get_retouch_fold_indices(device_name, exp_id):
+    if device_name in ('Cirrus', 'Spectrailis'):
+        total = 24
+        start = exp_id * 8
+        end = (exp_id + 1) * 8
+        test_id = list(range(start, end))
+    elif device_name == 'Topcon':
+        total = 22
+        if exp_id < 2:
+            test_id = list(range(exp_id * 7, (exp_id + 1) * 7))
+        else:
+            test_id = list(range(14, 22))
+    else:
+        raise ValueError(f'Unsupported RETOUCH device: {device_name}')
+
+    train_id = sorted(set(range(total)) - set(test_id))
+    return total, train_id, test_id
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='DconnNet Training With Pytorch')
@@ -63,10 +105,10 @@ def parse_args():
 
     # dataset info
     parser.add_argument('--dataset', type=str, default='retouch-Spectrailis',
-                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive, octa500')
+                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive, octa500, cremi')
 
     parser.add_argument('--data_root', type=str, default='/retouch',
-                        help='dataset directory')
+                        help='dataset directory (e.g. data/CREMI for --dataset cremi)')
     parser.add_argument('--resize', type=int, default=[256, 256], nargs='+',
                         help='image size: [height, width]')
     parser.add_argument('--label_mode', type=str, default='binary',
@@ -97,17 +139,17 @@ def parse_args():
     parser.add_argument('--conn_num', type=int, default=8, choices=[8, 24],
                         help='the number of connections for DconnNet (supported: 8, 24)')
     parser.add_argument('--direction_grouping', type=str, default='none',
-                        choices=['none', 'coarse24to8'],
-                        help='optional fork-specific directional grouping path; coarse24to8 compresses 24 proto-directions into the canonical 8-direction output layout')
-    parser.add_argument('--direction_fusion', type=str, default='weighted_sum',
+                        choices=['none', '24to8'],
+                        help='optional fork-specific directional grouping path; 24to8 compresses 24 proto-directions into the canonical 8-direction output layout')
+    parser.add_argument('--direction_fusion', type=str, default=None,
                         choices=['mean', 'weighted_sum', 'conv1x1', 'attention_gating'],
-                        help='fusion block used when --direction_grouping=coarse24to8')
+                        help='fusion block used when --direction_grouping=24to8')
     parser.add_argument('--tau', type=float, default=3.0,
                         help='the temperature parameter tau for the distance connectivity loss')
     parser.add_argument('--sigma', type=float, default=2.0,
                         help='the weight parameter sigma for the distance connectivity loss')
     parser.add_argument('--dist_aux_loss', type=str, default='smooth_l1',
-                        choices=['smooth_l1', 'gjml_sf_l1'],
+                        choices=['smooth_l1', 'gjml_sf_l1', 'cl_dice'],
                         help='auxiliary regression loss for dist/dist_inverted affinity targets')
     parser.add_argument('--dist_sf_l1_gamma', type=float, default=1.0,
                         help='gamma for Stable Focal-L1 when --dist_aux_loss=gjml_sf_l1')
@@ -124,6 +166,29 @@ def parse_args():
 
     parser.add_argument('--save-per-epochs', type=int, default=50,
                         help='per epochs to save')
+    parser.add_argument('--monitor_metric', '--monitor-metric', type=str, default='val_dice',
+                        choices=['val_dice', 'val_loss'],
+                        help='metric for best checkpoint and early stopping')
+    parser.add_argument('--early_stopping_patience', '--early-stopping-patience', type=int, default=20,
+                        help='patience for validation-based early stopping (<=0 disables early stopping)')
+    parser.add_argument('--early_stopping_min_delta', '--early-stopping-min-delta', type=float, default=0.001,
+                        help='minimum improvement threshold for monitor metric')
+    parser.add_argument('--early_stopping_tie_eps', '--early-stopping-tie-eps', type=float, default=1e-4,
+                        help='tie epsilon for val_dice tie-break using val_loss')
+    parser.add_argument('--early_stopping_stop_interval', '--early-stopping-stop-interval', type=int, default=10,
+                        help='actual stopping happens only on epochs divisible by this interval')
+    parser.add_argument('--tie_break_with_loss', '--tie-break-with-loss', dest='tie_break_with_loss',
+                        action='store_true', default=True,
+                        help='when val_dice is tied within eps, prefer lower val_loss')
+    parser.add_argument('--no_tie_break_with_loss', '--no-tie-break-with-loss', dest='tie_break_with_loss',
+                        action='store_false',
+                        help='disable val_loss tie-break when val_dice values are tied')
+    parser.add_argument('--save_best_only', '--save-best-only', dest='save_best_only',
+                        action='store_true', default=False,
+                        help='if set, disable periodic epoch checkpoints and keep best checkpoint only')
+    parser.add_argument('--no_save_best_only', '--no-save-best-only', dest='save_best_only',
+                        action='store_false',
+                        help='enable periodic epoch checkpoints')
 
     # evaluation only
     parser.add_argument('--test_only', action='store_true', default=False,
@@ -143,8 +208,32 @@ def parse_args():
         if args.target_fold < 1 or args.target_fold > args.folds:
             parser.error('--target_fold must be within [1, --folds]')
 
-    if args.direction_grouping == 'coarse24to8' and args.conn_num != 8:
-        parser.error('--direction_grouping=coarse24to8 requires --conn_num=8 because the grouped path feeds the canonical 8-direction branch')
+    if args.direction_grouping == '24to8' and args.conn_num != 8:
+        parser.error('--direction_grouping=24to8 requires --conn_num=8 because the grouped path feeds the canonical 8-direction branch')
+    if args.early_stopping_patience < 0:
+        parser.error('--early_stopping_patience must be >= 0')
+    if args.early_stopping_min_delta < 0:
+        parser.error('--early_stopping_min_delta must be >= 0')
+    if args.early_stopping_tie_eps < 0:
+        parser.error('--early_stopping_tie_eps must be >= 0')
+    if args.early_stopping_stop_interval < 1:
+        parser.error('--early_stopping_stop_interval must be >= 1')
+
+    # Group related runtime controls for clearer downstream consumption.
+    args.monitoring_config = {
+        'monitor_metric': args.monitor_metric,
+    }
+    args.early_stopping_config = {
+        'patience': int(args.early_stopping_patience),
+        'min_delta': float(args.early_stopping_min_delta),
+        'tie_eps': float(args.early_stopping_tie_eps),
+        'stop_interval': int(args.early_stopping_stop_interval),
+        'tie_break_with_loss': bool(args.tie_break_with_loss),
+    }
+    args.checkpoint_config = {
+        'save_best_only': bool(args.save_best_only),
+        'save_per_epochs': int(args.save_per_epochs),
+    }
 
     return args
 
@@ -175,35 +264,29 @@ def main(args):
         testset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='test', with_name=False)
 
     elif 'retouch' in args.dataset:
-        raise NotImplementedError("Retouch dataset loading is not implemented in this code. Please implement your own data loading logic based on the commented-out code below or your specific data organization.")
-        # TODO: change when data is ready
-        # device_name = args.dataset.split('-')[1]
-        # path = args.data_root + '/'+device_name + '/train'
-        # pat_ls = glob.glob(path+'/*')
+        if len(exp_indices) != 1:
+            raise ValueError(
+                'RETOUCH uses fixed 3-fold patient splits and currently supports one fold per run. '
+                'Please set --folds=3 and provide --target_fold.'
+            )
 
-        # # for Cirrus
-        # if device_name == 'Cirrus':
-        #     # total_id = [i for i in range(24)]
-        #     # test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
+        device_name = args.dataset.split('-', 1)[1]
+        exp_id = exp_indices[0]
+        case_roots = _resolve_retouch_case_roots(args.data_root, device_name)
+        total_cases, train_id, test_id = _get_retouch_fold_indices(device_name, exp_id)
 
-        # if device_name == 'Spectrailis':
-        # total_id = [i for i in range(24)]
-        # test_id = [i for i in range(exp_id*8, (exp_id+1)*8)]
+        if len(case_roots) < total_cases:
+            raise ValueError(
+                f'Found only {len(case_roots)} RETOUCH cases for {device_name}, '
+                f'but expected at least {total_cases}.'
+            )
 
-        # if device_name == 'Topcon':
+        case_roots = case_roots[:total_cases]
+        train_root = [case_roots[i] for i in train_id]
+        test_root = [case_roots[i] for i in test_id]
 
-        # total_id = [i for i in range(22)]
-        # if exp_id < 2:
-        #     test_id = [i for i in range(exp_id*7, (exp_id+1)*7)]
-        # else:
-        #     test_id = [i for i in range(14, 22)]
-
-        # train_id = set(total_id) - set(test_id)
-        # test_root = [pat_ls[i] for i in test_id]
-        # train_root = [pat_ls[i] for i in train_id]
-
-        # trainset = MyDataset(args, train_root=train_root, mode='train')
-        # validset = MyDataset(args, train_root=test_root, mode='test')
+        trainset = MyDataset(args, train_root=train_root, mode='train')
+        validset = MyDataset(args, train_root=test_root, mode='test')
 
     elif args.dataset == 'chase':
         overall_id = ['01', '02', '03', '04', '05', '06',
@@ -223,6 +306,9 @@ def main(args):
         trainset = MyDataset_OCTA500(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
         validset = MyDataset_OCTA500(args, train_root=args.data_root, mode='val', label_mode=args.label_mode)
         testset = MyDataset_OCTA500(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
+    elif args.dataset == 'cremi':
+        trainset = getdataset_cremi(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
+        testset = getdataset_cremi(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
         pass
@@ -272,9 +358,9 @@ def main(args):
     ).cuda()
 
     if args.pretrained:
-        model.load_state_dict(torch.load(
-            args.pretrained, map_location=torch.device('cpu')))
+        model.load_state_dict(torch.load(args.pretrained, map_location=torch.device('cpu')))
         model = model.cuda()
+        print("Loaded pretrained model from %s" % args.pretrained)
 
     solver = Solver(args)
 

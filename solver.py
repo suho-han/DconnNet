@@ -47,6 +47,91 @@ except Exception:
     amp = _AmpFallback()
 
 
+class EarlyStopping:
+    def __init__(
+        self,
+        monitor_metric='val_dice',
+        mode='max',
+        patience=20,
+        min_delta=0.001,
+        tie_break_with_loss=True,
+        tie_eps=1e-4,
+        stop_interval=10,
+    ):
+        self.monitor_metric = monitor_metric
+        self.mode = mode
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.tie_break_with_loss = bool(tie_break_with_loss)
+        self.tie_eps = float(tie_eps)
+        self.stop_interval = max(1, int(stop_interval))
+
+        self.enabled = self.patience > 0
+        self.best_monitor = float('nan')
+        self.best_val_dice = float('nan')
+        self.best_val_loss = float('nan')
+        self.best_epoch = 0
+        self.counter = 0
+        self.pending_stop = False
+
+    def _is_improved(self, monitor_value):
+        if self.best_epoch == 0:
+            return not math.isnan(float(monitor_value))
+        if math.isnan(float(monitor_value)):
+            return False
+        if self.mode == 'max':
+            return monitor_value > (self.best_monitor + self.min_delta)
+        return monitor_value < (self.best_monitor - self.min_delta)
+
+    def _is_tie_break_improved(self, val_dice, val_loss):
+        if self.monitor_metric != 'val_dice':
+            return False
+        if not self.tie_break_with_loss:
+            return False
+        if self.best_epoch == 0:
+            return False
+        if math.isnan(float(val_dice)) or math.isnan(float(val_loss)) or math.isnan(float(self.best_val_loss)):
+            return False
+        if abs(float(val_dice) - float(self.best_val_dice)) > self.tie_eps:
+            return False
+        return float(val_loss) < float(self.best_val_loss)
+
+    def step(self, monitor_value, val_dice, val_loss, epoch):
+        improved = self._is_improved(monitor_value)
+        used_tie_break = False
+        if not improved and self._is_tie_break_improved(val_dice, val_loss):
+            improved = True
+            used_tie_break = True
+
+        if improved:
+            self.best_monitor = float(monitor_value)
+            self.best_val_dice = float(val_dice)
+            self.best_val_loss = float(val_loss)
+            self.best_epoch = int(epoch)
+            self.counter = 0
+            self.pending_stop = False
+        else:
+            if self.enabled:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.pending_stop = True
+
+        should_stop = bool(self.enabled and self.pending_stop and (int(epoch) % self.stop_interval == 0))
+        waiting_for_boundary = bool(self.enabled and self.pending_stop and not should_stop)
+
+        return {
+            'improved': improved,
+            'used_tie_break': used_tie_break,
+            'counter': int(self.counter),
+            'best_monitor': float(self.best_monitor),
+            'best_val_dice': float(self.best_val_dice),
+            'best_val_loss': float(self.best_val_loss),
+            'best_epoch': int(self.best_epoch),
+            'should_stop': should_stop,
+            'waiting_for_boundary': waiting_for_boundary,
+        }
+
+
 class Solver(object):
     def __init__(self, args, optim=torch.optim.Adam):
         self.args = args
@@ -354,6 +439,69 @@ class Solver(object):
         pred_mask = (pred_mask > 0).float()
         return pred_mask
 
+    def _resolve_training_runtime_configs(self):
+        monitoring_config = getattr(self.args, 'monitoring_config', {}) or {}
+        early_stopping_config = getattr(self.args, 'early_stopping_config', {}) or {}
+        checkpoint_config = getattr(self.args, 'checkpoint_config', {}) or {}
+
+        monitor_metric = monitoring_config.get(
+            'monitor_metric',
+            getattr(self.args, 'monitor_metric', 'val_dice'),
+        )
+        if monitor_metric not in ('val_dice', 'val_loss'):
+            raise ValueError(
+                f"Unsupported monitor_metric={monitor_metric}; supported: val_dice, val_loss"
+            )
+
+        save_best_only = bool(
+            checkpoint_config.get(
+                'save_best_only',
+                getattr(self.args, 'save_best_only', False),
+            )
+        )
+        save_per_epochs = int(
+            checkpoint_config.get(
+                'save_per_epochs',
+                getattr(self.args, 'save_per_epochs', 50),
+            )
+        )
+        if save_per_epochs < 1:
+            raise ValueError('save_per_epochs must be >= 1')
+
+        early_stopping_kwargs = {
+            'patience': int(
+                early_stopping_config.get(
+                    'patience',
+                    getattr(self.args, 'early_stopping_patience', 20),
+                )
+            ),
+            'min_delta': float(
+                early_stopping_config.get(
+                    'min_delta',
+                    getattr(self.args, 'early_stopping_min_delta', 0.001),
+                )
+            ),
+            'tie_break_with_loss': bool(
+                early_stopping_config.get(
+                    'tie_break_with_loss',
+                    getattr(self.args, 'tie_break_with_loss', True),
+                )
+            ),
+            'tie_eps': float(
+                early_stopping_config.get(
+                    'tie_eps',
+                    getattr(self.args, 'early_stopping_tie_eps', 1e-4),
+                )
+            ),
+            'stop_interval': int(
+                early_stopping_config.get(
+                    'stop_interval',
+                    getattr(self.args, 'early_stopping_stop_interval', 10),
+                )
+            ),
+        }
+        return monitor_metric, save_best_only, save_per_epochs, early_stopping_kwargs
+
     def train(self, model, train_loader, val_loader, num_epochs=10, label_mode='binary', test_loader=None):
         optim = self.optim(model.parameters(), lr=self.lr)
 
@@ -395,7 +543,18 @@ class Solver(object):
 
         net, optimizer = amp.initialize(model, optim, opt_level='O2')
 
-        best_p = 0
+        monitor_metric, save_best_only, save_per_epochs, early_stopping_kwargs = (
+            self._resolve_training_runtime_configs()
+        )
+        monitor_mode = 'max' if monitor_metric == 'val_dice' else 'min'
+        early_stopper = None
+        if val_loader is not None:
+            early_stopper = EarlyStopping(
+                monitor_metric=monitor_metric,
+                mode=monitor_mode,
+                **early_stopping_kwargs,
+            )
+
         scheduled_modes = ['CosineAnnealingWarmRestarts']
         if self.args.lr_update in scheduled_modes:
             scheduled = True
@@ -428,6 +587,7 @@ class Solver(object):
         else:
             global_step = 0
             train_start_time = time.perf_counter()
+            completed_epoch = 0
             epoch_metrics = {
                 'dice': float('nan'),
                 'jac': float('nan'),
@@ -441,6 +601,8 @@ class Solver(object):
                 'val_loss_terms': {},
             }
             for epoch in range(self.args.epochs):
+                current_epoch = epoch + 1
+                completed_epoch = current_epoch
                 net.train()
                 train_loss_epoch = []
                 if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'reset_dist_edge_stats'):
@@ -496,7 +658,7 @@ class Solver(object):
                     )
 
                 mean_train_loss = float(np.mean(train_loss_epoch)) if train_loss_epoch else float('nan')
-                should_save_batch_triplet = ((epoch + 1) % self.args.save_per_epochs == 0)
+                should_save_batch_triplet = ((epoch + 1) % save_per_epochs == 0)
 
                 epoch_metrics = {
                     'dice': float('nan'),
@@ -511,6 +673,7 @@ class Solver(object):
                     'val_loss_terms': {},
                 }
 
+                stop_training = False
                 if val_loader is not None:
                     print('RUN VALIDATION ON validation split.')
 
@@ -522,16 +685,46 @@ class Solver(object):
                         save_batch_triplet=should_save_batch_triplet,
                         split_name='val',
                     )
-                    dice_p = epoch_metrics['dice']
-                    if best_p < dice_p:
-                        best_p = dice_p
+                    prev_best_dice = float(early_stopper.best_val_dice)
+                    monitor_value = (
+                        epoch_metrics['dice']
+                        if monitor_metric == 'val_dice'
+                        else epoch_metrics['val_loss']
+                    )
+                    stop_state = early_stopper.step(
+                        monitor_value=monitor_value,
+                        val_dice=epoch_metrics['dice'],
+                        val_loss=epoch_metrics['val_loss'],
+                        epoch=current_epoch,
+                    )
+                    monitor_label = 'validation Dice' if monitor_metric == 'val_dice' else 'validation loss'
+
+                    if stop_state['improved']:
                         best_model_dir = os.path.join(self.args.save, 'models')
-                        torch.save(model.state_dict(), os.path.join(best_model_dir, 'best_model.pth'))
+                        best_model_path = os.path.join(best_model_dir, 'best_model.pth')
+                        checkpoint_best_path = os.path.join(best_model_dir, 'checkpoint_best.pth')
+                        torch.save(model.state_dict(), best_model_path)
+                        torch.save(
+                            {
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'epoch': int(current_epoch),
+                                'best_val_dice': float(stop_state['best_val_dice']),
+                                'best_val_loss': float(stop_state['best_val_loss']),
+                                'monitor_metric': monitor_metric,
+                                'monitor_value': float(stop_state['best_monitor']),
+                                'tie_break_with_loss': bool(stop_state['used_tie_break']),
+                            },
+                            checkpoint_best_path,
+                        )
                         with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
-                            f.write(f'best_epoch={epoch + 1}\n')
-                            f.write(f'best_dice={best_p:.6f}\n')
+                            f.write(f'best_epoch={current_epoch}\n')
+                            f.write(f'best_val_dice={stop_state["best_val_dice"]:.6f}\n')
+                            f.write(f'best_val_loss={stop_state["best_val_loss"]:.6f}\n')
+                            f.write(f'monitor_metric={monitor_metric}\n')
+                            f.write(f'best_monitor_value={stop_state["best_monitor"]:.6f}\n')
+                            f.write(f'used_tie_break_with_loss={bool(stop_state["used_tie_break"])}\n')
                             f.write(f'best_train_loss={epoch_metrics["train_loss"]:.6f}\n')
-                            f.write(f'best_val_loss={epoch_metrics["val_loss"]:.6f}\n')
                             f.write(f'best_jac={epoch_metrics["jac"]:.6f}\n')
                             f.write(f'best_clDice={epoch_metrics["cldice"]:.6f}\n')
                             f.write(
@@ -540,48 +733,96 @@ class Solver(object):
                             f.write(
                                 f'best_betti_error_1={epoch_metrics["betti_error_1"]:.6f}\n'
                             )
+                        if stop_state['used_tie_break']:
+                            print(
+                                'Validation Dice tie detected; lower validation loss selected best checkpoint '
+                                f'({stop_state["best_val_loss"]:.6f}).'
+                            )
+                        else:
+                            if math.isnan(prev_best_dice):
+                                print(
+                                    'Best model updated based on validation Dice '
+                                    f'({stop_state["best_val_dice"]:.6f}).'
+                                )
+                            else:
+                                print(
+                                    'Validation Dice improved from '
+                                    f'{prev_best_dice:.6f} to {stop_state["best_val_dice"]:.6f}. '
+                                    'Saving best checkpoint.'
+                                )
 
-                if (epoch + 1) % self.args.save_per_epochs == 0:
+                    if stop_state['waiting_for_boundary']:
+                        print(
+                            f'Patience reached for {monitor_label}; waiting for stop boundary at every '
+                            f'{early_stopper.stop_interval} epochs. '
+                            f'Current epoch: {current_epoch}.'
+                        )
+                    if stop_state['should_stop']:
+                        print(
+                            f'Early stopping triggered. No improvement in {monitor_label} for '
+                            f'{early_stopper.patience} epochs.'
+                        )
+                        stop_training = True
+
+                if (not save_best_only) and (current_epoch % save_per_epochs == 0):
                     torch.save(
                         model.state_dict(),
-                        os.path.join(self.args.save, 'models', str(epoch + 1) + '_model.pth')
+                        os.path.join(self.args.save, 'models', str(current_epoch) + '_model.pth')
                     )
 
                 if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'get_dist_edge_stats'):
                     dist_edge_stats = self.loss_func.get_dist_edge_stats()
                 else:
                     dist_edge_stats = None
-                writer.add_scalar('epoch/train_loss', float(mean_train_loss), epoch + 1)
+                writer.add_scalar('epoch/train_loss', float(mean_train_loss), current_epoch)
                 if not math.isnan(float(epoch_metrics['val_loss'])):
-                    writer.add_scalar('epoch/val_loss', float(epoch_metrics['val_loss']), epoch + 1)
+                    writer.add_scalar('epoch/val_loss', float(epoch_metrics['val_loss']), current_epoch)
                 if not math.isnan(float(epoch_metrics['dice'])):
-                    writer.add_scalar('epoch/dice', float(epoch_metrics['dice']), epoch + 1)
+                    writer.add_scalar('epoch/dice', float(epoch_metrics['dice']), current_epoch)
                 if not math.isnan(float(epoch_metrics['jac'])):
-                    writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), epoch + 1)
+                    writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), current_epoch)
                 if not math.isnan(float(epoch_metrics['cldice'])):
-                    writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), epoch + 1)
+                    writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), current_epoch)
                 if not math.isnan(float(epoch_metrics['precision'])):
-                    writer.add_scalar('epoch/precision', float(epoch_metrics['precision']), epoch + 1)
+                    writer.add_scalar('epoch/precision', float(epoch_metrics['precision']), current_epoch)
                 if not math.isnan(float(epoch_metrics['accuracy'])):
-                    writer.add_scalar('epoch/accuracy', float(epoch_metrics['accuracy']), epoch + 1)
+                    writer.add_scalar('epoch/accuracy', float(epoch_metrics['accuracy']), current_epoch)
                 if not math.isnan(float(epoch_metrics['betti_error_0'])):
                     writer.add_scalar(
                         'epoch/betti_error_0',
                         float(epoch_metrics['betti_error_0']),
-                        epoch + 1,
+                        current_epoch,
                     )
                 if not math.isnan(float(epoch_metrics['betti_error_1'])):
                     writer.add_scalar(
                         'epoch/betti_error_1',
                         float(epoch_metrics['betti_error_1']),
-                        epoch + 1,
+                        current_epoch,
                     )
                 for key, value in epoch_metrics.get('val_loss_terms', {}).items():
-                    writer.add_scalar(f'val/{key}', float(value), epoch + 1)
+                    writer.add_scalar(f'val/{key}', float(value), current_epoch)
+                if early_stopper is not None and val_loader is not None:
+                    if not math.isnan(float(early_stopper.best_val_dice)):
+                        writer.add_scalar('epoch/best_val_dice', float(early_stopper.best_val_dice), current_epoch)
+                    writer.add_scalar('epoch/early_stopping_counter', float(early_stopper.counter), current_epoch)
                 if dist_edge_stats is not None:
-                    writer.add_scalar('train/edge_mean', float(dist_edge_stats['edge_mean']), epoch + 1)
-                    writer.add_scalar('train/edge_nonzero_ratio', float(dist_edge_stats['edge_nonzero_ratio']), epoch + 1)
-                if dist_edge_stats is None:
+                    writer.add_scalar('train/edge_mean', float(dist_edge_stats['edge_mean']), current_epoch)
+                    writer.add_scalar('train/edge_nonzero_ratio', float(dist_edge_stats['edge_nonzero_ratio']), current_epoch)
+
+                if val_loader is not None:
+                    print(f'Epoch [{current_epoch}/{self.args.epochs}]')
+                    print(f'Train Loss: {mean_train_loss:.6f}')
+                    print(f'Val Loss: {float(epoch_metrics["val_loss"]):.6f}')
+                    print(f'Val Dice: {float(epoch_metrics["dice"]):.6f}')
+                    if early_stopper is not None and not math.isnan(float(early_stopper.best_val_dice)):
+                        print(f'Best Val Dice: {float(early_stopper.best_val_dice):.6f}')
+                    else:
+                        print('Best Val Dice: nan')
+                    if early_stopper is not None and early_stopper.enabled:
+                        print(f'EarlyStopping Counter: {int(early_stopper.counter)}/{int(early_stopper.patience)}')
+                    else:
+                        print('EarlyStopping Counter: disabled')
+                elif dist_edge_stats is None:
                     print('[Epoch :%d] total loss:%.3f ' % (epoch, mean_train_loss))
                 else:
                     print(
@@ -594,8 +835,12 @@ class Solver(object):
                         )
                     )
                 elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
-                if val_loader is not None:
-                    self._write_epoch_result_row(epoch + 1, epoch_metrics, elapsed_hms)
+                self._write_epoch_result_row(current_epoch, epoch_metrics, elapsed_hms)
+                if stop_training:
+                    break
+
+            if completed_epoch == 0:
+                raise ValueError('Training loop completed zero epochs; please set --epochs >= 1.')
 
             final_eval_split = 'test' if test_loader is not None else 'val'
             final_eval_loader = test_loader if test_loader is not None else val_loader
@@ -616,12 +861,12 @@ class Solver(object):
                 final_checkpoint_name = 'last_epoch_model'
 
             print(f'RUN FINAL {final_eval_split.upper()} EVAL AFTER TRAINING.')
-            final_eval_epoch = epoch + 1
+            final_eval_epoch = int(completed_epoch)
             total_elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
             final_eval_metrics = self.test_epoch(
                 net,
                 final_eval_loader,
-                epoch,
+                final_eval_epoch - 1,
                 train_loss=epoch_metrics['train_loss'],
                 save_batch_triplet=True,
                 split_name=final_eval_split,
@@ -714,7 +959,7 @@ class Solver(object):
                     sample_cldc = []
                     sample_betti_error_0 = []
                     sample_betti_error_1 = []
-                    if self.args.dataset == 'isic':
+                    if self.args.dataset in ('isic', 'cremi'):
                         sample_precision, sample_accuracy = self._compute_binary_precision_accuracy(pred, gt_mask)
                     else:
                         sample_precision = torch.full((batch,), float('nan'), device=pred.device)
@@ -755,7 +1000,7 @@ class Solver(object):
                     sample_cldc = [float('nan')] * batch
                     sample_betti_error_0 = [float('nan')] * batch
                     sample_betti_error_1 = [float('nan')] * batch
-                    if self.args.dataset == 'isic':
+                    if self.args.dataset in ('isic', 'cremi'):
                         pred_label = pred_to_save.squeeze(1).long()
                         true_label = mask_to_save.squeeze(1).long()
                         sample_precision, sample_accuracy = self._compute_multiclass_precision_accuracy(

@@ -10,6 +10,8 @@ from skimage.io import imread, imsave
 from torch.autograd import Function, Variable
 from torch.nn.modules.loss import _Loss
 
+from src.losses import dist_aux_regression_loss as dist_aux_regression_loss_fn
+
 CANONICAL_8_OFFSETS = [
     (1, 1),
     (1, 0),
@@ -387,7 +389,6 @@ class connect_loss(nn.Module):
         self.label_mode = label_mode
         self.conn_num = conn_num
         self.sigma = sigma
-        self.sml1_loss = nn.SmoothL1Loss(reduction='none')
         self.dist_aux_loss_name = getattr(self.args, 'dist_aux_loss', 'smooth_l1')
         self.dist_sf_l1_gamma = getattr(self.args, 'dist_sf_l1_gamma', 1.0)
         self._collect_dist_edge_stats = False
@@ -421,28 +422,14 @@ class connect_loss(nn.Module):
         # CHASE distance labels are positive on vessel pixels and zero on background.
         return (target > 0).float()
 
-    def gjml_loss(self, pred, target, eps=1e-8):
-        pred_flat = pred.view(pred.shape[0], -1)
-        target_flat = target.view(target.shape[0], -1)
-        sum_norm = torch.sum(torch.abs(pred_flat + target_flat), dim=1)
-        diff_norm = torch.sum(torch.abs(pred_flat - target_flat), dim=1)
-        jaccard_term = (sum_norm - diff_norm) / (sum_norm + diff_norm + eps)
-        return (1 - jaccard_term).mean()
-
-    def stable_focal_l1_loss(self, pred, target, gamma):
-        diff = torch.abs(target - pred)
-        indicator = (target * pred >= 0).float()
-        return (diff * torch.pow(diff, gamma) * indicator).mean()
-
     def dist_aux_regression_loss(self, pred, target):
-        if self.dist_aux_loss_name == 'smooth_l1':
-            return self.sml1_loss(pred, target).mean()
-        if self.dist_aux_loss_name == 'gjml_sf_l1':
-            return self.gjml_loss(pred, target) + self.stable_focal_l1_loss(
-                pred, target, gamma=self.dist_sf_l1_gamma
-            )
-        raise ValueError(
-            f"Unsupported dist_aux_loss {self.dist_aux_loss_name}, expected 'smooth_l1' or 'gjml_sf_l1'"
+        # Keep method-level API for backward compatibility while delegating
+        # implementation to fork-specific modularized losses.
+        return dist_aux_regression_loss_fn(
+            pred,
+            target,
+            loss_name=self.dist_aux_loss_name,
+            gamma=self.dist_sf_l1_gamma,
         )
 
     def binary_edge_target_from_affinity(self, affinity_target):
@@ -642,14 +629,23 @@ class connect_loss(nn.Module):
             # regression target.
             vote_loss = self.dist_aux_regression_loss(pred, mask_target).mean()
             dice_l = self.dice_loss(pred[:, 0], mask_target[:, 0])
-            affinity_l = self.dist_aux_regression_loss(c_map, affinity_target)
+            if self.dist_aux_loss_name == 'cl_dice':
+                # clDice on dense affinity maps (B,8,H,W) is memory-prohibitive at
+                # high resolutions; keep clDice on vote-map supervision and use
+                # SmoothL1 for affinity/bicon regression to avoid OOM.
+                affinity_l = F.smooth_l1_loss(c_map, affinity_target, reduction='mean')
+            else:
+                affinity_l = self.dist_aux_regression_loss(c_map, affinity_target)
 
             bicon_map = bicon_map.view(affinity_target.shape)   # (B,8,H,W)
             if self.args.dataset == 'chase':
                 bicon_l = torch.zeros_like(vote_loss)
                 loss = vote_loss + affinity_l + edge_l + dice_l
             else:
-                bicon_l = self.dist_aux_regression_loss(bicon_map, affinity_target)
+                if self.dist_aux_loss_name == 'cl_dice':
+                    bicon_l = F.smooth_l1_loss(bicon_map, affinity_target, reduction='mean')
+                else:
+                    bicon_l = self.dist_aux_regression_loss(bicon_map, affinity_target)
                 loss = vote_loss + affinity_l + edge_l + 0.2 * bicon_l + dice_l
             loss_dict = {
                 'total': loss,

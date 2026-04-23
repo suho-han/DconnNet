@@ -122,7 +122,7 @@ class MyDataset(data.Dataset):
 
         if self.mode == 'train':
             img = self.normalize(img)
-            img, mask = self.randomflip(img, mask)
+            # Keep RETOUCH training path augmentation-free to match paper setting.
             img = np.transpose(img, (2, 0, 1))
             img = np.expand_dims(img, axis=0)
             mask = np.expand_dims(mask, axis=0)

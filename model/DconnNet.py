@@ -6,6 +6,7 @@ Created on Wed Apr 10 09:57:49 2019
 """
 import math
 
+import autorootcwd
 import torch
 import torch.nn as nn
 import torchsummary
@@ -17,28 +18,28 @@ from torchvision import models
 
 import model.gap as gap
 from model.attention import CAM_Module, PAM_Module
-from model.coarse_direction_grouping import CoarseDirectionReducer, FUSION_TYPES
+from model.coarse_direction_grouping import FUSION_TYPES, CoarseDirectionReducer
 from model.resnet import resnet34
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
 
 class DconnNet(nn.Module):
-    def __init__(self, num_class=1, conn_num=8, direction_grouping='none', direction_fusion='weighted_sum'):
+    def __init__(self, num_class=1, conn_num=8, direction_grouping='none', direction_fusion='none'):
         super(DconnNet, self).__init__()
 
-        if direction_grouping not in ('none', 'coarse24to8'):
-            raise ValueError("direction_grouping must be either 'none' or 'coarse24to8'")
-        if direction_grouping == 'coarse24to8' and conn_num != 8:
-            raise ValueError("direction_grouping='coarse24to8' requires conn_num=8 for the final branch layout")
-        if direction_fusion not in FUSION_TYPES:
+        if direction_grouping not in ('none', '24to8'):
+            raise ValueError("direction_grouping must be either 'none' or '24to8'")
+        if direction_grouping == '24to8' and conn_num != 8:
+            raise ValueError("direction_grouping='24to8' requires conn_num=8 for the final branch layout")
+        if direction_fusion != 'none' and direction_fusion not in FUSION_TYPES:
             raise ValueError(f"Unsupported direction_fusion {direction_fusion}, expected one of {FUSION_TYPES}")
 
         self.num_class = num_class
         self.conn_num = conn_num
         self.direction_grouping = direction_grouping
         self.direction_fusion = direction_fusion
-        self.proto_conn_num = 24 if direction_grouping == 'coarse24to8' else conn_num
+        self.proto_conn_num = 24 if direction_grouping == '24to8' else conn_num
 
         out_planes = num_class * conn_num
         proto_out_planes = num_class * self.proto_conn_num
@@ -72,7 +73,7 @@ class DconnNet(nn.Module):
         )
 
         self.direction_reducer = None
-        if self.direction_grouping == 'coarse24to8':
+        if self.direction_grouping == '24to8':
             self.direction_reducer = CoarseDirectionReducer(
                 num_classes=num_class,
                 fusion_type=direction_fusion,

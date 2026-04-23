@@ -264,8 +264,8 @@ class MyDataset_CHASE(data.Dataset):
         self.totensor = ToTensor()
 
     def __getitem__(self, index):
-
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], self.train, self.label_mode)
+        resize_shape = tuple(self.args.resize[:2])
+        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)
@@ -326,8 +326,8 @@ class MyDataset_DRIVE(data.Dataset):
         self.totensor = ToTensor()
 
     def __getitem__(self, index):
-
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], self.train, self.label_mode)
+        resize_shape = tuple(self.args.resize[:2])
+        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)
@@ -388,8 +388,8 @@ class MyDataset_OCTA500(data.Dataset):
         self.totensor = ToTensor()
 
     def __getitem__(self, index):
-
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape=(512, 512), train=self.train, label_mode=self.label_mode)
+        resize_shape = tuple(self.args.resize[:2])
+        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)

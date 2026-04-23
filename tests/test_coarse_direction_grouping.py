@@ -92,6 +92,29 @@ def test_weighted_conv_and_attention_start_from_mean_like_behavior():
         assert torch.allclose(out, mean_out, atol=1e-6, rtol=1e-6)
 
 
+def test_return_maps_exposes_learned_or_dynamic_fusion_maps():
+    x = torch.randn(2, 24, 4, 5)
+
+    weighted = CoarseDirectionReducer(num_classes=1, fusion_type='weighted_sum')
+    weighted_out, weighted_maps = weighted(x, return_maps=True)
+    assert weighted_out.shape == (2, 8, 4, 5)
+    assert set(weighted_maps.keys()) == {'logits', 'weight_map'}
+    assert weighted_maps['logits'].shape == (8, 3)
+    assert weighted_maps['weight_map'].shape == (1, 1, 8, 3, 1, 1)
+
+    conv = CoarseDirectionReducer(num_classes=1, fusion_type='conv1x1')
+    conv_out, conv_maps = conv(x, return_maps=True)
+    assert conv_out.shape == (2, 8, 4, 5)
+    assert set(conv_maps.keys()) == {'conv_map'}
+    assert conv_maps['conv_map'].shape == (2, 1, 8, 4, 5)
+
+    attention = CoarseDirectionReducer(num_classes=1, fusion_type='attention_gating')
+    attention_out, attention_maps = attention(x, return_maps=True)
+    assert attention_out.shape == (2, 8, 4, 5)
+    assert set(attention_maps.keys()) == {'attention_map'}
+    assert attention_maps['attention_map'].shape == (2, 1, 8, 3, 1, 1)
+
+
 def test_reducer_outputs_canonical8_order_directly():
     x = torch.zeros((1, 24, 1, 1), dtype=torch.float32)
     for fine_idx in EXPECTED_GROUP_INDEX_MAP[0]:
@@ -118,7 +141,7 @@ def test_grouped_dconnnet_path_returns_canonical_8_direction_outputs(monkeypatch
     model = dconnnet_module.DconnNet(
         num_class=1,
         conn_num=8,
-        direction_grouping='coarse24to8',
+        direction_grouping='24to8',
         direction_fusion='weighted_sum',
     ).eval()
 
@@ -136,7 +159,7 @@ def test_grouped_dconnnet_path_rejects_non8_final_branch():
         dconnnet_module.DconnNet(
             num_class=1,
             conn_num=24,
-            direction_grouping='coarse24to8',
+            direction_grouping='24to8',
         )
     except ValueError as exc:
         assert 'requires conn_num=8' in str(exc)
