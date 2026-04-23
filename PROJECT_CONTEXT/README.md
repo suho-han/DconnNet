@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT README
 
-Last updated: 2026-04-19
+Last updated: 2026-04-23
 
 ## 목적
 
@@ -9,7 +9,7 @@ Last updated: 2026-04-19
 
 ## 현재까지 반영된 핵심 변경
 
-### 1) Direction Grouping (`coarse24to8`)
+### 1) Direction Grouping (`24to8`)
 
 - 24방향 proto 출력을 8방향 canonical 출력으로 축약하는 fork 경로 추가
 - 그룹 순서를 canonical-8 기준(`SE,S,SW,E,W,NE,N,NW`)으로 정렬
@@ -28,7 +28,7 @@ Last updated: 2026-04-19
 - dataset별 single/multi YAML 스펙 추가:
   - `scripts/configs/*.yaml`
 - 기존 `{dataset}_train.sh`, `{dataset}_multi_train.sh`는 deprecate wrapper로 유지
-- `coarse24to8` 시 `conn_num` 정책 강제:
+- `24to8` 시 `conn_num` 정책 강제:
   - single: `conn_num=8`만 허용
   - multi: conn sweep을 `[8]`로 정규화
 
@@ -47,6 +47,17 @@ Last updated: 2026-04-19
 
 - `octa500-3M`, `octa500-6M` 학습 경로 추가
 - `MyDataset_OCTA500` 데이터셋 로더 반영
+- `cremi` 학습 경로 추가:
+  - `data_loader/GetDataset_CREMI.py` (`getdataset_cremi`)
+  - `train.py --dataset cremi` 분기 연동
+  - offline distance-map 노트북: `notebooks/distance_map_cremi.ipynb`
+
+### 5) Dist Aux (`cl_dice`) 안정화
+
+- `dist_aux_loss=cl_dice` 경로를 모듈화(`src/losses/dist_aux.py`)하고 `connect_loss`는 호환 wrapper 유지
+- `cl_dice` 계산식은 upstream(`jocpae/clDice`) 형태로 정렬
+- 고해상도 OOM 방지를 위해 dist 경로에서 `cl_dice`는 vote supervision에 적용하고,
+  dense affinity/bicon 항은 `SmoothL1`로 안정화
 
 ## 참고 문서
 
