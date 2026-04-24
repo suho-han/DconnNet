@@ -117,10 +117,6 @@
 
 - Keep commits separated by baseline-touching changes and fork-specific feature changes whenever practical.
 
-## Telegram Alert
-
-- If every job(train/infernece) or session from Codex is done, send an alert using token and id in `.env`
-
 ## Things to avoid
 
 - Do not replace original baseline code with fork-specific experimental code unless explicitly requested.
