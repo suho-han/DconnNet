@@ -44,8 +44,6 @@ build_experiment_name() {
   local label_mode="$1"
   local conn_num="$2"
   local dist_aux_loss="$3"
-  local direction_grouping="$4"
-  local direction_fusion="$5"
   local base_name
 
   if [[ "${label_mode}" == "binary" ]]; then
@@ -54,51 +52,21 @@ build_experiment_name() {
     base_name="${label_mode}_${conn_num}_${dist_aux_loss}"
   fi
 
-  if [[ "${direction_grouping}" != "none" ]]; then
-    base_name="${base_name}_${direction_grouping}_${direction_fusion}"
-  fi
-
   printf '%s' "${base_name}"
-}
-
-strip_direction_suffix_from_experiment_name() {
-  local experiment_name="$1"
-  local base_name="${experiment_name}"
-  local direction_grouping="none"
-  local direction_fusion="weighted_sum"
-  local fusion grouping prefix
-
-  for fusion in attention_gating weighted_sum conv1x1 mean; do
-    if [[ "${base_name}" != *"_${fusion}" ]]; then
-      continue
-    fi
-    prefix="${base_name%_${fusion}}"
-    for grouping in 24to8; do
-      if [[ "${prefix}" == *"_${grouping}" ]]; then
-        direction_grouping="${grouping}"
-        direction_fusion="${fusion}"
-        base_name="${prefix%_${grouping}}"
-        printf '%s\t%s\t%s' "${base_name}" "${direction_grouping}" "${direction_fusion}"
-        return 0
-      fi
-    done
-  done
-
-  printf '%s\t%s\t%s' "${base_name}" "${direction_grouping}" "${direction_fusion}"
 }
 
 parse_experiment_name_fields() {
   local experiment_name="$1"
-  local base_name direction_grouping direction_fusion
+  local base_name
   local label_mode conn_num dist_aux_loss
 
-  IFS=$'\t' read -r base_name direction_grouping direction_fusion <<< "$(strip_direction_suffix_from_experiment_name "${experiment_name}")"
+  base_name="${experiment_name}"
 
   if [[ "${base_name}" =~ ^binary_([0-9]+)_bce$ ]]; then
     label_mode="binary"
     conn_num="${BASH_REMATCH[1]}"
     dist_aux_loss="smooth_l1"
-    printf '%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}" "${direction_grouping}" "${direction_fusion}"
+    printf '%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}"
     return 0
   fi
 
@@ -106,7 +74,7 @@ parse_experiment_name_fields() {
     label_mode="${BASH_REMATCH[1]}"
     conn_num="${BASH_REMATCH[2]}"
     dist_aux_loss="${BASH_REMATCH[3]}"
-    printf '%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}" "${direction_grouping}" "${direction_fusion}"
+    printf '%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}"
     return 0
   fi
 
@@ -454,43 +422,26 @@ except Exception as exc:
 
 try:
     config = launcher.load_config(config_path)
-    datasets, direction_fusions = launcher.validate_config_shape(config)
+    datasets = launcher.validate_config_shape(config)
     mode = config["mode"]
     device = int(config.get("device", 0))
-    direction_grouping = str(config.get("direction_grouping", "none"))
-    default_fusion = str(config.get("direction_fusion", "weighted_sum"))
 
     runs = []
     if mode == "single":
         config["dataset"] = datasets[0]
-        for fusion in direction_fusions:
-            fusion_config = dict(config)
-            fusion_config["direction_fusion"] = fusion
-            fusion_runs = launcher.build_single_schedule(fusion_config, device)
-            for run in fusion_runs:
-                run["direction_fusion"] = fusion
-            runs.extend(fusion_runs)
+        runs = launcher.build_single_schedule(config, device)
     else:
-        for fusion in direction_fusions:
-            fusion_config = dict(config)
-            fusion_config["direction_fusion"] = fusion
-            fusion_runs = launcher.build_multi_schedule(fusion_config, device, datasets)
-            for run in fusion_runs:
-                run["direction_fusion"] = fusion
-            runs.extend(fusion_runs)
+        runs = launcher.build_multi_schedule(config, device, datasets)
 
     for run in runs:
         dataset = str(run["preset"]["dataset"])
         conn_num = int(run["conn_num"])
         label_mode = str(run["label_mode"])
         dist_aux_loss = str(run["dist_aux_loss"])
-        direction_fusion = str(run.get("direction_fusion", default_fusion))
         experiment_name = launcher.build_experiment_output_name(
             conn_num=conn_num,
             label_mode=label_mode,
             dist_aux_loss=dist_aux_loss,
-            direction_grouping=direction_grouping,
-            direction_fusion=direction_fusion,
         )
         output_dir = str(run.get("output_dir", config.get("output_dir", "output")))
         target_fold = run.get("target_fold")
@@ -548,7 +499,7 @@ is_experiment_completed() {
   local dataset="$2"
   local experiment_name="$3"
   local output_dir_norm output_base
-  local candidate_dir legacy_experiment_name
+  local candidate_dir
   local -A seen_dirs=()
 
   output_dir_norm="$(normalize_output_dir "${output_dir_raw}")"
@@ -569,29 +520,13 @@ is_experiment_completed() {
     fi
   done < <(build_experiment_candidate_dirs "${output_base}" "${dataset}" "${experiment_name}")
 
-  if [[ "${experiment_name}" == *"_24to8_"* ]]; then
-    legacy_experiment_name="${experiment_name/_24to8_/_coarse24to8_}"
-    if [[ "${legacy_experiment_name}" != "${experiment_name}" ]]; then
-      while IFS= read -r candidate_dir; do
-        [[ -n "${candidate_dir}" ]] || continue
-        if [[ -n "${seen_dirs["${candidate_dir}"]+x}" ]]; then
-          continue
-        fi
-        seen_dirs["${candidate_dir}"]=1
-        if has_final_results_in_dir "${candidate_dir}"; then
-          return 0
-        fi
-      done < <(build_experiment_candidate_dirs "${output_base}" "${dataset}" "${legacy_experiment_name}")
-    fi
-  fi
-
   return 1
 }
 
 print_schedule_status_for_config() {
   local resolved_config_path="$1"
   local schedule_rows total_experiments running_experiments completed_experiments remaining_experiments
-  local schedule_key legacy_schedule_key remaining_row
+  local schedule_key remaining_row
   local sched_dataset sched_experiment sched_output_dir sched_target_fold
   local -a remaining_rows=()
 
@@ -610,9 +545,7 @@ print_schedule_status_for_config() {
 
     total_experiments=$((total_experiments + 1))
     schedule_key="${sched_dataset}|${sched_experiment}|${sched_target_fold}"
-    legacy_schedule_key="${sched_dataset}|${sched_experiment/_24to8_/_coarse24to8_}|${sched_target_fold}"
-
-    if [[ -n "${running_schedule_keys["${schedule_key}"]+x}" ]] || [[ -n "${running_schedule_keys["${legacy_schedule_key}"]+x}" ]]; then
+    if [[ -n "${running_schedule_keys["${schedule_key}"]+x}" ]]; then
       running_experiments=$((running_experiments + 1))
       continue
     fi
@@ -737,8 +670,6 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
   conn_num="$(extract_flag "conn_num" "8" "${argv[@]}")"
   label_mode="$(extract_flag "label_mode" "binary" "${argv[@]}")"
   dist_aux_loss="$(extract_flag "dist_aux_loss" "smooth_l1" "${argv[@]}")"
-  direction_grouping="$(extract_flag "direction_grouping" "none" "${argv[@]}")"
-  direction_fusion="$(extract_flag "direction_fusion" "weighted_sum" "${argv[@]}")"
   target_fold="$(extract_flag "target_fold" "" "${argv[@]}")"
   epochs="$(extract_flag "epochs" "45" "${argv[@]}")"
   output_dir_raw="$(extract_flag "output_dir" "output/" "${argv[@]}")"
@@ -751,13 +682,13 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
   else
     output_base="${REPO_ROOT}/${output_dir_norm}"
   fi
-  experiment_name="$(build_experiment_name "${label_mode}" "${conn_num}" "${dist_aux_loss}" "${direction_grouping}" "${direction_fusion}")"
+  experiment_name="$(build_experiment_name "${label_mode}" "${conn_num}" "${dist_aux_loss}")"
   results_csv="$(resolve_results_csv_path "${output_base}" "${dataset}" "${experiment_name}")"
 
   if [[ -r "${results_csv}" ]]; then
     experiment_name_from_path="$(basename -- "$(dirname -- "${results_csv}")")"
     if parsed_experiment_fields="$(parse_experiment_name_fields "${experiment_name_from_path}")"; then
-      IFS=$'\t' read -r label_mode conn_num dist_aux_loss direction_grouping direction_fusion <<< "${parsed_experiment_fields}"
+      IFS=$'\t' read -r label_mode conn_num dist_aux_loss <<< "${parsed_experiment_fields}"
       experiment_name="${experiment_name_from_path}"
     fi
   fi
@@ -769,15 +700,13 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
     device="${gpu_index}"
   fi
 
-  printf -v row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf -v row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${pid}" \
     "${gpu_index}" \
     "${dataset}" \
     "${conn_num}" \
     "${label_mode}" \
     "${dist_aux_loss}" \
-    "${direction_grouping}" \
-    "${direction_fusion}" \
     "${device}" \
     "${gpu_mem_mb}" \
     "${epoch_progress}" \
@@ -787,9 +716,6 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
   rows+=("${row}")
   if ((is_train_process == 1)); then
     running_schedule_keys["${dataset}|${experiment_name}|${target_fold}"]=1
-    if [[ "${experiment_name}" == *"_coarse24to8_"* ]]; then
-      running_schedule_keys["${dataset}|${experiment_name/_coarse24to8_/_24to8_}|${target_fold}"]=1
-    fi
 
     while IFS= read -r inferred_config_path; do
       [[ -n "${inferred_config_path}" ]] || continue
@@ -821,7 +747,7 @@ if ((${#rows[@]} == 0)); then
 else
   echo
   {
-    printf 'PID\tGPU\tDATASET\tCONN_NUM\tLABEL_MODE\tDIST_AUX_LOSS\tDIRECTION_GROUPING\tDIRECTION_FUSION\tDEVICE\tGPU_MEM_MB\tEPOCH_PROGRESS\tETA_DURATION\tETA_FINISH\tETA_STATUS\n'
+    printf 'PID\tGPU\tDATASET\tCONN_NUM\tLABEL_MODE\tDIST_AUX_LOSS\tDEVICE\tGPU_MEM_MB\tEPOCH_PROGRESS\tETA_DURATION\tETA_FINISH\tETA_STATUS\n'
     printf '%s\n' "${rows[@]}"
   } | {
     if command -v column >/dev/null 2>&1; then

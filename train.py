@@ -29,9 +29,6 @@ def get_experiment_output_name(args):
     else:
         base_name = f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
 
-    if getattr(args, 'direction_grouping', 'none') != 'none':
-        base_name = f"{base_name}_{args.direction_grouping}_{args.direction_fusion}"
-
     return base_name
 
 
@@ -138,12 +135,6 @@ def parse_args():
                         help='1-based fold index to run; default runs all folds')
     parser.add_argument('--conn_num', type=int, default=8, choices=[8, 24],
                         help='the number of connections for DconnNet (supported: 8, 24)')
-    parser.add_argument('--direction_grouping', type=str, default='none',
-                        choices=['none', '24to8'],
-                        help='optional fork-specific directional grouping path; 24to8 compresses 24 proto-directions into the canonical 8-direction output layout')
-    parser.add_argument('--direction_fusion', type=str, default=None,
-                        choices=['mean', 'weighted_sum', 'conv1x1', 'attention_gating'],
-                        help='fusion block used when --direction_grouping=24to8')
     parser.add_argument('--tau', type=float, default=3.0,
                         help='the temperature parameter tau for the distance connectivity loss')
     parser.add_argument('--sigma', type=float, default=2.0,
@@ -208,8 +199,6 @@ def parse_args():
         if args.target_fold < 1 or args.target_fold > args.folds:
             parser.error('--target_fold must be within [1, --folds]')
 
-    if args.direction_grouping == '24to8' and args.conn_num != 8:
-        parser.error('--direction_grouping=24to8 requires --conn_num=8 because the grouped path feeds the canonical 8-direction branch')
     if args.early_stopping_patience < 0:
         parser.error('--early_stopping_patience must be >= 0')
     if args.early_stopping_min_delta < 0:
@@ -259,9 +248,9 @@ def main(args):
     test_loader = None
 
     if args.dataset == 'isic':
-        trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='train', with_name=False)
-        validset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='validation', with_name=False)
-        testset = ISIC2018_dataset(dataset_folder=args.data_root, folder=0, train_type='test', with_name=False)
+        trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='train', with_name=False)
+        validset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='validation', with_name=False)
+        testset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='test', with_name=False)
 
     elif 'retouch' in args.dataset:
         if len(exp_indices) != 1:
@@ -353,8 +342,6 @@ def main(args):
     model = DconnNet(
         num_class=args.num_class,
         conn_num=args.conn_num,
-        direction_grouping=args.direction_grouping,
-        direction_fusion=args.direction_fusion,
     ).cuda()
 
     if args.pretrained:

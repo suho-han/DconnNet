@@ -1,12 +1,10 @@
 dataset: cremi
 mode: multi
 device: 0
-direction_grouping: none
-batch-size: 8
-# direction_fusion: weighted_sum
+batch_size: 8
 # dist_sf_l1_gamma: 1.0
 multi:
-  conn_num: [ 8, 24 ]
-  label_mode: [ binary, dist, dist_inverted ]
-  dist_aux_loss: [ smooth_l1, cl_dice ]
+  conn_nums: [ 8, 24 ]
+  label_modes: [ binary, dist, dist_inverted ]
+  dist_aux_losses: [ smooth_l1, cl_dice ]
   folds: 1

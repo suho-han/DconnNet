@@ -1,8 +1,6 @@
 dataset: [ octa500 ]
 mode: multi
 device: 1
-direction_grouping: 24to8
-direction_fusion: [ "mean", "conv1x1", "attention_gating" ]
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500

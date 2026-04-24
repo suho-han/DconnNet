@@ -18,31 +18,19 @@ from torchvision import models
 
 import model.gap as gap
 from model.attention import CAM_Module, PAM_Module
-from model.coarse_direction_grouping import FUSION_TYPES, CoarseDirectionReducer
 from model.resnet import resnet34
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
 
 class DconnNet(nn.Module):
-    def __init__(self, num_class=1, conn_num=8, direction_grouping='none', direction_fusion='none'):
+    def __init__(self, num_class=1, conn_num=8):
         super(DconnNet, self).__init__()
-
-        if direction_grouping not in ('none', '24to8'):
-            raise ValueError("direction_grouping must be either 'none' or '24to8'")
-        if direction_grouping == '24to8' and conn_num != 8:
-            raise ValueError("direction_grouping='24to8' requires conn_num=8 for the final branch layout")
-        if direction_fusion != 'none' and direction_fusion not in FUSION_TYPES:
-            raise ValueError(f"Unsupported direction_fusion {direction_fusion}, expected one of {FUSION_TYPES}")
 
         self.num_class = num_class
         self.conn_num = conn_num
-        self.direction_grouping = direction_grouping
-        self.direction_fusion = direction_fusion
-        self.proto_conn_num = 24 if direction_grouping == '24to8' else conn_num
 
         out_planes = num_class * conn_num
-        proto_out_planes = num_class * self.proto_conn_num
         self.backbone = resnet34(pretrained=True)
         self.sde_module = SDE_module(512, 512, out_planes, conn_num)
         self.fb5 = FeatureBlock(512, 256, relu=False, last=True)  # 256
@@ -64,20 +52,13 @@ class DconnNet(nn.Module):
                                        norm_fn=nn.BatchNorm2d, num_groups_gn=None)
 
         self.cls_pred_conv = nn.Conv2d(64, 32, 3, 1, 1)
-        self.cls_pred_conv_2 = nn.Conv2d(32, proto_out_planes, 1)
+        self.cls_pred_conv_2 = nn.Conv2d(32, out_planes, 1)
         self.upsample4x_op = nn.UpsamplingBilinear2d(scale_factor=2)
         self.channel_mapping = nn.Sequential(
-            nn.Conv2d(512, proto_out_planes, 3, 1, 1),
-            nn.BatchNorm2d(proto_out_planes),
+            nn.Conv2d(512, out_planes, 3, 1, 1),
+            nn.BatchNorm2d(out_planes),
             nn.ReLU(True)
         )
-
-        self.direction_reducer = None
-        if self.direction_grouping == '24to8':
-            self.direction_reducer = CoarseDirectionReducer(
-                num_classes=num_class,
-                fusion_type=direction_fusion,
-            )
 
         self.direc_reencode = nn.Sequential(
             nn.Conv2d(out_planes, out_planes, 1),
@@ -101,8 +82,6 @@ class DconnNet(nn.Module):
         directional_c5 = self.channel_mapping(c5)
         mapped_c5 = F.interpolate(
             directional_c5, scale_factor=32, mode='bilinear', align_corners=True)
-        if self.direction_reducer is not None:
-            mapped_c5 = self.direction_reducer(mapped_c5)
         mapped_c5 = self.direc_reencode(mapped_c5)
 
         d_prior = self.gap(mapped_c5)
@@ -130,8 +109,6 @@ class DconnNet(nn.Module):
         final_feat = self.final_decoder(feat_list)
 
         cls_pred = self.cls_pred_conv_2(final_feat)
-        if self.direction_reducer is not None:
-            cls_pred = self.direction_reducer(cls_pred)
         cls_pred = self.upsample4x_op(cls_pred)
 
         return cls_pred, mapped_c5

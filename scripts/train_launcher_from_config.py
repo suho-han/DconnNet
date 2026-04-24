@@ -34,8 +34,6 @@ ALLOWED_DATASETS = {
     "retouch-Topcon",
 }
 ALLOWED_MODES = {"single", "multi"}
-ALLOWED_DIRECTION_GROUPING = {"none", "24to8"}
-ALLOWED_DIRECTION_FUSION = {"mean", "weighted_sum", "conv1x1", "attention_gating"}
 ALLOWED_OCTA_VARIANTS = {"3M", "6M"}
 ALLOWED_RETOUCH_DEVICES = {"Cirrus", "Spectrailis", "Topcon"}
 ALLOWED_MONITOR_METRICS = {"val_dice", "val_loss"}
@@ -125,6 +123,13 @@ def as_list(value: Any, default: list[Any]) -> list[Any]:
     if isinstance(value, list):
         return list(value)
     return [value]
+
+
+def get_with_alias(cfg: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
+    for key in keys:
+        if key in cfg and cfg[key] is not None:
+            return cfg[key]
+    return default
 
 
 def normalize_datasets_for_mode(dataset_value: Any, mode: str) -> list[str]:
@@ -282,15 +287,11 @@ def build_experiment_output_name(
     conn_num: int,
     label_mode: str,
     dist_aux_loss: str,
-    direction_grouping: str,
-    direction_fusion: str,
 ) -> str:
     if label_mode == "binary":
         base_name = f"binary_{conn_num}_bce"
     else:
         base_name = f"{label_mode}_{conn_num}_{dist_aux_loss}"
-    if direction_grouping != "none":
-        base_name = f"{base_name}_{direction_grouping}_{direction_fusion}"
     return base_name
 
 
@@ -301,15 +302,11 @@ def resolve_pretrained_path(
     conn_num: int,
     label_mode: str,
     dist_aux_loss: str,
-    direction_grouping: str,
-    direction_fusion: str,
 ) -> str:
     exp_name = build_experiment_output_name(
         conn_num=conn_num,
         label_mode=label_mode,
         dist_aux_loss=dist_aux_loss,
-        direction_grouping=direction_grouping,
-        direction_fusion=direction_fusion,
     )
     models_dir = Path(output_dir) / dataset / exp_name / "models"
 
@@ -320,15 +317,12 @@ def resolve_pretrained_path(
                 conn_num=conn_num,
                 label_mode=label_mode,
                 dist_aux_loss=dist_aux_loss,
-                direction_grouping=direction_grouping,
-                direction_fusion=direction_fusion,
                 experiment_name=exp_name,
             )
         except KeyError as exc:
             raise ValueError(
                 f"Unsupported pretrained format key: {exc} "
-                "(supported: dataset, conn_num, label_mode, dist_aux_loss, "
-                "direction_grouping, direction_fusion, experiment_name)"
+                "(supported: dataset, conn_num, label_mode, dist_aux_loss, experiment_name)"
             ) from exc
         resolved_path = Path(resolved)
         if resolved_path.is_absolute():
@@ -352,8 +346,6 @@ def build_train_cmd(
     label_mode: str,
     dist_aux_loss: str,
     dist_sf_l1_gamma: float,
-    direction_grouping: str,
-    direction_fusion: str,
     device: int,
     epochs: int,
     folds: int,
@@ -394,10 +386,6 @@ def build_train_cmd(
         str(dist_aux_loss),
         "--dist_sf_l1_gamma",
         str(dist_sf_l1_gamma),
-        "--direction_grouping",
-        str(direction_grouping),
-        "--direction_fusion",
-        str(direction_fusion),
         "--device",
         str(device),
     ]
@@ -486,17 +474,6 @@ def send_telegram_alert(
     )
 
 
-def normalize_direction_conn_policy(direction_grouping: str, conn_values: list[int]) -> list[int]:
-    if direction_grouping != "24to8":
-        return conn_values
-    if conn_values != [8]:
-        print(
-            "[INFO] 24to8 requires canonical 8-direction branch; forcing conn sweep to [8]",
-            file=sys.stderr,
-        )
-    return [8]
-
-
 def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str, Any]]:
     dataset = config["dataset"]
     single_cfg = config.get("single") or {}
@@ -514,11 +491,12 @@ def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str,
     if pretrained_spec is not None and not isinstance(pretrained_spec, str):
         raise ValueError("pretrained must be a string path")
 
-    batch_size = single_cfg.get("batch_size", config.get("batch_size"))
+    batch_size = get_with_alias(
+        single_cfg,
+        ("batch_size", "batch-size"),
+        get_with_alias(config, ("batch_size", "batch-size")),
+    )
 
-    direction_grouping = config.get("direction_grouping", "none")
-    if direction_grouping == "24to8" and conn_num == 24:
-        raise ValueError("single + 24to8 requires conn_num=8")
     if (dataset == "retouch" or dataset.startswith("retouch-")) and conn_num != 8:
         raise ValueError("retouch single mode currently supports conn_num=8 only")
 
@@ -586,8 +564,6 @@ def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str,
                             conn_num=conn_num,
                             label_mode=label_mode,
                             dist_aux_loss=dist_aux_loss,
-                            direction_grouping=direction_grouping,
-                            direction_fusion=str(config.get("direction_fusion", "weighted_sum")),
                         ) if test_only else None,
                     }
                 )
@@ -615,8 +591,6 @@ def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str,
                 conn_num=conn_num,
                 label_mode=label_mode,
                 dist_aux_loss=dist_aux_loss,
-                direction_grouping=direction_grouping,
-                direction_fusion=str(config.get("direction_fusion", "weighted_sum")),
             ) if test_only else None,
         }
     ]
@@ -636,15 +610,17 @@ def build_multi_schedule(config: dict[str, Any], device: int, datasets: list[str
     if pretrained_spec is not None and not isinstance(pretrained_spec, str):
         raise ValueError("pretrained must be a string path")
 
-    batch_size = multi_cfg.get("batch_size", config.get("batch_size"))
+    batch_size = get_with_alias(
+        multi_cfg,
+        ("batch_size", "batch-size"),
+        get_with_alias(config, ("batch_size", "batch-size")),
+    )
 
-    conn_values = [int(v) for v in as_list(multi_cfg.get("conn_nums"), [8, 24])]
-    direction_grouping = config.get("direction_grouping", "none")
-    conn_values = normalize_direction_conn_policy(direction_grouping, conn_values)
+    conn_values = [int(v) for v in as_list(get_with_alias(multi_cfg, ("conn_nums", "conn_num")), [8, 24])]
 
-    label_modes = [str(v) for v in as_list(multi_cfg.get("label_modes"), ["binary", "dist", "dist_inverted"])]
-    dist_aux_values = [str(v) for v in as_list(multi_cfg.get("dist_aux_losses"), ["gjml_sf_l1", "smooth_l1"])]
-    binary_dist_aux = str(multi_cfg.get("binary_dist_aux_loss", "smooth_l1"))
+    label_modes = [str(v) for v in as_list(get_with_alias(multi_cfg, ("label_modes", "label_mode")), ["binary", "dist", "dist_inverted"])]
+    dist_aux_values = [str(v) for v in as_list(get_with_alias(multi_cfg, ("dist_aux_losses", "dist_aux_loss")), ["gjml_sf_l1", "smooth_l1"])]
+    binary_dist_aux = str(get_with_alias(multi_cfg, ("binary_dist_aux_loss",), "smooth_l1"))
 
     runs: list[dict[str, Any]] = []
     for dataset in datasets:
@@ -721,30 +697,21 @@ def build_multi_schedule(config: dict[str, Any], device: int, datasets: list[str
                                             conn_num=conn_num,
                                             label_mode=label_mode,
                                             dist_aux_loss=dist_aux_loss,
-                                            direction_grouping=direction_grouping,
-                                            direction_fusion=str(config.get("direction_fusion", "weighted_sum")),
                                         ) if test_only else None,
                                     }
                                 )
     return runs
 
 
-def normalize_direction_fusions(direction_fusion_value: Any) -> list[str]:
-    direction_fusions = [str(v) for v in as_list(direction_fusion_value, ["weighted_sum"])]
-    if not direction_fusions:
-        raise ValueError("direction_fusion must include at least one fusion mode")
-    unsupported_fusions = sorted(
-        {fusion for fusion in direction_fusions if fusion not in ALLOWED_DIRECTION_FUSION}
-    )
-    if unsupported_fusions:
+def validate_config_shape(config: dict[str, Any]) -> list[str]:
+    removed_keys = [key for key in ("direction_grouping", "direction_fusion") if key in config]
+    if removed_keys:
         raise ValueError(
-            f"Unsupported direction_fusion: {unsupported_fusions} "
-            f"(supported: {sorted(ALLOWED_DIRECTION_FUSION)})"
+            "Unsupported config key(s): "
+            + ", ".join(sorted(removed_keys))
+            + ". Direction-grouping options were removed from this fork."
         )
-    return direction_fusions
 
-
-def validate_config_shape(config: dict[str, Any]) -> tuple[list[str], list[str]]:
     dataset_value = config.get("dataset")
     mode = config.get("mode")
 
@@ -759,16 +726,7 @@ def validate_config_shape(config: dict[str, Any]) -> tuple[list[str], list[str]]
             f"(supported: {sorted(ALLOWED_DATASETS)})"
         )
 
-    direction_grouping = config.get("direction_grouping", "none")
-    direction_fusion = config.get("direction_fusion", "weighted_sum")
-
-    if direction_grouping not in ALLOWED_DIRECTION_GROUPING:
-        raise ValueError(
-            f"Unsupported direction_grouping: {direction_grouping} "
-            f"(supported: {sorted(ALLOWED_DIRECTION_GROUPING)})"
-        )
-    direction_fusions = normalize_direction_fusions(direction_fusion)
-    return datasets, direction_fusions
+    return datasets
 
 
 def main() -> int:
@@ -785,7 +743,7 @@ def main() -> int:
 
     try:
         config = load_config(config_path)
-        datasets, direction_fusions = validate_config_shape(config)
+        datasets = validate_config_shape(config)
 
         if args.device is not None:
             config["device"] = int(args.device)
@@ -798,8 +756,6 @@ def main() -> int:
 
         mode = config["mode"]
         device = int(config.get("device", 0))
-        direction_grouping = str(config.get("direction_grouping", "none"))
-        direction_fusion = str(config.get("direction_fusion", "weighted_sum"))
         dist_sf_l1_gamma = float(config.get("dist_sf_l1_gamma", 1.0))
 
         if "isic2018" in datasets:
@@ -808,21 +764,9 @@ def main() -> int:
         runs: list[dict[str, Any]] = []
         if mode == "single":
             config["dataset"] = datasets[0]
-            for fusion in direction_fusions:
-                fusion_config = dict(config)
-                fusion_config["direction_fusion"] = fusion
-                fusion_runs = build_single_schedule(fusion_config, device)
-                for run in fusion_runs:
-                    run["direction_fusion"] = fusion
-                runs.extend(fusion_runs)
+            runs = build_single_schedule(config, device)
         else:
-            for fusion in direction_fusions:
-                fusion_config = dict(config)
-                fusion_config["direction_fusion"] = fusion
-                fusion_runs = build_multi_schedule(fusion_config, device, datasets)
-                for run in fusion_runs:
-                    run["direction_fusion"] = fusion
-                runs.extend(fusion_runs)
+            runs = build_multi_schedule(config, device, datasets)
 
         pybin = sys.executable
         for run in runs:
@@ -837,8 +781,6 @@ def main() -> int:
                 label_mode=run["label_mode"],
                 dist_aux_loss=run["dist_aux_loss"],
                 dist_sf_l1_gamma=dist_sf_l1_gamma,
-                direction_grouping=direction_grouping,
-                direction_fusion=str(run.get("direction_fusion", direction_fusion)),
                 device=run["device"],
                 epochs=run["epochs"],
                 folds=run["folds"],

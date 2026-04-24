@@ -1,8 +1,6 @@
 dataset: [ chase, drive ]
 mode: multi
 device: 3
-# direction_grouping: 24to8
-# direction_fusion: [ "mean", "conv1x1", "attention_gating" ]
 dist_sf_l1_gamma: 1.0
 batch-size: 4
 multi:

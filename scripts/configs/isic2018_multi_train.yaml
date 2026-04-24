@@ -1,8 +1,6 @@
 dataset: isic2018
 mode: multi
 device: 0
-direction_grouping: none
-direction_fusion: weighted_sum
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500
