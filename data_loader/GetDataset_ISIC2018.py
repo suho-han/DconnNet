@@ -59,7 +59,7 @@ def ISIC2018_transform_newdata(sample, train_type):
 
 class ISIC2018_dataset(Dataset):
     def __init__(self, dataset_folder='/ISIC2018_Task1_npy_all',
-                 folder='folder0', train_type='train', with_name=False, transform=ISIC2018_transform_newdata):
+                 folder='0', train_type='train', with_name=False, transform=ISIC2018_transform_newdata):
         folder = 'folder'+str(folder)
         self.transform = transform
         self.train_type = train_type
