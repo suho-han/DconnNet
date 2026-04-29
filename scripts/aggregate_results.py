@@ -17,6 +17,17 @@ matplotlib.use("Agg")
 
 
 LATEX_TABLE_ARRAYSTRETCH = "1.5"
+# NOTE: "decoder_guided" is a fork-specific fusion objective used in
+# experiment names like "..._decoder_guided_A...".
+KNOWN_CONN_FUSIONS = ("conv_residual", "scaled_sum", "gate", "decoder_guided")
+ALLOWED_LABEL_MODES = ("binary", "dist", "dist_inverted")
+CONN_FUSION_SORT_ORDER = {
+    "none": 0,
+    "conv_residual": 1,
+    "gate": 2,
+    "scaled_sum": 3,
+    "decoder_guided": 4,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="summary",
         help="Output file stem (without extension).",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Aggregate all counted datasets into combined outputs. "
+            "By default, combined outputs include only DRIVE, CHASE, and "
+            "OCTA-family datasets."
+        ),
     )
     parser.add_argument(
         "--sample-vis-count",
@@ -174,6 +194,95 @@ def _fmt_duration_csv(value: object) -> str:
 def _fmt_duration_latex(value: object) -> str:
     text = _fmt_duration_csv(value)
     return text if text else "N/A"
+
+
+def _normalize_dataset_name(dataset_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", dataset_name.lower())
+
+
+def _is_counted_dataset_name(dataset_name: object) -> bool:
+    return _normalize_dataset_name(str(dataset_name)) != "trash"
+
+
+def _dataset_summary_group(dataset_name: str) -> Tuple[int, str]:
+    normalized = _normalize_dataset_name(dataset_name)
+    if normalized == "cremi":
+        return 0, "CREMI"
+    if normalized == "drive":
+        return 1, "DRIVE"
+    if normalized in {"chase", "chasedb1"}:
+        return 2, "CHASE"
+    if normalized.startswith("isic"):
+        return 3, "ISIC"
+    if "octa" in normalized and any(tag in normalized for tag in ("3m", "6m")):
+        return 4, "OCTA3M&6M"
+    return 5, "Other datasets"
+
+
+def _dataset_group_sort_key(dataset_name: str) -> Tuple[int, str, List[object]]:
+    group_order, group_name = _dataset_summary_group(dataset_name)
+    return group_order, group_name, natural_sort_key(dataset_name)
+
+
+def _append_dataset_group_heading(lines: List[str], dataset_name: str) -> None:
+    _, group_name = _dataset_summary_group(dataset_name)
+    lines.append(rf"\section*{{{escape_latex_text(group_name)}}}")
+
+
+def _append_page_break(lines: List[str], has_previous_content: bool) -> bool:
+    if has_previous_content:
+        lines.append(r"\clearpage")
+    return True
+
+
+def is_octa_dataset_name(dataset_name: object) -> bool:
+    normalized = _normalize_dataset_name(str(dataset_name))
+    return "octa" in normalized and any(tag in normalized for tag in ("3m", "6m"))
+
+
+def should_include_dataset_in_default_aggregate(dataset_name: object) -> bool:
+    normalized = _normalize_dataset_name(str(dataset_name))
+    return (
+        normalized == "drive"
+        or normalized in {"chase", "chasedb1"}
+        or is_octa_dataset_name(dataset_name)
+    )
+
+
+def should_include_dataset_in_aggregate(dataset_name: object, include_all: bool) -> bool:
+    if not _is_counted_dataset_name(dataset_name):
+        return False
+    if include_all:
+        return True
+    return should_include_dataset_in_default_aggregate(dataset_name)
+
+
+def filter_rows_for_aggregate_scope(
+    rows: List[Dict[str, object]],
+    include_all: bool,
+) -> List[Dict[str, object]]:
+    return [
+        row for row in rows
+        if should_include_dataset_in_aggregate(row.get("dataset", "unknown"), include_all)
+    ]
+
+
+def _format_conn_table_label(conn_num: object, conn_layout: object = "default") -> str:
+    conn_text = str(conn_num)
+    if str(conn_layout) == "out8" and conn_text == "8":
+        return "8'"
+    return conn_text
+
+
+def _conn_layout_sort_key(conn_layout: object) -> Tuple[int, str]:
+    layout_text = str(conn_layout)
+    order = {
+        "default": 0,
+        "standard8": 0,
+        "full24": 0,
+        "out8": 1,
+    }.get(layout_text, 9)
+    return order, layout_text.lower()
 
 
 def parse_final_summary_csv(path: str) -> Optional[Dict[str, object]]:
@@ -487,10 +596,14 @@ def discover_nested_target_root_infos(
             continue
         seen_dirs.add(normalized_dir)
 
+        rel_path = os.path.relpath(current_dir, input_root)
+        rel_parts = [] if rel_path in {".", ""} else rel_path.split(os.sep)
+        if "_smoke" in rel_parts:
+            continue
+
         if depth > 0:
             available_folds = discover_available_folds(current_dir, input_name)
             if available_folds:
-                rel_parts = os.path.relpath(current_dir, input_root).split(os.sep)
                 scope_fold_count = None
                 for part in rel_parts:
                     scope_fold_count = parse_scope_fold_count(part)
@@ -736,6 +849,7 @@ def build_model_candidate(summary: Dict[str, object], fold_row: Dict[str, object
         "root_name": summary["root_name"],
         "experiment": exp_meta["experiment"],
         "conn_num": exp_meta["conn_num"],
+        "conn_layout": exp_meta["conn_layout"],
         "loss": exp_meta["loss"],
         "config_folds": config_folds,
         "fold": fold,
@@ -896,9 +1010,15 @@ def render_panel(
 
 def format_model_config_summary(model: Dict[str, object], multiline: bool = False) -> str:
     separator = "\n" if multiline else " | "
+    seg_aux_label = _format_segaux_column_value(
+        model.get("seg_aux_weight"),
+        model.get("seg_aux_variant", "none"),
+    )
     fields = [
         f"Exp={model['experiment']}",
-        f"Conn={model['conn_num']}",
+        f"Conn={_format_conn_table_label(model['conn_num'], model.get('conn_layout', 'default'))}",
+        f"Fusion={_format_fusion_table_label(model.get('conn_fusion', 'none'), model.get('fusion_loss_profile', 'A'), model.get('fusion_residual_scale'))}",
+        f"SegAux={seg_aux_label or 'none'}",
         f"Loss={model['loss']}",
     ]
     fields.append(f"Folds={model['config_folds']}")
@@ -1040,7 +1160,10 @@ def maybe_write_sample_visualization(
             render_row[f"model{idx}_name"] = str(model["root_name"])
             render_row[f"model{idx}_config"] = format_model_config_summary(model)
             render_row[f"model{idx}_experiment"] = str(model["experiment"])
-            render_row[f"model{idx}_conn_num"] = model["conn_num"]
+            render_row[f"model{idx}_conn_num"] = _format_conn_table_label(
+                model["conn_num"],
+                model.get("conn_layout", "default"),
+            )
             render_row[f"model{idx}_loss"] = str(model["loss"])
             render_row[f"model{idx}_folds"] = model["config_folds"]
             render_row[f"model{idx}_fold"] = int(model["fold"])
@@ -1219,9 +1342,9 @@ def _rank_row_indices(rows: List[Dict[str, object]], key: str, higher_is_better:
 
 
 def _fmt_latex_ranked_value(value: float, is_best: bool, is_second: bool) -> str:
+    if math.isnan(value):
+        return "-"
     text = _fmt_float(value)
-    if text == "nan":
-        return text
     if is_best:
         return rf"\textbf{{{text}}}"
     if is_second:
@@ -1293,6 +1416,42 @@ def extract_dataset_name(root: str, input_root: str) -> str:
 def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
     tokens = root_name.split("_")
     loss = "unknown"
+    conn_layout: object = "default"
+    seg_aux_weight: Optional[float] = None
+    seg_aux_variant = "none"
+
+    segaux_match = re.search(r"_segaux(?:_w([0-9]*\.?[0-9]+))?$", root_name)
+    if segaux_match is not None:
+        if segaux_match.group(1) is not None:
+            seg_aux_weight = float(segaux_match.group(1))
+            seg_aux_variant = f"w{segaux_match.group(1)}"
+        else:
+            seg_aux_weight = 0.3
+            seg_aux_variant = "segaux"
+
+    # Preferred fork naming convention:
+    #   <label_mode>[_<fusion_tag>]_ <conn_num> [_<conn_layout>] _<loss> [_suffix...]
+    # Example:
+    #   dist_inverted_decoder_guided_A_8_gjml_sf_l1
+    #   dist_inverted_decoder_guided_A_8_gjml_sf_l1_segaux
+    ordered_name_match = re.fullmatch(
+        r"(binary|dist|dist_inverted)(?:_(.+?))?_(\d+)(?:_(standard8|full24|out8))?_(bce|smooth_l1|cl_dice|gjml_sf_l1|gjml_sj_l1)(?:_.+)?",
+        root_name,
+    )
+    if ordered_name_match is not None:
+        ordered_label_mode = ordered_name_match.group(1)
+        ordered_body = ordered_name_match.group(2)
+        conn_num = int(ordered_name_match.group(3))
+        explicit_layout = ordered_name_match.group(4)
+        conn_layout = explicit_layout if explicit_layout is not None else "default"
+        loss = ordered_name_match.group(5)
+        if ordered_body:
+            experiment = f"{ordered_label_mode}_{ordered_body}"
+        else:
+            experiment = ordered_label_mode
+        tokens = experiment.split("_")
+    else:
+        experiment = root_name
 
     loss_suffixes = [
         (["gjml", "sf", "l1"], "gjml_sf_l1"),
@@ -1307,36 +1466,218 @@ def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
             loss = loss_name
             break
 
-    conn_num: object = "NA"
-    if tokens and tokens[-1].isdigit():
-        conn_num = int(tokens[-1])
-        tokens = tokens[:-1]
+    conn_num: object = "NA" if ordered_name_match is None else int(ordered_name_match.group(3))
+    if tokens:
+        if len(tokens) >= 2 and tokens[-2].isdigit() and tokens[-1] in {"standard8", "full24", "out8"}:
+            conn_num = int(tokens[-2])
+            conn_layout = tokens[-1]
+            tokens = tokens[:-2]
+        elif tokens[-1].isdigit():
+            conn_num = int(tokens[-1])
+            tokens = tokens[:-1]
 
-    experiment = "_".join(tokens) if tokens else root_name
+    if ordered_name_match is None:
+        experiment = "_".join(tokens) if tokens else root_name
     if loss == "unknown":
         loss = infer_loss_tag_from_legacy_name(root_name)
     if experiment == "binary":
         loss = "bce"
 
+    conn_fusion = "none"
+    fusion_loss_profile = "A"
+    fusion_residual_scale: Optional[float] = None
+    decoder_fusion = "none"
+    label_mode = infer_label_mode_from_experiment(experiment)
+    experiment_prefixes = ALLOWED_LABEL_MODES
+    for prefix in experiment_prefixes:
+        prefix_token = f"{prefix}_"
+        if not experiment.startswith(prefix_token):
+            continue
+        experiment_body = experiment[len(prefix_token):]
+        for fusion_name in KNOWN_CONN_FUSIONS:
+            fusion_token = f"{fusion_name}_"
+            if not experiment_body.startswith(fusion_token):
+                continue
+            fusion_tail = experiment_body[len(fusion_token):]
+            # Historically we used strict regex matching here, but experiment
+            # names sometimes carry extra suffixes. We only need the initial
+            # profile token (A/B/C) and an optional decoder fusion name.
+            parts = [p for p in fusion_tail.split("_") if p]
+            if not parts or parts[0] not in {"A", "B", "C"}:
+                continue
+
+            conn_fusion = fusion_name
+            fusion_loss_profile = parts[0]
+            next_idx = 1
+            if len(parts) >= 2:
+                rs_match = re.fullmatch(r"rs([0-9]*\.?[0-9]+)", parts[1])
+                if rs_match is not None:
+                    fusion_residual_scale = float(rs_match.group(1))
+                    next_idx = 2
+            if len(parts) >= (next_idx + 2) and parts[next_idx] == "dec":
+                decoder_fusion = "_".join(parts[next_idx + 1:])
+            break
+        if conn_fusion != "none":
+            break
+
     return {
         "experiment": experiment,
+        "label_mode": label_mode,
         "conn_num": conn_num,
+        "conn_layout": conn_layout,
         "loss": loss,
+        "conn_fusion": conn_fusion,
+        "fusion_loss_profile": fusion_loss_profile,
+        "fusion_residual_scale": fusion_residual_scale,
+        "decoder_fusion": decoder_fusion,
+        "seg_aux_weight": seg_aux_weight,
+        "seg_aux_variant": seg_aux_variant,
     }
 
 
-def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
-    experiment = str(row["experiment"])
-    exp_order = {
-        "binary": 0,
-        "dist": 1,
-        "dist_inverted": 2,
-    }.get(experiment, 9)
+def infer_label_mode_from_experiment(experiment_name: object) -> str:
+    experiment = str(experiment_name)
+    if experiment == "binary" or experiment.startswith("binary_"):
+        return "binary"
+    if experiment == "dist_inverted" or experiment.startswith("dist_inverted_"):
+        return "dist_inverted"
+    if experiment == "dist" or experiment.startswith("dist_"):
+        return "dist"
+    return "unknown"
 
-    conn_raw = row.get("conn_num", "NA")
-    conn_sort = int(conn_raw) if isinstance(conn_raw, int) else 10 ** 9
 
-    loss = str(row.get("loss", "Unknown"))
+def _format_fusion_table_label(
+    conn_fusion: object, fusion_loss_profile: object, fusion_residual_scale: object = None
+) -> str:
+    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    if conn_fusion_name == "none":
+        return "none"
+    profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
+    if conn_fusion_name == "scaled_sum" and fusion_residual_scale is not None:
+        try:
+            return f"{conn_fusion_name}/{profile_name}/rs{float(fusion_residual_scale):g}"
+        except (TypeError, ValueError):
+            pass
+    return f"{conn_fusion_name}/{profile_name}"
+
+
+def _format_seg_aux_table_label(seg_aux_weight: object) -> Optional[str]:
+    if seg_aux_weight is None:
+        return None
+    if isinstance(seg_aux_weight, (int, float)):
+        return f"{float(seg_aux_weight):g}"
+    text = str(seg_aux_weight).strip()
+    return text if text else None
+
+
+def _format_segaux_column_value(seg_aux_weight: object, seg_aux_variant: object) -> Optional[str]:
+    seg_aux_label = _format_seg_aux_table_label(seg_aux_weight)
+    if seg_aux_label is None:
+        return None
+    seg_aux_variant_name = str(seg_aux_variant if seg_aux_variant is not None else "none")
+    if seg_aux_variant_name == "segaux":
+        return "segaux"
+    if seg_aux_variant_name.startswith("w"):
+        return seg_aux_variant_name
+    return seg_aux_label
+
+
+def _table_fusion_and_decoder_labels(
+    conn_fusion: object,
+    fusion_loss_profile: object,
+    fusion_residual_scale: object,
+    seg_aux_weight: object = None,
+    seg_aux_variant: object = "none",
+) -> Tuple[str, str]:
+    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
+    seg_aux_label = _format_segaux_column_value(seg_aux_weight, seg_aux_variant)
+
+    if seg_aux_label is not None:
+        return _format_fusion_table_label(conn_fusion_name, profile_name, fusion_residual_scale), seg_aux_label
+
+    return (
+        _format_fusion_table_label(conn_fusion_name, profile_name, fusion_residual_scale),
+        "none",
+    )
+
+
+def _latex_summary_fusion_and_decoder_labels(
+    conn_fusion: object,
+    fusion_loss_profile: object,
+    fusion_residual_scale: object,
+    seg_aux_weight: object = None,
+    seg_aux_variant: object = "none",
+) -> Tuple[str, str]:
+    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
+
+    if conn_fusion_name == "scaled_sum" and profile_name == "A":
+        seg_aux_label = _format_segaux_column_value(seg_aux_weight, seg_aux_variant)
+        dec_label = "none"
+        if seg_aux_label is not None:
+            dec_label = seg_aux_label
+        if fusion_residual_scale is not None:
+            try:
+                return f"scaled_sum/rs{float(fusion_residual_scale):g}", dec_label
+            except (TypeError, ValueError):
+                pass
+        return "scaled_sum", dec_label
+
+    fusion_label, decoder_label = _table_fusion_and_decoder_labels(
+        conn_fusion,
+        fusion_loss_profile,
+        fusion_residual_scale,
+        seg_aux_weight,
+        seg_aux_variant,
+    )
+    if conn_fusion_name == "decoder_guided" and profile_name == "A":
+        return "decoder_guided", decoder_label
+    return fusion_label, decoder_label
+
+
+def _latex_ablation_fusion_spec(
+    conn_fusion: object,
+    fusion_loss_profile: object,
+    fusion_residual_scale: object = None,
+) -> str:
+    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
+    if conn_fusion_name == "decoder_guided" and profile_name == "A":
+        return ""
+    if conn_fusion_name == "scaled_sum" and profile_name == "A":
+        if fusion_residual_scale is not None:
+            try:
+                return f"rs{float(fusion_residual_scale):g}"
+            except (TypeError, ValueError):
+                return ""
+        return ""
+    if conn_fusion_name == "scaled_sum" and fusion_residual_scale is not None:
+        try:
+            return f"{profile_name}/rs{float(fusion_residual_scale):g}"
+        except (TypeError, ValueError):
+            pass
+    return profile_name
+
+
+def _fusion_profile_sort_value(profile_name: object) -> int:
+    profile = str(profile_name)
+    if profile == "A":
+        return 0
+    if profile == "B":
+        return 1
+    if profile == "C":
+        return 2
+    return 9
+
+
+def _conn_fusion_sort_value(conn_fusion_name: object) -> int:
+    conn_fusion = str(conn_fusion_name)
+    return CONN_FUSION_SORT_ORDER.get(conn_fusion, 9)
+
+
+def _loss_sort_key(loss_name: object) -> Tuple[int, str]:
+    loss = str(loss_name if loss_name is not None else "unknown")
     loss_order = {
         "bce": 0,
         "smooth_l1": 1,
@@ -1345,17 +1686,68 @@ def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
         "gjml_sj_l1": 3,
         "unknown": 9,
     }.get(loss, 9)
+    return (loss_order, loss.lower())
+
+
+def _experiment_mean_unique_key(row: Dict[str, object]) -> Tuple[object, ...]:
+    # Keep one row per experiment directory name so suffix variants
+    # (for example *_segaux, *_segaux_w0.1) are not collapsed.
+    experiment_source = str(row.get("experiment_source", row.get("experiment", "unknown")))
+    return (
+        row["dataset"],
+        experiment_source,
+        row["experiment"],
+        row.get("label_mode", "unknown"),
+        row["conn_num"],
+        row.get("conn_layout", "default"),
+        row.get("conn_fusion", "none"),
+        row.get("fusion_loss_profile", "A"),
+        row["loss"],
+        row["fold_scope"],
+    )
+
+
+def experiment_sort_key(row: Dict[str, object]) -> Tuple[object, ...]:
+    label_mode = str(row.get("label_mode", infer_label_mode_from_experiment(row.get("experiment", "unknown"))))
+    label_mode_order = {
+        "binary": 0,
+        "dist": 1,
+        "dist_inverted": 2,
+    }.get(label_mode, 9)
+
+    conn_raw = row.get("conn_num", "NA")
+    conn_sort = int(conn_raw) if isinstance(conn_raw, int) else 10 ** 9
+    conn_layout_sort = _conn_layout_sort_key(row.get("conn_layout", "default"))
+
+    fusion_label, decoder_label = _table_fusion_and_decoder_labels(
+        row.get("conn_fusion", "none"),
+        row.get("fusion_loss_profile", "A"),
+        row.get("fusion_residual_scale"),
+        row.get("seg_aux_weight"),
+        row.get("seg_aux_variant", "none"),
+    )
+    fusion_name, _, fusion_profile_name = fusion_label.partition("/")
+    fusion_sort = _conn_fusion_sort_value(fusion_name)
+    fusion_profile_sort = _fusion_profile_sort_value(fusion_profile_name if fusion_profile_name else "A")
+    decoder_sort = (0, "") if decoder_label == "none" else (1, natural_sort_key(decoder_label))
+
+    loss_order, loss_norm = _loss_sort_key(row.get("loss", "Unknown"))
 
     fold_scope = str(row.get("fold_scope", "direct"))
     fold_scope_count = row.get("fold_scope_count", "NA")
     fold_scope_sort = int(fold_scope_count) if isinstance(fold_scope_count, int) else 10 ** 9
 
     return (
-        exp_order,
-        natural_sort_key(experiment),
+        label_mode_order,
+        natural_sort_key(label_mode),
         conn_sort,
+        conn_layout_sort,
+        fusion_sort,
+        fusion_profile_sort,
+        natural_sort_key(fusion_label),
+        decoder_sort,
         loss_order,
-        loss.lower(),
+        loss_norm,
         fold_scope_sort,
         fold_scope.lower(),
     )
@@ -1368,6 +1760,11 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
             [
                 "label_mode",
                 "conn_num",
+                "conn_label",
+                "conn_layout",
+                "conn_fusion",
+                "fusion_loss_profile",
+                "fusion_residual_scale",
                 "loss",
                 "num_folds",
                 "best_dice_mean",
@@ -1391,8 +1788,19 @@ def write_experiment_mean_csv(path: str, rows: List[Dict[str, object]]) -> None:
         for row in rows:
             writer.writerow(
                 [
-                    row["experiment"],
+                    str(row.get("label_mode", infer_label_mode_from_experiment(row.get("experiment", "unknown")))),
                     row["conn_num"],
+                    _format_conn_table_label(row["conn_num"], row.get("conn_layout", "default")),
+                    row.get("conn_layout", "default"),
+                    row.get("conn_fusion", "none"),
+                    row.get("fusion_loss_profile", "A"),
+                    _fmt_float(
+                        (
+                            float(row.get("fusion_residual_scale"))
+                            if row.get("fusion_residual_scale") is not None
+                            else float("nan")
+                        )
+                    ),
                     row["loss"],
                     int(row["num_folds"]),
                     _fmt_float(row["best_dice"]),
@@ -1427,7 +1835,7 @@ def write_latex(
     table_columns = 3 + len(metric_specs)
     lines = [
         r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage[a2paper,margin=1in,portrait]{geometry}",
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
@@ -1481,13 +1889,20 @@ def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, o
     lines += [
         r"\begin{table}[H]",
         r"\centering",
-        r"\begin{tabular}{lccccccccc}",
+        r"\begin{tabular}{lccccccccccc}",
         r"\toprule",
-        r"label\_mode & Conn & Loss & \#Folds & Dice & Jac & clDice & Err $(\beta_0)$ & Err $(\beta_1)$ & Train Time \\",
+        r"No. & label\_mode & Conn & Fusion & SegAux & Loss & Dice & Jac & clDice & Err $(\beta_0)$ & Err $(\beta_1)$ & Train Time \\",
         r"\midrule",
     ]
 
     for idx, row in enumerate(rows):
+        fusion_label, decoder_label = _latex_summary_fusion_and_decoder_labels(
+            row.get("conn_fusion", "none"),
+            row.get("fusion_loss_profile", "A"),
+            row.get("fusion_residual_scale"),
+            row.get("seg_aux_weight"),
+            row.get("seg_aux_variant", "none"),
+        )
         dice_txt = _fmt_latex_ranked_mean_std_marginal(
             float(row["best_dice"]),
             float(row.get("best_dice_std", float("nan"))),
@@ -1523,9 +1938,13 @@ def _append_experiment_mean_table_lines(lines: List[str], rows: List[Dict[str, o
         time_txt = rf"\shortstack{{{mean_time}\\({std_time})}}"
 
         lines.append(
-            f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
+            f'{idx + 1} '
+            f'& {escape_latex_text(str(row.get("label_mode", infer_label_mode_from_experiment(row.get("experiment", "unknown")))))} '
+            f'& {escape_latex_text(_format_conn_table_label(row["conn_num"], row.get("conn_layout", "default")))} '
+            f'& {escape_latex_text(fusion_label)} '
+            f'& {escape_latex_text(decoder_label)} '
             f'& {escape_latex_text(str(row["loss"]))} '
-            f'& {int(row["num_folds"])} & {dice_txt} & {jac_txt} & {cldice_txt} & {betti0_txt} & {betti1_txt} & {time_txt} \\\\'
+            f'& {dice_txt} & {jac_txt} & {cldice_txt} & {betti0_txt} & {betti1_txt} & {time_txt} \\\\'
         )
 
     lines += [
@@ -1594,17 +2013,24 @@ def _append_dataset_mean_table_lines(
         for key, _, higher_is_better in metric_specs
     }
 
-    table_columns = 4 + len(metric_specs)
+    table_columns = 6 + len(metric_specs)
     lines += [
         r"\begin{table}[H]",
         r"\centering",
         rf"\begin{{tabular}}{{{'l' + 'c' * (table_columns - 1)}}}",
         r"\toprule",
-        r"label\_mode & Conn & Loss & \#Folds & " + " & ".join(label for _, label, _ in metric_specs) + r" \\",
+        r"No. & label\_mode & Conn & Fusion & SegAux & Loss & " + " & ".join(label for _, label, _ in metric_specs) + r" \\",
         r"\midrule",
     ]
 
     for idx, row in enumerate(rows):
+        fusion_label, decoder_label = _latex_summary_fusion_and_decoder_labels(
+            row.get("conn_fusion", "none"),
+            row.get("fusion_loss_profile", "A"),
+            row.get("fusion_residual_scale"),
+            row.get("seg_aux_weight"),
+            row.get("seg_aux_variant", "none"),
+        )
         metric_cells: List[str] = []
         for key, _, _ in metric_specs:
             best_indices, second_indices = rank_map[key]
@@ -1627,9 +2053,13 @@ def _append_dataset_mean_table_lines(
                 )
 
         lines.append(
-            f'{escape_latex_text(str(row["experiment"]))} & {escape_latex_text(str(row["conn_num"]))} '
+            f'{idx + 1} '
+            f'& {escape_latex_text(str(row.get("label_mode", infer_label_mode_from_experiment(row.get("experiment", "unknown")))))} '
+            f'& {escape_latex_text(_format_conn_table_label(row["conn_num"], row.get("conn_layout", "default")))} '
+            f'& {escape_latex_text(fusion_label)} '
+            f'& {escape_latex_text(decoder_label)} '
             f'& {escape_latex_text(str(row["loss"]))} '
-            f'& {int(row["num_folds"])} & ' + " & ".join(metric_cells) + r" \\")
+            f'& ' + " & ".join(metric_cells) + r" \\")
 
     lines += [
         r"\bottomrule",
@@ -1640,7 +2070,7 @@ def _append_dataset_mean_table_lines(
 def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, object]]) -> None:
     lines = [
         r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage[a2paper,margin=1in,portrait]{geometry}",
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
@@ -1650,24 +2080,39 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
     rows_by_dataset: Dict[str, List[Dict[str, object]]] = {}
     for row in rows:
         dataset_name = str(row.get("dataset", "unknown_dataset"))
+        if not _is_counted_dataset_name(dataset_name):
+            continue
         rows_by_dataset.setdefault(dataset_name, []).append(row)
 
+    has_previous_dataset = False
     if len(rows_by_dataset) == 1:
         dataset_name, dataset_rows = next(iter(rows_by_dataset.items()))
+        has_previous_dataset = _append_page_break(lines, has_previous_dataset)
         _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
         lines += [
             rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
             r"\end{table}",
         ]
     else:
-        for dataset_name, dataset_rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
-            if len(dataset_rows) == 0:
+        grouped_rows: Dict[int, List[Tuple[str, List[Dict[str, object]]]]] = {}
+        for dataset_name, dataset_rows in rows_by_dataset.items():
+            group_order, _ = _dataset_summary_group(dataset_name)
+            grouped_rows.setdefault(group_order, []).append((dataset_name, dataset_rows))
+
+        for group_order in sorted(grouped_rows):
+            group_items = sorted(grouped_rows[group_order], key=lambda item: _dataset_group_sort_key(item[0]))
+            if not group_items:
                 continue
-            _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
-            lines += [
-                rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
-                r"\end{table}",
-            ]
+            for dataset_name, dataset_rows in group_items:
+                if len(dataset_rows) == 0:
+                    continue
+                has_previous_dataset = _append_page_break(lines, has_previous_dataset)
+                _append_dataset_group_heading(lines, dataset_name)
+                _append_dataset_mean_table_lines(lines, dataset_rows, dataset_name)
+                lines += [
+                    rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
+                    r"\end{table}",
+                ]
 
     lines += [
         r"\end{document}",
@@ -1680,14 +2125,84 @@ def write_experiment_mean_latex(path: str, title: str, rows: List[Dict[str, obje
 def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
     datasets = set()
     for row in rows:
-        datasets.add(str(row.get("dataset", "unknown")))
+        dataset_name = str(row.get("dataset", "unknown"))
+        if not _is_counted_dataset_name(dataset_name):
+            continue
+        datasets.add(dataset_name)
     dataset_list = sorted(list(datasets), key=natural_sort_key)
+    dataset_buckets: List[Tuple[str, List[str]]] = []
+    core_bucket = [ds for ds in ["cremi", "drive"] if ds in dataset_list]
+    if core_bucket:
+        dataset_buckets.append(("CREMI, DRIVE", core_bucket))
+    other_bucket = [ds for ds in dataset_list if ds not in {"cremi", "drive"}]
+    if other_bucket:
+        dataset_buckets.append(("Other datasets", other_bucket))
+
+    def row_label_mode(row: Dict[str, object]) -> str:
+        label_mode = str(row.get("label_mode", ""))
+        if label_mode in ALLOWED_LABEL_MODES:
+            return label_mode
+        return infer_label_mode_from_experiment(row.get("experiment", "unknown"))
+
+    def fusion_objective_spec(row: Dict[str, object]) -> Tuple[str, str]:
+        conn_fusion = str(row.get("conn_fusion", "none"))
+        residual_scale = row.get("fusion_residual_scale")
+        return (
+            conn_fusion,
+            _latex_ablation_fusion_spec(
+                conn_fusion,
+                row.get("fusion_loss_profile", "A"),
+                residual_scale,
+            ),
+        )
+
+    def decoder_option_spec(row: Dict[str, object]) -> Tuple[str]:
+        _fusion_label, dec_label = _table_fusion_and_decoder_labels(
+            row.get("conn_fusion", "none"),
+            row.get("fusion_loss_profile", "A"),
+            row.get("fusion_residual_scale"),
+            row.get("seg_aux_weight"),
+            row.get("seg_aux_variant", "none"),
+        )
+        return (str(dec_label),)
+
+    def run_rank_key(row: Dict[str, object]) -> Tuple[object, ...]:
+        dice = float(row.get("best_dice", float("nan")))
+        iou = float(row.get("best_jac", float("nan")))
+        dice_key = dice if not math.isnan(dice) else float("-inf")
+        iou_key = iou if not math.isnan(iou) else float("-inf")
+        return (
+            dice_key,
+            iou_key,
+            tuple(-x if isinstance(x, int) else x for x in experiment_sort_key(row)),
+            natural_sort_key(str(row.get("experiment", "unknown"))),
+        )
+
+    def _fmt_signed_delta(value: float) -> str:
+        if math.isnan(value):
+            return "-"
+        return f"{value:+.4f}"
+
+    def _fmt_latex_delta_colored(value: float) -> str:
+        return _fmt_latex_delta_colored_with_direction(value, higher_is_better=True)
+
+    def _fmt_latex_delta_colored_with_direction(value: float, higher_is_better: bool) -> str:
+        if math.isnan(value):
+            return "-"
+        signed_value = f"{value:+.4f}"
+        if value == 0:
+            return signed_value
+        is_improvement = value > 0 if higher_is_better else value < 0
+        if is_improvement:
+            return rf"\textcolor{{green!60!black}}{{{signed_value}}}"
+        return rf"\textcolor{{red!70!black}}{{{signed_value}}}"
 
     variable_groups = [
         {
             "name": "Label Mode",
             "headers": ["Label Mode"],
-            "func": lambda r: (str(r.get("experiment", "unknown")),),
+            "func": lambda r: (row_label_mode(r),),
+            "filter": lambda r: row_label_mode(r) in ALLOWED_LABEL_MODES,
         },
         {
             "name": "Loss",
@@ -1696,169 +2211,473 @@ def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
             "filter": lambda r: str(r.get("loss", "unknown")) != "bce",
         },
         {
-            "name": "Connectivity",
-            "headers": ["Conn."],
+            "name": "Fusion + Decoder/SegAux",
+            "headers": ["Conn. Fusion", "Fusion Spec", "SegAux"],
             "func": lambda r: (
-                str(r.get("conn_num", "unknown")),
+                fusion_objective_spec(r)[0],
+                fusion_objective_spec(r)[1],
+                decoder_option_spec(r)[0],
             ),
-        }
+            "sort_key": lambda tup: (
+                _conn_fusion_sort_value(tup[0]),
+                _fusion_profile_sort_value(
+                    "A" if tup[0] == "decoder_guided" and tup[1] == "" else str(tup[1]).split("/", 1)[0]
+                ),
+                natural_sort_key(str(tup[0])),
+                natural_sort_key(str(tup[1])),
+                natural_sort_key(str(tup[2])),
+            ),
+        },
     ]
 
     lines = [
         r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage[a2paper,margin=1in,portrait]{geometry}",
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\usepackage{multirow}",
+        r"\usepackage[table]{xcolor}",
         r"\begin{document}",
         rf"\renewcommand{{\arraystretch}}{{{LATEX_TABLE_ARRAYSTRETCH}}}",
-        r"\section*{Ablation Studies (Marginal Averages)}",
+        r"\section*{Ablation Studies (Category-grouped Best Runs)}",
+    ]
+    has_previous_table = False
+
+    def get_ranks(values: List[float], higher_is_better: bool = True) -> Tuple[Set[int], Set[int]]:
+        valid_vals = [v for v in values if not math.isnan(v)]
+        if not valid_vals:
+            return set(), set()
+        ranked = sorted(set(valid_vals), reverse=higher_is_better)
+        best = ranked[0]
+        second = ranked[1] if len(ranked) > 1 else None
+        best_idx = {i for i, v in enumerate(values) if v == best}
+        second_idx = {i for i, v in enumerate(values) if v == second} if second is not None else set()
+        return best_idx, second_idx
+
+    # Emit all tables for a bucket first so table numbering becomes:
+    # core bucket(1,2,3,...) then other bucket(...).
+    for bucket_name, bucket_datasets in dataset_buckets:
+        for v_group in variable_groups:
+            var_name = v_group["name"]
+            headers = v_group["headers"]
+            var_func = v_group["func"]
+            row_filter = v_group.get("filter", lambda r: True)
+
+            val_set = set()
+            for row in rows:
+                if row_filter(row):
+                    val_set.add(var_func(row))
+
+            def tuple_sort_key(tup):
+                custom_sort_key = v_group.get("sort_key")
+                if custom_sort_key is not None:
+                    return custom_sort_key(tup)
+                return [natural_sort_key(str(x)) for x in tup]
+
+            val_list = sorted(list(val_set), key=tuple_sort_key)
+            selected_rows: Dict[str, Dict[Tuple[object, ...], Dict[str, object]]] = {
+                ds: {} for ds in bucket_datasets
+            }
+
+            for row in rows:
+                if not row_filter(row):
+                    continue
+                ds = str(row.get("dataset", "unknown"))
+                if ds not in selected_rows:
+                    continue
+                val = var_func(row)
+                existing = selected_rows[ds].get(val)
+                if existing is None or run_rank_key(row) > run_rank_key(existing):
+                    selected_rows[ds][val] = row
+
+            dataset_metrics = {ds: {"dice": [], "iou": []} for ds in bucket_datasets}
+
+            for ds in bucket_datasets:
+                for v in val_list:
+                    selected = selected_rows[ds].get(v)
+                    if selected is None:
+                        dataset_metrics[ds]["dice"].append(float("nan"))
+                        dataset_metrics[ds]["iou"].append(float("nan"))
+                        continue
+                    dataset_metrics[ds]["dice"].append(float(selected.get("best_dice", float("nan"))))
+                    dataset_metrics[ds]["iou"].append(float(selected.get("best_jac", float("nan"))))
+
+            dataset_ranks = {}
+            for ds in bucket_datasets:
+                dice_b, dice_s = get_ranks(dataset_metrics[ds]["dice"], True)
+                iou_b, iou_s = get_ranks(dataset_metrics[ds]["iou"], True)
+                dataset_ranks[ds] = {"dice_best": dice_b, "dice_second": dice_s, "iou_best": iou_b, "iou_second": iou_s}
+
+            has_previous_table = _append_page_break(lines, has_previous_table)
+            lines.extend([
+                r"\begin{table}[H]",
+                r"\centering",
+            ])
+
+            num_var_cols = len(headers) + 1
+            col_str = "l" * num_var_cols + "cc" * len(bucket_datasets)
+            lines.append(rf"\begin{{tabular}}{{{col_str}}}")
+            lines.append(r"\toprule")
+
+            header1 = [r"\multirow{2}{*}{No.}"]
+            for h in headers:
+                if isinstance(h, str) and h.startswith("LATEX:"):
+                    header_txt = h[len("LATEX:"):]
+                else:
+                    header_txt = escape_latex_text(str(h))
+                header1.append(rf"\multirow{{2}}{{*}}{{{header_txt}}}")
+            for ds in bucket_datasets:
+                header1.append(rf"\multicolumn{{2}}{{c}}{{{escape_latex_text(ds)}}}")
+            lines.append(" & ".join(header1) + r" \\")
+
+            cmidrules = []
+            current_col = num_var_cols + 1
+            for _ in bucket_datasets:
+                cmidrules.append(rf"\cmidrule(lr){{{current_col}-{current_col+1}}}")
+                current_col += 2
+            if cmidrules:
+                lines.append(" ".join(cmidrules))
+
+            header2 = [""] * num_var_cols
+            for _ in bucket_datasets:
+                header2.extend(["Dice", "IoU"])
+            lines.append(" & ".join(header2) + r" \\")
+            lines.append(r"\midrule")
+
+            for idx, v in enumerate(val_list):
+                row_str_parts = [str(idx + 1)]
+                for x in v:
+                    x_str = str(x)
+                    if x_str.startswith("LATEX:"):
+                        row_str_parts.append(x_str[len("LATEX:"):])
+                    else:
+                        row_str_parts.append(escape_latex_text(x_str))
+                for ds in bucket_datasets:
+                    selected = selected_rows[ds].get(v)
+                    dice = float("nan") if selected is None else float(selected.get("best_dice", float("nan")))
+                    iou = float("nan") if selected is None else float(selected.get("best_jac", float("nan")))
+                    dice_txt = _fmt_latex_ranked_value(
+                        dice, idx in dataset_ranks[ds]["dice_best"], idx in dataset_ranks[ds]["dice_second"]
+                    )
+                    iou_txt = _fmt_latex_ranked_value(
+                        iou, idx in dataset_ranks[ds]["iou_best"], idx in dataset_ranks[ds]["iou_second"]
+                    )
+
+                    row_str_parts.append(dice_txt)
+                    row_str_parts.append(iou_txt)
+                lines.append(" & ".join(row_str_parts) + r" \\")
+
+            lines.extend([
+                r"\bottomrule",
+                r"\end{tabular}",
+                rf"\caption{{Ablation on {escape_latex_text(var_name)} ({escape_latex_text(bucket_name)})}}",
+                r"\end{table}",
+            ])
+
+    # Additional table: from each dataset best run, switch one element at a time
+    # and report the best available alternative with +/- deltas.
+    drop_axes = [
+        ("label_mode", "Label Mode", lambda r: row_label_mode(r)),
+        ("loss", "Loss", lambda r: str(r.get("loss", "unknown"))),
+        ("dec", "SegAux", lambda r: decoder_option_spec(r)[0]),
+        ("fusion", "Fusion", lambda r: str(fusion_objective_spec(r))),
+    ]
+    preferred_drop_one_losses = ("gjml_sf_l1", "smooth_l1")
+    preferred_drop_one_loss_set = set(preferred_drop_one_losses)
+    drop_metric_specs = [
+        ("best_dice", "Dice", True),
+        ("best_jac", "IoU", True),
+        ("best_cldice", "clDice", True),
+        ("best_betti_error_0", r"Err $(\beta_0)$", False),
+        ("best_betti_error_1", r"Err $(\beta_1)$", False),
     ]
 
-    for v_group in variable_groups:
-        var_name = v_group["name"]
-        headers = v_group["headers"]
-        var_func = v_group["func"]
-        row_filter = v_group.get("filter", lambda r: True)
+    def _loss_toggle_target(loss_name: object) -> Optional[str]:
+        loss = str(loss_name if loss_name is not None else "unknown")
+        if loss == "gjml_sf_l1":
+            return "smooth_l1"
+        if loss == "smooth_l1":
+            return "gjml_sf_l1"
+        return None
 
-        val_set = set()
-        for row in rows:
-            if row_filter(row):
-                val_set.add(var_func(row))
+    def _option_cells(row: Optional[Dict[str, object]]) -> Tuple[str, str, str, str, str]:
+        if row is None:
+            return ("-", "-", "-", "-", "-")
+        fusion_label, decoder_label = _latex_summary_fusion_and_decoder_labels(
+            row.get("conn_fusion", "none"),
+            row.get("fusion_loss_profile", "A"),
+            row.get("fusion_residual_scale"),
+            row.get("seg_aux_weight"),
+            row.get("seg_aux_variant", "none"),
+        )
+        return (
+            row_label_mode(row),
+            _format_conn_table_label(row.get("conn_num", "unknown"), row.get("conn_layout", "default")),
+            fusion_label,
+            decoder_label,
+            str(row.get("loss", "unknown")),
+        )
 
-        def tuple_sort_key(tup):
-            return [natural_sort_key(str(x)) for x in tup]
+    def _same_conn_config(a: Dict[str, object], b: Dict[str, object]) -> bool:
+        return (
+            a.get("conn_num", "unknown") == b.get("conn_num", "unknown")
+            and str(a.get("conn_layout", "default")) == str(b.get("conn_layout", "default"))
+        )
 
-        val_list = sorted(list(val_set), key=tuple_sort_key)
+    def _is_plain_binary8_baseline(row: Dict[str, object]) -> bool:
+        return (
+            row_label_mode(row) == "binary"
+            and row.get("conn_num", "unknown") == 8
+            and str(row.get("conn_layout", "default")) == "default"
+            and str(row.get("conn_fusion", "none")) == "none"
+            and decoder_option_spec(row)[0] == "none"
+            and str(row.get("loss", "unknown")) == "bce"
+        )
 
-        stats = {ds: {v: {"dice": [], "iou": []} for v in val_list} for ds in dataset_list}
+    for bucket_name, bucket_datasets in dataset_buckets:
+        # Split drop-one delta tables per dataset.
+        table_dataset_groups: List[Tuple[str, List[str]]] = []
+        if bucket_name == "CREMI, DRIVE":
+            if "cremi" in bucket_datasets:
+                table_dataset_groups.append(("CREMI", ["cremi"]))
+            if "drive" in bucket_datasets:
+                table_dataset_groups.append(("DRIVE", ["drive"]))
+        else:
+            for ds in bucket_datasets:
+                table_dataset_groups.append((ds, [ds]))
 
-        for row in rows:
-            if not row_filter(row):
-                continue
-            ds = str(row.get("dataset", "unknown"))
-            val = var_func(row)
-            dice = float(row.get("best_dice", float("nan")))
-            iou = float(row.get("best_jac", float("nan")))
-            if not math.isnan(dice):
-                stats[ds][val]["dice"].append(dice)
-            if not math.isnan(iou):
-                stats[ds][val]["iou"].append(iou)
+        for table_label, table_datasets in table_dataset_groups:
+            rows_out: List[
+                Tuple[
+                    str,
+                    str,
+                    Tuple[str, str, str, str, str],
+                    List[float],
+                    List[float],
+                ]
+            ] = []
+            for ds in table_datasets:
+                ds_rows = [r for r in rows if str(r.get("dataset", "unknown")) == ds]
+                if len(ds_rows) == 0:
+                    continue
+                preferred_best_rows = [
+                    r for r in ds_rows
+                    if str(r.get("loss", "unknown")) in preferred_drop_one_loss_set
+                ]
+                best_row = max(preferred_best_rows or ds_rows, key=run_rank_key)
+                best_metric_values = [
+                    float(best_row.get(metric_key, float("nan")))
+                    for metric_key, _metric_label, _higher_is_better in drop_metric_specs
+                ]
+                rows_out.append((
+                    ds,
+                    "BEST",
+                    _option_cells(best_row),
+                    best_metric_values,
+                    [float("nan")] * len(drop_metric_specs),
+                ))
 
-        def get_ranks(values: List[float], higher_is_better: bool = True) -> Tuple[Set[int], Set[int]]:
-            valid_vals = [v for v in values if not math.isnan(v)]
-            if not valid_vals:
-                return set(), set()
-            ranked = sorted(set(valid_vals), reverse=higher_is_better)
-            best = ranked[0]
-            second = ranked[1] if len(ranked) > 1 else None
-            best_idx = {i for i, v in enumerate(values) if v == best}
-            second_idx = {i for i, v in enumerate(values) if v == second} if second is not None else set()
-            return best_idx, second_idx
+                axis_values = {axis_key: axis_func(best_row) for axis_key, _, axis_func in drop_axes}
+                for axis_key, axis_label, axis_func in drop_axes:
+                    # Drop-one tables should remove an active choice from the best run.
+                    # If the best row already uses the default/plain setting, there is
+                    # nothing to drop for that axis.
+                    if axis_key == "label_mode" and axis_values["label_mode"] == "binary":
+                        rows_out.append((
+                            ds,
+                            f"-{axis_label}",
+                            _option_cells(None),
+                            [float("nan")] * len(drop_metric_specs),
+                            [float("nan")] * len(drop_metric_specs),
+                        ))
+                        continue
+                    if axis_key == "fusion" and axis_values["fusion"] == str(("none", "A")):
+                        rows_out.append((
+                            ds,
+                            f"-{axis_label}",
+                            _option_cells(None),
+                            [float("nan")] * len(drop_metric_specs),
+                            [float("nan")] * len(drop_metric_specs),
+                        ))
+                        continue
+                    if axis_key == "dec" and axis_values["dec"] == "none":
+                        rows_out.append((
+                            ds,
+                            f"-{axis_label}",
+                            _option_cells(None),
+                            [float("nan")] * len(drop_metric_specs),
+                            [float("nan")] * len(drop_metric_specs),
+                        ))
+                        continue
 
-        avg_stats = {
-            ds: {
-                v: {
-                    "dice_mean": float("nan"),
-                    "dice_std": float("nan"),
-                    "iou_mean": float("nan"),
-                    "iou_std": float("nan"),
-                }
-                for v in val_list
-            }
-            for ds in dataset_list
-        }
-        dataset_metrics = {ds: {"dice": [], "iou": []} for ds in dataset_list}
+                    alt_candidates = []
+                    for cand in ds_rows:
+                        if not _same_conn_config(cand, best_row):
+                            continue
 
-        for ds in dataset_list:
-            for v in val_list:
-                dice_list = stats[ds][v]["dice"]
-                iou_list = stats[ds][v]["iou"]
-                avg_dice = _safe_mean(dice_list)
-                avg_iou = _safe_mean(iou_list)
-                std_dice = _safe_std(dice_list, avg_dice)
-                std_iou = _safe_std(iou_list, avg_iou)
+                        if axis_key == "loss":
+                            target_loss = _loss_toggle_target(axis_values["loss"])
+                            if target_loss is None:
+                                continue
+                            if str(cand.get("loss", "unknown")) != target_loss:
+                                continue
+                            if row_label_mode(cand) == axis_values["label_mode"] and \
+                               str(fusion_objective_spec(cand)) == axis_values["fusion"] and \
+                               decoder_option_spec(cand)[0] == axis_values["dec"]:
+                                alt_candidates.append(cand)
+                            continue
 
-                avg_stats[ds][v]["dice_mean"] = avg_dice
-                avg_stats[ds][v]["dice_std"] = std_dice
-                avg_stats[ds][v]["iou_mean"] = avg_iou
-                avg_stats[ds][v]["iou_std"] = std_iou
+                        if axis_key == "label_mode":
+                            # Special rule: when best is dist, dropped label mode
+                            # must compare against binary+bce.
+                            if axis_values["label_mode"] in {"dist", "dist_inverted"}:
+                                if row_label_mode(cand) != "binary":
+                                    continue
+                                if str(cand.get("loss", "unknown")) != "bce":
+                                    continue
+                                if str(fusion_objective_spec(cand)) == axis_values["fusion"] and \
+                                   decoder_option_spec(cand)[0] == axis_values["dec"]:
+                                    alt_candidates.append(cand)
+                                continue
+                            if row_label_mode(cand) == axis_values["label_mode"]:
+                                continue
+                            if str(cand.get("loss", "unknown")) == axis_values["loss"] and \
+                               str(fusion_objective_spec(cand)) == axis_values["fusion"] and \
+                               decoder_option_spec(cand)[0] == axis_values["dec"]:
+                                alt_candidates.append(cand)
+                            continue
 
-                dataset_metrics[ds]["dice"].append(avg_dice)
-                dataset_metrics[ds]["iou"].append(avg_iou)
+                        if axis_key == "fusion":
+                            # Special rule: dropped fusion compares against the
+                            # plain no-fusion, no-dec baseline with the same
+                            # label mode, connectivity, and loss.
+                            if str(cand.get("conn_fusion", "none")) != "none":
+                                continue
+                            if decoder_option_spec(cand)[0] != "none":
+                                continue
+                            if row_label_mode(cand) == axis_values["label_mode"] and \
+                               str(cand.get("loss", "unknown")) == axis_values["loss"]:
+                                alt_candidates.append(cand)
+                            continue
 
-        dataset_ranks = {}
-        for ds in dataset_list:
-            dice_b, dice_s = get_ranks(dataset_metrics[ds]["dice"], True)
-            iou_b, iou_s = get_ranks(dataset_metrics[ds]["iou"], True)
-            dataset_ranks[ds] = {"dice_best": dice_b, "dice_second": dice_s, "iou_best": iou_b, "iou_second": iou_s}
+                        if axis_key == "dec":
+                            # Special rule: if best uses decoder option, dropped variant
+                            # should compare against the plain dec=none configuration.
+                            best_dec = axis_values["dec"]
+                            cand_dec = decoder_option_spec(cand)[0]
+                            if best_dec != "none":
+                                if cand_dec != "none":
+                                    continue
+                                if row_label_mode(cand) == axis_values["label_mode"] and \
+                                   str(cand.get("loss", "unknown")) == axis_values["loss"] and \
+                                   str(fusion_objective_spec(cand)) == axis_values["fusion"]:
+                                    alt_candidates.append(cand)
+                                continue
 
-        lines.extend([
-            r"\begin{table}[H]",
-            r"\centering",
-        ])
+                        if axis_func(cand) == axis_values[axis_key]:
+                            continue
+                        same_other_axes = True
+                        for other_axis_key, _, other_axis_func in drop_axes:
+                            if other_axis_key == axis_key:
+                                continue
+                            if other_axis_func(cand) != axis_values[other_axis_key]:
+                                same_other_axes = False
+                                break
+                        if same_other_axes:
+                            alt_candidates.append(cand)
 
-        num_var_cols = len(headers)
-        col_str = "l" * num_var_cols + "cc" * len(dataset_list)
-        lines.append(rf"\begin{{tabular}}{{{col_str}}}")
-        lines.append(r"\toprule")
+                    if len(alt_candidates) == 0:
+                        rows_out.append((
+                            ds,
+                            f"-{axis_label}",
+                            _option_cells(None),
+                            [float("nan")] * len(drop_metric_specs),
+                            [float("nan")] * len(drop_metric_specs),
+                        ))
+                        continue
 
-        header1 = []
-        for h in headers:
-            if isinstance(h, str) and h.startswith("LATEX:"):
-                header_txt = h[len("LATEX:"):]
-            else:
-                header_txt = escape_latex_text(str(h))
-            header1.append(rf"\multirow{{2}}{{*}}{{{header_txt}}}")
-        for ds in dataset_list:
-            header1.append(rf"\multicolumn{{2}}{{c}}{{{escape_latex_text(ds)}}}")
-        lines.append(" & ".join(header1) + r" \\")
+                    alt = max(alt_candidates, key=run_rank_key)
+                    alt_metric_values = [
+                        float(alt.get(metric_key, float("nan")))
+                        for metric_key, _metric_label, _higher_is_better in drop_metric_specs
+                    ]
+                    alt_metric_deltas = []
+                    for idx, _spec in enumerate(drop_metric_specs):
+                        alt_value = alt_metric_values[idx]
+                        best_value = best_metric_values[idx]
+                        if math.isnan(alt_value) or math.isnan(best_value):
+                            alt_metric_deltas.append(float("nan"))
+                        else:
+                            alt_metric_deltas.append(alt_value - best_value)
+                    rows_out.append((ds, f"-{axis_label}", _option_cells(alt), alt_metric_values, alt_metric_deltas))
 
-        cmidrules = []
-        current_col = num_var_cols + 1
-        for ds in dataset_list:
-            cmidrules.append(rf"\cmidrule(lr){{{current_col}-{current_col+1}}}")
-            current_col += 2
-        if cmidrules:
-            lines.append(" ".join(cmidrules))
-
-        header2 = [""] * num_var_cols
-        for ds in dataset_list:
-            header2.extend(["Dice", "IoU"])
-        lines.append(" & ".join(header2) + r" \\")
-        lines.append(r"\midrule")
-
-        for idx, v in enumerate(val_list):
-            row_str_parts = []
-            for x in v:
-                x_str = str(x)
-                if x_str.startswith("LATEX:"):
-                    row_str_parts.append(x_str[len("LATEX:"):])
+                baseline_candidates = [r for r in ds_rows if _is_plain_binary8_baseline(r)]
+                if len(baseline_candidates) == 0:
+                    rows_out.append((
+                        ds,
+                        "BASE",
+                        _option_cells(None),
+                        [float("nan")] * len(drop_metric_specs),
+                        [float("nan")] * len(drop_metric_specs),
+                    ))
                 else:
-                    row_str_parts.append(escape_latex_text(x_str))
-            for ds in dataset_list:
-                dice_mean = avg_stats[ds][v]["dice_mean"]
-                dice_std = avg_stats[ds][v]["dice_std"]
-                iou_mean = avg_stats[ds][v]["iou_mean"]
-                iou_std = avg_stats[ds][v]["iou_std"]
+                    baseline_row = max(baseline_candidates, key=run_rank_key)
+                    baseline_metric_values = [
+                        float(baseline_row.get(metric_key, float("nan")))
+                        for metric_key, _metric_label, _higher_is_better in drop_metric_specs
+                    ]
+                    baseline_metric_deltas = []
+                    for idx, _spec in enumerate(drop_metric_specs):
+                        baseline_value = baseline_metric_values[idx]
+                        best_value = best_metric_values[idx]
+                        if math.isnan(baseline_value) or math.isnan(best_value):
+                            baseline_metric_deltas.append(float("nan"))
+                        else:
+                            baseline_metric_deltas.append(baseline_value - best_value)
+                    rows_out.append(
+                        (
+                            ds,
+                            "BASE",
+                            _option_cells(baseline_row),
+                            baseline_metric_values,
+                            baseline_metric_deltas,
+                        )
+                    )
 
-                dice_txt = _fmt_latex_ranked_mean_std_marginal(
-                    dice_mean, dice_std, idx in dataset_ranks[ds]["dice_best"], idx in dataset_ranks[ds]["dice_second"]
+            if len(rows_out) == 0:
+                continue
+
+            has_previous_table = _append_page_break(lines, has_previous_table)
+            lines.extend([
+                r"\begin{table}[H]",
+                r"\centering",
+                r"\begin{tabular}{lllcccccccccc}",
+                r"\toprule",
+                r"No. & Dataset & Variant"
+                r" & label\_mode & Conn & Fusion & SegAux & Loss"
+                r" & " + " & ".join(metric_label for _metric_key, metric_label, _higher_is_better in drop_metric_specs) + r" \\",
+                r"\midrule",
+            ])
+            for row_idx, (ds, variant, opts, metric_values, metric_deltas) in enumerate(rows_out):
+                metric_cells: List[str] = []
+                for metric_idx, (_metric_key, _metric_label, higher_is_better) in enumerate(drop_metric_specs):
+                    value = metric_values[metric_idx]
+                    delta = metric_deltas[metric_idx]
+                    if variant == "BEST":
+                        metric_cells.append(_fmt_latex_ranked_value(value, False, False))
+                    else:
+                        metric_cells.append(_fmt_latex_delta_colored_with_direction(delta, higher_is_better))
+                lines.append(
+                    f"{row_idx + 1} & {escape_latex_text(ds)} & {escape_latex_text(variant)} "
+                    f"& {escape_latex_text(opts[0])} & {escape_latex_text(opts[1])} & {escape_latex_text(opts[2])} & {escape_latex_text(opts[3])} & {escape_latex_text(opts[4])} "
+                    f"& " + " & ".join(metric_cells) + r" \\"
                 )
-                iou_txt = _fmt_latex_ranked_mean_std_marginal(
-                    iou_mean, iou_std, idx in dataset_ranks[ds]["iou_best"], idx in dataset_ranks[ds]["iou_second"]
-                )
-
-                row_str_parts.append(dice_txt)
-                row_str_parts.append(iou_txt)
-            lines.append(" & ".join(row_str_parts) + r" \\")
-
-        lines.extend([
-            r"\bottomrule",
-            r"\end{tabular}",
-            rf"\caption{{Ablation on {escape_latex_text(var_name)}}}",
-            r"\end{table}",
-        ])
+            lines.extend([
+                r"\bottomrule",
+                r"\end{tabular}",
+                rf"\caption{{Best-run drop-one deltas ({escape_latex_text(table_label)})}}",
+                r"\end{table}",
+            ])
 
     lines.append(r"\end{document}")
 
@@ -1873,20 +2692,44 @@ def write_experiment_mean_dataset_tables_latex(
 ) -> None:
     lines = [
         r"\documentclass[11pt]{article}",
-        r"\usepackage[a4paper,margin=1in,landscape]{geometry}",
+        r"\usepackage[a2paper,margin=1in,portrait]{geometry}",
         r"\usepackage{booktabs}",
         r"\usepackage{float}",
         r"\begin{document}",
     ]
 
-    for dataset_name, rows in sorted(rows_by_dataset.items(), key=lambda item: natural_sort_key(item[0])):
-        if len(rows) == 0:
+    grouped_rows: Dict[int, List[Tuple[str, List[Dict[str, object]]]]] = {}
+    for dataset_name, rows in rows_by_dataset.items():
+        if not _is_counted_dataset_name(dataset_name):
             continue
-        _append_dataset_mean_table_lines(lines, rows, dataset_name, include_std=False)
-        lines.extend([
-            rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)})}}",
-            r"\end{table}",
-        ])
+        group_order, _ = _dataset_summary_group(dataset_name)
+        grouped_rows.setdefault(group_order, []).append((dataset_name, rows))
+
+    has_previous_dataset = False
+    for group_order in sorted(grouped_rows):
+        group_items = sorted(grouped_rows[group_order], key=lambda item: _dataset_group_sort_key(item[0]))
+        if not group_items:
+            continue
+        for dataset_name, rows in group_items:
+            if len(rows) == 0:
+                continue
+            has_previous_dataset = _append_page_break(lines, has_previous_dataset)
+            _append_dataset_group_heading(lines, dataset_name)
+            rows_by_loss: Dict[str, List[Dict[str, object]]] = {}
+            for row in rows:
+                loss = str(row.get("loss", "unknown"))
+                rows_by_loss.setdefault(loss, []).append(row)
+
+            ordered_losses = sorted(rows_by_loss.keys(), key=_loss_sort_key)
+            for loss in ordered_losses:
+                loss_rows = rows_by_loss[loss]
+                if len(loss_rows) == 0:
+                    continue
+                _append_dataset_mean_table_lines(lines, loss_rows, dataset_name, include_std=False)
+                lines.extend([
+                    rf"\caption{{Cross-experiment mean summary ({escape_latex_text(dataset_name)}, Loss={escape_latex_text(loss)})}}",
+                    r"\end{table}",
+                ])
 
     lines += [
         r"\end{document}",
@@ -1973,6 +2816,49 @@ def move_non_pdf_files_to_dump(output_dir: str, dump_dir: str) -> None:
         shutil.move(src_path, dst_path)
 
 
+def normalize_aggregate_stem(output_stem: str) -> str:
+    stem = str(output_stem).strip()
+    if stem.endswith("_experiment_means"):
+        return stem
+    return f"{stem}_experiment_means"
+
+
+def aggregate_output_stem(output_stem: str, include_all: bool) -> str:
+    stem = normalize_aggregate_stem(output_stem)
+    if include_all:
+        return f"{stem}_all"
+    return stem
+
+
+def should_exclude_ambiguous_scaled_sum_row(exp_meta: Dict[str, object]) -> bool:
+    """Drop legacy scaled_sum rows without explicit residual-scale spec.
+
+    These runs were produced before `_rs<scale>` was appended to the
+    experiment name, so the residual scale cannot be recovered reliably.
+    """
+    conn_fusion = str(exp_meta.get("conn_fusion", "none"))
+    profile = str(exp_meta.get("fusion_loss_profile", "A"))
+    residual_scale = exp_meta.get("fusion_residual_scale")
+    return (
+        conn_fusion == "scaled_sum"
+        and profile == "A"
+        and residual_scale is None
+    )
+
+
+def remove_legacy_duplicate_aggregate_pdfs(output_dir: str, agg_stem: str) -> None:
+    # If agg_stem is already "..._experiment_means", old behavior could also
+    # emit "..._experiment_means_experiment_means_*". Remove those duplicates.
+    legacy_stem = f"{agg_stem}_experiment_means"
+    duplicate_pdf_paths = [
+        os.path.join(output_dir, f"{legacy_stem}_datasets.pdf"),
+        os.path.join(output_dir, f"{legacy_stem}_ablation.pdf"),
+    ]
+    for path in duplicate_pdf_paths:
+        if os.path.isfile(path):
+            os.remove(path)
+
+
 def main() -> None:
     args = parse_args()
     requested_folds = [item.strip() for item in args.folds.split(",") if item.strip()]
@@ -1981,7 +2867,9 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
     dump_dir = os.path.join(args.output_dir, "dump")
+    dump_csv_dir = os.path.join(dump_dir, "csv")
     os.makedirs(dump_dir, exist_ok=True)
+    os.makedirs(dump_csv_dir, exist_ok=True)
     move_non_pdf_files_to_dump(args.output_dir, dump_dir)
     target_roots = discover_target_roots(args.input_root, requested_folds, args.input_name)
     experiment_mean_rows: List[Dict[str, object]] = []
@@ -2012,11 +2900,26 @@ def main() -> None:
             }
         )
         exp_meta = parse_experiment_metadata(experiment_root_name)
+        if should_exclude_ambiguous_scaled_sum_row(exp_meta):
+            print(
+                f"[WARN] {root}: ambiguous scaled_sum/A run without explicit rs suffix; "
+                "excluding from aggregate outputs."
+            )
+            continue
         experiment_mean_rows.append(
             {
                 "dataset": extract_dataset_name(root, args.input_root),
+                "experiment_source": experiment_root_name,
                 "experiment": exp_meta["experiment"],
+                "label_mode": exp_meta["label_mode"],
                 "conn_num": exp_meta["conn_num"],
+                "conn_layout": exp_meta["conn_layout"],
+                "conn_fusion": exp_meta["conn_fusion"],
+                "fusion_loss_profile": exp_meta["fusion_loss_profile"],
+                "fusion_residual_scale": exp_meta.get("fusion_residual_scale"),
+                "decoder_fusion": exp_meta.get("decoder_fusion", "none"),
+                "seg_aux_weight": exp_meta.get("seg_aux_weight"),
+                "seg_aux_variant": exp_meta.get("seg_aux_variant", "none"),
                 "loss": exp_meta["loss"],
                 "fold_scope": scope_name,
                 "fold_scope_count": scope_fold_count,
@@ -2044,20 +2947,12 @@ def main() -> None:
 
         if len(target_roots) == 1:
             output_stem = args.output_stem
-            title = "Final Metrics"
         else:
             output_stem = f"{root_output_label(root, args.input_root)}_{args.output_stem}"
-            title = f"Final Metrics ({escape_latex_text(display_name)})"
-        dataset_name = extract_dataset_name(root, args.input_root)
 
-        csv_out = os.path.join(dump_dir, f"{output_stem}.csv")
-        tex_out = os.path.join(dump_dir, f"{output_stem}.tex")
-        pdf_out = os.path.join(args.output_dir, f"{output_stem}.pdf")
+        csv_out = os.path.join(dump_csv_dir, f"{output_stem}.csv")
 
         write_summary_csv(csv_out, fold_rows, mean_row, std_row)
-        write_latex(tex_out, title, fold_rows, mean_row, std_row, dataset_name)
-        if len(target_roots) == 1:
-            build_pdf(tex_out, pdf_out)
 
     if len(target_roots) == 1:
         maybe_write_sample_visualization(
@@ -2072,13 +2967,7 @@ def main() -> None:
     if len(experiment_mean_rows) >= 1:
         unique_rows: Dict[Tuple, Dict[str, object]] = {}
         for row in experiment_mean_rows:
-            key = (
-                row["dataset"],
-                row["experiment"],
-                row["conn_num"],
-                row["loss"],
-                row["fold_scope"],
-            )
+            key = _experiment_mean_unique_key(row)
             unique_rows[key] = row
         experiment_mean_rows = list(unique_rows.values())
 
@@ -2086,36 +2975,45 @@ def main() -> None:
             experiment_mean_rows,
             key=experiment_sort_key,
         )
-        agg_stem = f"{args.output_stem}_experiment_means"
-        agg_csv_out = os.path.join(dump_dir, f"{agg_stem}.csv")
-        agg_tex_out = os.path.join(dump_dir, f"{agg_stem}.tex")
+        aggregate_rows = filter_rows_for_aggregate_scope(
+            experiment_mean_rows,
+            include_all=args.all,
+        )
+        if len(aggregate_rows) == 0:
+            scope_label = "all counted datasets" if args.all else "default dataset scope"
+            print(f"[WARN] No aggregate rows matched {scope_label}; skipping combined outputs.")
+            return
 
-        write_experiment_mean_csv(agg_csv_out, experiment_mean_rows)
+        agg_stem = aggregate_output_stem(args.output_stem, include_all=args.all)
+        agg_csv_out = os.path.join(dump_csv_dir, f"{agg_stem}.csv")
+        agg_tex_out = os.path.join(dump_dir, f"{agg_stem}.tex")
+        log_prefix = "[ALL]" if args.all else "[DEFAULT]"
+
+        write_experiment_mean_csv(agg_csv_out, aggregate_rows)
         write_experiment_mean_latex(
             agg_tex_out,
             "Cross-experiment Mean Summary",
-            experiment_mean_rows,
+            aggregate_rows,
         )
 
-        print(f"[ALL] CSV: {agg_csv_out}")
-        print(f"[ALL] LaTeX: {agg_tex_out}")
+        print(f"{log_prefix} CSV: {agg_csv_out}")
+        print(f"{log_prefix} LaTeX: {agg_tex_out}")
 
         rows_by_dataset: Dict[str, List[Dict[str, object]]] = {}
-        for row in experiment_mean_rows:
+        for row in aggregate_rows:
             dataset_name = str(row.get("dataset", "unknown_dataset"))
+            if not _is_counted_dataset_name(dataset_name):
+                continue
             rows_by_dataset.setdefault(dataset_name, []).append(row)
 
         for dataset_name, dataset_rows in sorted(
             rows_by_dataset.items(),
-            key=lambda item: natural_sort_key(item[0]),
+            key=lambda item: _dataset_group_sort_key(item[0]),
         ):
             dataset_suffix = sanitize_scope_name_for_filename(dataset_name)
-            dataset_csv_out = os.path.join(dump_dir, f"{agg_stem}_{dataset_suffix}.csv")
-            dataset_csv_summary_out = os.path.join(args.output_dir, f"{agg_stem}_{dataset_suffix}.csv")
+            dataset_csv_out = os.path.join(dump_csv_dir, f"{agg_stem}_{dataset_suffix}.csv")
             write_experiment_mean_csv(dataset_csv_out, dataset_rows)
-            write_experiment_mean_csv(dataset_csv_summary_out, dataset_rows)
-            print(f"[ALL:{dataset_name}] CSV: {dataset_csv_out}")
-            print(f"[ALL:{dataset_name}] CSV (summary): {dataset_csv_summary_out}")
+            print(f"{log_prefix}:{dataset_name} CSV: {dataset_csv_out}")
 
         if len(rows_by_dataset) >= 1:
             dataset_tex_out = os.path.join(dump_dir, f"{agg_stem}_datasets.tex")
@@ -2128,16 +3026,18 @@ def main() -> None:
             )
             build_pdf(dataset_tex_out, dataset_pdf_out)
 
-            print(f"[ALL:DATASETS] LaTeX: {dataset_tex_out}")
-            print(f"[ALL:DATASETS] PDF: {dataset_pdf_out}")
+            print(f"{log_prefix}:DATASETS LaTeX: {dataset_tex_out}")
+            print(f"{log_prefix}:DATASETS PDF: {dataset_pdf_out}")
 
             ablation_tex_out = os.path.join(dump_dir, f"{agg_stem}_ablation.tex")
             ablation_pdf_out = os.path.join(args.output_dir, f"{agg_stem}_ablation.pdf")
-            write_ablation_latex(ablation_tex_out, experiment_mean_rows)
+            write_ablation_latex(ablation_tex_out, aggregate_rows)
             build_pdf(ablation_tex_out, ablation_pdf_out)
 
-            print(f"[ALL:ABLATION] LaTeX: {ablation_tex_out}")
-            print(f"[ALL:ABLATION] PDF: {ablation_pdf_out}")
+            print(f"{log_prefix}:ABLATION LaTeX: {ablation_tex_out}")
+            print(f"{log_prefix}:ABLATION PDF: {ablation_pdf_out}")
+
+            remove_legacy_duplicate_aggregate_pdfs(args.output_dir, agg_stem)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ Usage:
 
 Options:
   --all   Include GPU compute processes that are not train.py.
+  --short Print only the active-process table; skip schedule status.
   -h, --help
 EOF
 }
@@ -44,12 +45,62 @@ build_experiment_name() {
   local label_mode="$1"
   local conn_num="$2"
   local dist_aux_loss="$3"
+  local conn_layout="$4"
+  local conn_fusion="$5"
+  local fusion_loss_profile="$6"
+  local use_seg_aux="${7:-0}"
+  local seg_aux_weight="${8:-0.3}"
+  local fusion_residual_scale="${9:-0.2}"
   local base_name
+  local layout_suffix=""
 
-  if [[ "${label_mode}" == "binary" ]]; then
-    base_name="binary_${conn_num}_bce"
+  if [[ -z "${conn_layout}" ]]; then
+    if [[ "${conn_num}" == "24" ]]; then
+      conn_layout="full24"
+    else
+      conn_layout="standard8"
+    fi
+  fi
+  if [[ "${conn_num}" == "8" && "${conn_layout}" != "standard8" ]]; then
+    layout_suffix="_${conn_layout}"
+  fi
+
+  if [[ -z "${conn_fusion}" ]]; then
+    conn_fusion="none"
+  fi
+  if [[ -z "${fusion_loss_profile}" ]]; then
+    fusion_loss_profile="A"
+  fi
+
+  if [[ "${conn_fusion}" == "none" ]]; then
+    if [[ "${label_mode}" == "binary" ]]; then
+      base_name="binary_${conn_num}${layout_suffix}_bce"
+    else
+      base_name="${label_mode}_${conn_num}${layout_suffix}_${dist_aux_loss}"
+    fi
   else
-    base_name="${label_mode}_${conn_num}_${dist_aux_loss}"
+    local fusion_tag="${conn_fusion}_${fusion_loss_profile}"
+    if [[ "${conn_fusion}" == "scaled_sum" ]]; then
+      local scale_str
+      scale_str="$(awk -v s="${fusion_residual_scale}" 'BEGIN { printf "%.6f", s + 0 }' | sed -E 's/0+$//; s/\.$//')"
+      fusion_tag="${fusion_tag}_rs${scale_str}"
+    fi
+    if [[ "${label_mode}" == "binary" ]]; then
+      base_name="binary_${fusion_tag}_${conn_num}${layout_suffix}_bce"
+    else
+      base_name="${label_mode}_${fusion_tag}_${conn_num}${layout_suffix}_${dist_aux_loss}"
+    fi
+  fi
+
+  if [[ "${use_seg_aux}" == "1" ]]; then
+    # Keep suffix policy consistent with train.py/get_experiment_output_name():
+    # - default (0.3): _segaux
+    # - non-default:   _segaux_w<weight>
+    if awk -v w="${seg_aux_weight}" 'BEGIN { d=w-0.3; if (d<0) d=-d; exit (d <= 1e-6) ? 0 : 1 }'; then
+      base_name="${base_name}_segaux"
+    else
+      base_name="${base_name}_segaux_w${seg_aux_weight}"
+    fi
   fi
 
   printf '%s' "${base_name}"
@@ -58,23 +109,113 @@ build_experiment_name() {
 parse_experiment_name_fields() {
   local experiment_name="$1"
   local base_name
-  local label_mode conn_num dist_aux_loss
+  local label_mode conn_num conn_layout dist_aux_loss conn_fusion fusion_loss_profile
 
   base_name="${experiment_name}"
 
-  if [[ "${base_name}" =~ ^binary_([0-9]+)_bce$ ]]; then
+  # Strip SegAux suffixes so metadata parsing stays stable.
+  # Examples:
+  # - dist_inverted_8_smooth_l1_segaux
+  # - dist_inverted_8_smooth_l1_segaux_w0.5
+  if [[ "${base_name}" =~ ^(.+)_segaux_w([0-9.eE+-]+)$ ]]; then
+    base_name="${BASH_REMATCH[1]}"
+  elif [[ "${base_name}" =~ ^(.+)_segaux$ ]]; then
+    base_name="${BASH_REMATCH[1]}"
+  fi
+
+  if [[ "${base_name}" =~ ^binary_([A-Za-z0-9_]+)_([ABC])_rs([0-9]*\.?[0-9]+)_([0-9]+)(_([A-Za-z0-9]+))?_bce$ ]]; then
     label_mode="binary"
-    conn_num="${BASH_REMATCH[1]}"
+    conn_fusion="${BASH_REMATCH[1]}"
+    fusion_loss_profile="${BASH_REMATCH[2]}"
+    conn_num="${BASH_REMATCH[4]}"
+    conn_layout="${BASH_REMATCH[6]}"
+    if [[ -z "${conn_layout}" ]]; then
+      conn_layout="standard8"
+    fi
     dist_aux_loss="smooth_l1"
-    printf '%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
     return 0
   fi
 
-  if [[ "${base_name}" =~ ^(.+)_([0-9]+)_(.+)$ ]]; then
+  if [[ "${base_name}" =~ ^binary_([A-Za-z0-9_]+)_([ABC])_([0-9]+)(_([A-Za-z0-9]+))?_bce$ ]]; then
+    label_mode="binary"
+    conn_fusion="${BASH_REMATCH[1]}"
+    fusion_loss_profile="${BASH_REMATCH[2]}"
+    conn_num="${BASH_REMATCH[3]}"
+    conn_layout="${BASH_REMATCH[5]}"
+    if [[ -z "${conn_layout}" ]]; then
+      conn_layout="standard8"
+    fi
+    dist_aux_loss="smooth_l1"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
+    return 0
+  fi
+
+  if [[ "${base_name}" =~ ^binary_([0-9]+)(_([A-Za-z0-9]+))?_bce$ ]]; then
+    label_mode="binary"
+    conn_fusion="none"
+    fusion_loss_profile="A"
+    conn_num="${BASH_REMATCH[1]}"
+    conn_layout="${BASH_REMATCH[3]}"
+    if [[ -z "${conn_layout}" ]]; then
+      conn_layout="standard8"
+    fi
+    dist_aux_loss="smooth_l1"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
+    return 0
+  fi
+
+  if [[ "${base_name}" =~ ^(dist|dist_inverted)_([A-Za-z0-9_]+)_([ABC])_rs([0-9]*\.?[0-9]+)_([0-9]+)(_([A-Za-z0-9]+))?_(.+)$ ]]; then
     label_mode="${BASH_REMATCH[1]}"
+    conn_fusion="${BASH_REMATCH[2]}"
+    fusion_loss_profile="${BASH_REMATCH[3]}"
+    conn_num="${BASH_REMATCH[5]}"
+    conn_layout="${BASH_REMATCH[7]}"
+    if [[ -z "${conn_layout}" ]]; then
+      if [[ "${conn_num}" == "24" ]]; then
+        conn_layout="full24"
+      else
+        conn_layout="standard8"
+      fi
+    fi
+    dist_aux_loss="${BASH_REMATCH[8]}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
+    return 0
+  fi
+
+  if [[ "${base_name}" =~ ^(dist|dist_inverted)_([A-Za-z0-9_]+)_([ABC])_([0-9]+)(_([A-Za-z0-9]+))?_(.+)$ ]]; then
+    label_mode="${BASH_REMATCH[1]}"
+    conn_fusion="${BASH_REMATCH[2]}"
+    fusion_loss_profile="${BASH_REMATCH[3]}"
+    conn_num="${BASH_REMATCH[4]}"
+    conn_layout="${BASH_REMATCH[6]}"
+    if [[ -z "${conn_layout}" ]]; then
+      if [[ "${conn_num}" == "24" ]]; then
+        conn_layout="full24"
+      else
+        conn_layout="standard8"
+      fi
+    fi
+    dist_aux_loss="${BASH_REMATCH[7]}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
+    return 0
+  fi
+
+  if [[ "${base_name}" =~ ^(.+)_([0-9]+)(_([A-Za-z0-9]+))?_(.+)$ ]]; then
+    label_mode="${BASH_REMATCH[1]}"
+    conn_fusion="none"
+    fusion_loss_profile="A"
     conn_num="${BASH_REMATCH[2]}"
-    dist_aux_loss="${BASH_REMATCH[3]}"
-    printf '%s\t%s\t%s' "${label_mode}" "${conn_num}" "${dist_aux_loss}"
+    conn_layout="${BASH_REMATCH[4]}"
+    if [[ -z "${conn_layout}" ]]; then
+      if [[ "${conn_num}" == "24" ]]; then
+        conn_layout="full24"
+      else
+        conn_layout="standard8"
+      fi
+    fi
+    dist_aux_loss="${BASH_REMATCH[5]}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s' "${label_mode}" "${conn_num}" "${conn_layout}" "${dist_aux_loss}" "${conn_fusion}" "${fusion_loss_profile}"
     return 0
   fi
 
@@ -147,13 +288,24 @@ format_duration_hms() {
   fi
 }
 
+format_finish_time_from_epoch() {
+  local finish_epoch="$1"
+  local formatted
+  if ! formatted="$(date -d "@${finish_epoch}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)"; then
+    if ! formatted="$(date -r "${finish_epoch}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)"; then
+      formatted="n/a"
+    fi
+  fi
+  printf '%s' "${formatted}"
+}
+
 compute_eta_fields() {
   local csv_path="$1"
   local total_epochs_raw="$2"
   local parsed rc marker last_epoch elapsed_sec valid_rows total_epochs remaining_epochs eta_sec now_epoch finish_epoch eta_duration eta_finish eta_status progress
 
   if [[ ! -r "${csv_path}" ]]; then
-    printf 'n/a\tn/a\tn/a\tno_csv'
+    printf 'n/a\tn/a\tn/a\tno_csv\tn/a'
     return 0
   fi
 
@@ -213,13 +365,13 @@ compute_eta_fields() {
     rc=$?
     case "${rc}" in
       10)
-        printf 'n/a\tn/a\tn/a\tmissing_cols'
+        printf 'n/a\tn/a\tn/a\tmissing_cols\tn/a'
         ;;
       11)
-        printf 'n/a\tn/a\tn/a\tno_valid_rows'
+        printf 'n/a\tn/a\tn/a\tno_valid_rows\tn/a'
         ;;
       *)
-        printf 'n/a\tn/a\tn/a\tparse_error'
+        printf 'n/a\tn/a\tn/a\tparse_error\tn/a'
         ;;
     esac
     return 0
@@ -227,11 +379,11 @@ compute_eta_fields() {
 
   IFS=',' read -r marker last_epoch elapsed_sec valid_rows <<< "${parsed}"
   if [[ "${marker}" != "OK" ]] || [[ -z "${last_epoch}" ]] || [[ -z "${elapsed_sec}" ]]; then
-    printf 'n/a\tn/a\tn/a\tparse_error'
+    printf 'n/a\tn/a\tn/a\tparse_error\tn/a'
     return 0
   fi
   if ((last_epoch <= 0)); then
-    printf 'n/a\tn/a\tn/a\tinvalid_epoch'
+    printf 'n/a\tn/a\tn/a\tinvalid_epoch\tn/a'
     return 0
   fi
 
@@ -255,14 +407,10 @@ compute_eta_fields() {
 
   now_epoch="$(date +%s)"
   finish_epoch=$((now_epoch + eta_sec))
-  if ! eta_finish="$(date -d "@${finish_epoch}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)"; then
-    if ! eta_finish="$(date -r "${finish_epoch}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)"; then
-      eta_finish="n/a"
-    fi
-  fi
+  eta_finish="$(format_finish_time_from_epoch "${finish_epoch}")"
 
   progress="${last_epoch}/${total_epochs}"
-  printf '%s\t%s\t%s\t%s' "${progress}" "${eta_duration}" "${eta_finish}" "${eta_status}"
+  printf '%s\t%s\t%s\t%s\t%s' "${progress}" "${eta_duration}" "${eta_finish}" "${eta_status}" "${eta_sec}"
 }
 
 extract_flag() {
@@ -292,6 +440,35 @@ extract_flag() {
   done
 
   printf '%s' "${default_value}"
+}
+
+has_flag() {
+  local key="$1"
+  shift
+
+  local -a argv=("$@")
+  local token
+  local long_key="--${key}"
+  local long_key_with_equal="--${key}="
+  local value
+
+  for token in "${argv[@]}"; do
+    if [[ "${token}" == "${long_key}" ]]; then
+      return 0
+    fi
+    if [[ "${token}" == "${long_key_with_equal}"* ]]; then
+      value="${token#${long_key_with_equal}}"
+      case "${value}" in
+        0|false|False|FALSE|no|off)
+          return 1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+    fi
+  done
+  return 1
 }
 
 is_train_py_process() {
@@ -442,6 +619,12 @@ try:
             conn_num=conn_num,
             label_mode=label_mode,
             dist_aux_loss=dist_aux_loss,
+            conn_layout=run.get("conn_layout"),
+            conn_fusion=run.get("conn_fusion", "none"),
+            fusion_loss_profile=run.get("fusion_loss_profile", "A"),
+            fusion_residual_scale=float(run.get("fusion_residual_scale", 0.2)),
+            use_seg_aux=bool(run.get("use_seg_aux", False)),
+            seg_aux_weight=float(run.get("seg_aux_weight", 0.3)),
         )
         output_dir = str(run.get("output_dir", config.get("output_dir", "output")))
         target_fold = run.get("target_fold")
@@ -567,6 +750,12 @@ print_schedule_status_for_config() {
   echo "Schedule status (${resolved_config_path}):"
   echo "Remaining/Total: ${remaining_experiments}/${total_experiments} (running=${running_experiments}, completed=${completed_experiments})"
 
+  if ((running_experiments > 0)); then
+    CONFIG_CURRENT_PLUS_REMAINING_COUNT["${resolved_config_path}"]=$((remaining_experiments + 1))
+  else
+    CONFIG_CURRENT_PLUS_REMAINING_COUNT["${resolved_config_path}"]="${remaining_experiments}"
+  fi
+
   if ((remaining_experiments > 0)); then
     {
       printf 'DATASET\tEXPERIMENT\tTARGET_FOLD\n'
@@ -586,10 +775,15 @@ print_schedule_status_for_config() {
 }
 
 INCLUDE_ALL=0
+SHORT=0
 while (($#)); do
   case "$1" in
     --all)
       INCLUDE_ALL=1
+      shift
+      ;;
+    --short)
+      SHORT=1
       shift
       ;;
     -h|--help)
@@ -629,9 +823,13 @@ while IFS=',' read -r raw_index raw_uuid; do
 done <<< "${GPU_QUERY}"
 
 declare -a rows=()
+declare -a row_keys=()
 declare -A seen_pid_gpu=()
 declare -A running_schedule_keys=()
 declare -A inferred_config_paths=()
+declare -A CONFIG_CURRENT_PLUS_REMAINING_COUNT=()
+declare -A ROW_CONFIG_PATH=()
+declare -A ROW_ETA_SEC=()
 train_process_count=0
 
 while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
@@ -668,8 +866,17 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
 
   dataset="$(extract_flag "dataset" "retouch-Spectrailis" "${argv[@]}")"
   conn_num="$(extract_flag "conn_num" "8" "${argv[@]}")"
+  conn_layout="$(extract_flag "conn_layout" "" "${argv[@]}")"
+  conn_fusion="$(extract_flag "conn_fusion" "none" "${argv[@]}")"
+  fusion_loss_profile="$(extract_flag "fusion_loss_profile" "A" "${argv[@]}")"
+  fusion_residual_scale="$(extract_flag "fusion_residual_scale" "0.2" "${argv[@]}")"
   label_mode="$(extract_flag "label_mode" "binary" "${argv[@]}")"
   dist_aux_loss="$(extract_flag "dist_aux_loss" "smooth_l1" "${argv[@]}")"
+  use_seg_aux="0"
+  if has_flag "use_seg_aux" "${argv[@]}"; then
+    use_seg_aux="1"
+  fi
+  seg_aux_weight="$(extract_flag "seg_aux_weight" "0.3" "${argv[@]}")"
   target_fold="$(extract_flag "target_fold" "" "${argv[@]}")"
   epochs="$(extract_flag "epochs" "45" "${argv[@]}")"
   output_dir_raw="$(extract_flag "output_dir" "output/" "${argv[@]}")"
@@ -682,29 +889,31 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
   else
     output_base="${REPO_ROOT}/${output_dir_norm}"
   fi
-  experiment_name="$(build_experiment_name "${label_mode}" "${conn_num}" "${dist_aux_loss}")"
+  experiment_name="$(build_experiment_name "${label_mode}" "${conn_num}" "${dist_aux_loss}" "${conn_layout}" "${conn_fusion}" "${fusion_loss_profile}" "${use_seg_aux}" "${seg_aux_weight}" "${fusion_residual_scale}")"
   results_csv="$(resolve_results_csv_path "${output_base}" "${dataset}" "${experiment_name}")"
 
   if [[ -r "${results_csv}" ]]; then
     experiment_name_from_path="$(basename -- "$(dirname -- "${results_csv}")")"
     if parsed_experiment_fields="$(parse_experiment_name_fields "${experiment_name_from_path}")"; then
-      IFS=$'\t' read -r label_mode conn_num dist_aux_loss <<< "${parsed_experiment_fields}"
+      IFS=$'\t' read -r label_mode conn_num conn_layout dist_aux_loss conn_fusion fusion_loss_profile <<< "${parsed_experiment_fields}"
       experiment_name="${experiment_name_from_path}"
     fi
   fi
 
   eta_fields="$(compute_eta_fields "${results_csv}" "${epochs}")"
-  IFS=$'\t' read -r epoch_progress eta_duration eta_finish eta_status <<< "${eta_fields}"
+  IFS=$'\t' read -r epoch_progress eta_duration eta_finish eta_status eta_sec_raw <<< "${eta_fields}"
 
   if [[ -z "${device}" ]]; then
     device="${gpu_index}"
   fi
 
-  printf -v row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf -v row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${pid}" \
     "${gpu_index}" \
     "${dataset}" \
     "${conn_num}" \
+    "${conn_fusion}" \
+    "${fusion_loss_profile}" \
     "${label_mode}" \
     "${dist_aux_loss}" \
     "${device}" \
@@ -714,17 +923,24 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
     "${eta_finish}" \
     "${eta_status}"
   rows+=("${row}")
+  row_keys+=("${key}")
+  ROW_ETA_SEC["${key}"]="${eta_sec_raw}"
   if ((is_train_process == 1)); then
     running_schedule_keys["${dataset}|${experiment_name}|${target_fold}"]=1
+    row_config_path=""
 
     while IFS= read -r inferred_config_path; do
       [[ -n "${inferred_config_path}" ]] || continue
+      if [[ -z "${row_config_path}" ]]; then
+        row_config_path="${inferred_config_path}"
+      fi
       inferred_config_paths["${inferred_config_path}"]=1
     done < <(collect_launcher_config_paths_from_ancestors "${pid}")
+    ROW_CONFIG_PATH["${key}"]="${row_config_path}"
   fi
 done <<< "${PROC_QUERY}"
 
-if ((train_process_count > 0)); then
+if ((SHORT == 0)) && ((train_process_count > 0)); then
   if ((${#inferred_config_paths[@]} == 0)); then
     echo
     echo "[INFO] Could not infer launcher config from active train.py process ancestry."
@@ -746,9 +962,48 @@ if ((${#rows[@]} == 0)); then
   fi
 else
   echo
+  rendered_rows=()
+  for idx in "${!rows[@]}"; do
+    row="${rows[idx]}"
+    row_key="${row_keys[idx]}"
+    IFS=$'\t' read -r pid gpu dataset conn_num conn_fusion fusion_loss_profile label_mode dist_aux_loss device gpu_mem_mb epoch_progress eta_duration eta_finish eta_status <<< "${row}"
+    eta_finish_total="n/a"
+
+    row_config_path="${ROW_CONFIG_PATH["${row_key}"]:-}"
+    eta_sec_raw="${ROW_ETA_SEC["${row_key}"]:-n/a}"
+    remaining_count=""
+    if [[ -n "${row_config_path}" ]]; then
+      remaining_count="${CONFIG_CURRENT_PLUS_REMAINING_COUNT["${row_config_path}"]:-}"
+    fi
+
+    if [[ "${eta_sec_raw}" =~ ^[0-9]+$ ]] && [[ "${remaining_count}" =~ ^[0-9]+$ ]] && ((remaining_count > 0)); then
+      total_eta_sec=$((eta_sec_raw * remaining_count))
+      finish_epoch_total=$(( $(date +%s) + total_eta_sec ))
+      eta_finish_total="$(format_finish_time_from_epoch "${finish_epoch_total}")"
+    fi
+
+    printf -v rendered_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "${pid}" \
+      "${gpu}" \
+      "${dataset}" \
+      "${conn_num}" \
+      "${conn_fusion}" \
+      "${fusion_loss_profile}" \
+      "${label_mode}" \
+      "${dist_aux_loss}" \
+      "${device}" \
+      "${gpu_mem_mb}" \
+      "${epoch_progress}" \
+      "${eta_duration}" \
+      "${eta_finish}" \
+      "${eta_finish_total}" \
+      "${eta_status}"
+    rendered_rows+=("${rendered_row}")
+  done
+
   {
-    printf 'PID\tGPU\tDATASET\tCONN_NUM\tLABEL_MODE\tDIST_AUX_LOSS\tDEVICE\tGPU_MEM_MB\tEPOCH_PROGRESS\tETA_DURATION\tETA_FINISH\tETA_STATUS\n'
-    printf '%s\n' "${rows[@]}"
+    printf 'PID\tGPU\tDATASET\tCONN_NUM\tCONN_FUSION\tFUSION_LOSS_PROFILE\tLABEL_MODE\tDIST_AUX_LOSS\tDEVICE\tGPU_MEM_MB\tEPOCH_PROGRESS\tETA_DURATION\tETA_FINISH\tETA_FINISH_TOTAL\tETA_STATUS\n'
+    printf '%s\n' "${rendered_rows[@]}"
   } | {
     if command -v column >/dev/null 2>&1; then
       column -t -s $'\t'
