@@ -111,7 +111,7 @@ def test_non_chase_dist_mode_computes_bicon(monkeypatch):
 
 def test_cl_dice_dist_mode_uses_stable_affinity_and_bicon_terms(monkeypatch):
     _patch_cuda_to_noop(monkeypatch)
-    module = _make_loss_module(dataset='isic', dist_aux_loss='cl_dice')
+    module = _make_loss_module(dataset='isic', dist_aux_loss='cl_dice', size=8)
     affinity_map = torch.zeros((1, 8, 8, 8), dtype=torch.float32)
     target = torch.zeros((1, 1, 8, 8), dtype=torch.float32)
     target[:, :, 2:6, 2:6] = 0.8

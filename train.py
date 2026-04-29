@@ -15,6 +15,7 @@ from skimage.io import imread, imsave
 from torch.autograd import Variable
 from torchvision import datasets, transforms
 
+from connect_loss import is_default_connectivity_layout, normalize_conn_layout, resolve_connectivity_layout
 from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE, MyDataset_OCTA500
 from data_loader.GetDataset_CREMI import getdataset_cremi
 from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
@@ -24,10 +25,34 @@ from solver import Solver
 
 
 def get_experiment_output_name(args):
-    if args.label_mode == 'binary':
-        base_name = f'binary_{args.conn_num}_bce'
+    layout_suffix = ''
+    if not is_default_connectivity_layout(args.conn_num, args.conn_layout):
+        layout_suffix = f'_{args.conn_layout}'
+
+    conn_fusion = str(getattr(args, 'conn_fusion', 'none'))
+    if conn_fusion == 'none':
+        if args.label_mode == 'binary':
+            base_name = f'binary_{args.conn_num}{layout_suffix}_bce'
+        else:
+            base_name = f"{args.label_mode}_{args.conn_num}{layout_suffix}_{args.dist_aux_loss}"
     else:
-        base_name = f"{args.label_mode}_{args.conn_num}_{args.dist_aux_loss}"
+        fusion_profile = str(getattr(args, 'fusion_loss_profile', 'A'))
+        fusion_tag = f'{conn_fusion}_{fusion_profile}'
+        if conn_fusion == 'scaled_sum':
+            residual_scale = float(getattr(args, 'fusion_residual_scale', 0.2))
+            scale_str = f"{residual_scale:.6f}".rstrip("0").rstrip(".")
+            fusion_tag = f'{fusion_tag}_rs{scale_str}'
+        if args.label_mode == 'binary':
+            base_name = f'binary_{fusion_tag}_{args.conn_num}{layout_suffix}_bce'
+        else:
+            base_name = f"{args.label_mode}_{fusion_tag}_{args.conn_num}{layout_suffix}_{args.dist_aux_loss}"
+
+    if getattr(args, 'use_seg_aux', False):
+        weight = getattr(args, 'seg_aux_weight', 0.3)
+        if weight != 0.3:
+            base_name = f"{base_name}_segaux_w{weight}"
+        else:
+            base_name = f"{base_name}_segaux"
 
     return base_name
 
@@ -109,6 +134,7 @@ def parse_args():
     parser.add_argument('--resize', type=int, default=[256, 256], nargs='+',
                         help='image size: [height, width]')
     parser.add_argument('--label_mode', type=str, default='binary',
+                        choices=['binary', 'dist', 'dist_inverted'],
                         help='label mode: binary, dist, dist_inverted')
 
     # network option & hyper-parameters
@@ -135,6 +161,36 @@ def parse_args():
                         help='1-based fold index to run; default runs all folds')
     parser.add_argument('--conn_num', type=int, default=8, choices=[8, 24],
                         help='the number of connections for DconnNet (supported: 8, 24)')
+    parser.add_argument('--conn_layout', type=str, default=None,
+                        choices=['standard8', 'full24', 'out8'],
+                        help='connectivity layout: default is standard8 for conn_num=8 and full24 for conn_num=24')
+    parser.add_argument('--conn_fusion', type=str, default='none',
+                        choices=['none', 'gate', 'scaled_sum', 'conv_residual', 'decoder_guided'],
+                        help='fork-specific directional fusion mode; none keeps legacy path')
+    parser.add_argument('--fusion_loss_profile', type=str, default='A',
+                        choices=['A', 'B', 'C'],
+                        help='fusion objective profile: A/B/C')
+    parser.add_argument('--fusion_lambda_inner', type=float, default=0.2,
+                        help='lambda for inner branch affinity term (profiles B/C)')
+    parser.add_argument('--fusion_lambda_outer', type=float, default=0.05,
+                        help='lambda for outer branch affinity term (profile C)')
+    parser.add_argument('--fusion_lambda_fused', type=float, default=0.3,
+                        help='lambda for fused branch affinity term')
+    parser.add_argument('--fusion_residual_scale', type=float, default=0.2,
+                        help='residual scale for conn_fusion=scaled_sum')
+
+    # New options for SegAux and DGRF
+    parser.add_argument('--use_seg_aux', action='store_true', default=False,
+                        help='Enable Segmentation Auxiliary Supervision')
+    parser.add_argument('--seg_aux_weight', type=float, default=0.3,
+                        help='weight for SegAux BCE loss')
+    parser.add_argument('--fusion_gate_reg_weight', type=float, default=0.01,
+                        help='weight for DGRF gate regularization loss')
+    parser.add_argument('--conn_aux_c3_weight', type=float, default=0.3,
+                        help='weight for auxiliary C3 loss when DGRF is enabled')
+    parser.add_argument('--conn_aux_c5_weight', type=float, default=0.2,
+                        help='weight for auxiliary C5 loss when DGRF is enabled')
+
     parser.add_argument('--tau', type=float, default=3.0,
                         help='the temperature parameter tau for the distance connectivity loss')
     parser.add_argument('--sigma', type=float, default=2.0,
@@ -186,6 +242,11 @@ def parse_args():
                         help='test only, please load the pretrained model')
     args = parser.parse_args()
 
+    try:
+        args.conn_layout = normalize_conn_layout(args.conn_num, args.conn_layout)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.output_dir:
         args.save = os.path.join(
             args.output_dir,
@@ -198,6 +259,21 @@ def parse_args():
     if args.target_fold is not None:
         if args.target_fold < 1 or args.target_fold > args.folds:
             parser.error('--target_fold must be within [1, --folds]')
+
+    if args.num_class != 1 and args.conn_layout != 'standard8':
+        parser.error('multi-class mode currently supports only conn_layout=standard8')
+    if args.conn_fusion != 'none':
+        if args.num_class != 1:
+            parser.error('conn_fusion currently supports only num_class=1')
+        if args.conn_num != 8:
+            parser.error('conn_fusion currently supports only conn_num=8')
+        if args.conn_layout != 'standard8':
+            parser.error('conn_fusion currently supports only conn_layout=standard8')
+
+    args.connectivity_layout = resolve_connectivity_layout(args.conn_num, args.conn_layout)
+    # Keep the CLI-level `conn_num` intact for layout resolution semantics and
+    # expose directional-channel count explicitly for downstream consumers.
+    args.conn_channels = args.connectivity_layout['channel_count']
 
     if args.early_stopping_patience < 0:
         parser.error('--early_stopping_patience must be >= 0')
@@ -342,6 +418,10 @@ def main(args):
     model = DconnNet(
         num_class=args.num_class,
         conn_num=args.conn_num,
+        conn_layout=args.conn_layout,
+        conn_fusion=args.conn_fusion,
+        fusion_residual_scale=args.fusion_residual_scale,
+        use_seg_aux=args.use_seg_aux,
     ).cuda()
 
     if args.pretrained:

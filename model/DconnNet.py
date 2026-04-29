@@ -22,17 +22,163 @@ from model.resnet import resnet34
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
+OUTER_8_NATIVE_ORDER = [
+    (-2, -2),
+    (-2, 0),
+    (-2, 2),
+    (0, -2),
+    (0, 2),
+    (2, -2),
+    (2, 0),
+    (2, 2),
+]
+
+OUTER_8_STANDARD_ORDER = [
+    (2, 2),
+    (2, 0),
+    (2, -2),
+    (0, 2),
+    (0, -2),
+    (-2, 2),
+    (-2, 0),
+    (-2, -2),
+]
+
+_OUTER_8_NATIVE_POS = {offset: idx for idx, offset in enumerate(OUTER_8_NATIVE_ORDER)}
+OUTER_8_TO_STANDARD8_INDEX = [_OUTER_8_NATIVE_POS[offset] for offset in OUTER_8_STANDARD_ORDER]
+
+
+def reorder_outer8_to_standard8(logits, index=OUTER_8_TO_STANDARD8_INDEX):
+    if logits.dim() != 4:
+        raise ValueError(f"Expected 4D logits tensor (B,C,H,W), got {logits.shape}")
+    if logits.shape[1] % 8 != 0:
+        raise ValueError(f"Channel dimension must be divisible by 8, got {logits.shape[1]}")
+
+    group_count = logits.shape[1] // 8
+    if group_count == 1:
+        return logits[:, index, :, :]
+
+    view = logits.view(logits.shape[0], group_count, 8, logits.shape[2], logits.shape[3])
+    gathered = view[:, :, index, :, :]
+    return gathered.reshape(logits.shape[0], logits.shape[1], logits.shape[2], logits.shape[3])
+
+
+def fuse_directional_logits(
+    c3_logits,
+    c5_aligned_logits,
+    mode,
+    residual_scale=0.2,
+    gate_conv=None,
+    residual_conv=None,
+):
+    if c3_logits.shape != c5_aligned_logits.shape:
+        raise ValueError(
+            f"Shape mismatch for fusion: c3={tuple(c3_logits.shape)}, c5={tuple(c5_aligned_logits.shape)}"
+        )
+
+    if mode == 'gate':
+        if gate_conv is None:
+            raise ValueError("gate_conv is required for mode='gate'")
+        alpha = torch.sigmoid(gate_conv(torch.cat([c3_logits, c5_aligned_logits], dim=1)))
+        return alpha * c3_logits + (1.0 - alpha) * c5_aligned_logits
+    if mode == 'scaled_sum':
+        return c3_logits + float(residual_scale) * c5_aligned_logits
+    if mode == 'conv_residual':
+        if residual_conv is None:
+            raise ValueError("residual_conv is required for mode='conv_residual'")
+        return c3_logits + residual_conv(c5_aligned_logits)
+    raise ValueError(f"Unsupported conn_fusion mode: {mode}")
+
+
+class DecoderGuidedResidualFusion(nn.Module):
+    def __init__(self, dec_ch, conn_ch=8, hidden_ch=64):
+        super().__init__()
+        in_ch = dec_ch + conn_ch + conn_ch
+
+        self.shared = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+        )
+
+        self.gate = nn.Sequential(
+            nn.Conv2d(hidden_ch, conn_ch, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        self.residual = nn.Conv2d(hidden_ch, conn_ch, kernel_size=1)
+
+    def forward(self, D, C3, C5):
+        if C3.shape != C5.shape:
+            raise ValueError(
+                f"C3 and C5 must have the same shape for decoder-guided residual fusion, "
+                f"got C3={C3.shape}, C5={C5.shape}"
+            )
+
+        if D.shape[-2:] != C3.shape[-2:]:
+            raise ValueError(
+                f"Decoder feature and connectivity maps must have the same spatial size, "
+                f"got D={D.shape}, C3={C3.shape}"
+            )
+
+        x = torch.cat([D, C3, C5], dim=1)
+        h = self.shared(x)
+        beta = self.gate(h)
+        residual = self.residual(h)
+        c_fused = C3 + beta * residual
+        return c_fused, beta
+
+
+class ConnectivitySegHead(nn.Module):
+    def __init__(self, dec_ch, conn_ch=8, hidden_ch=64):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(dec_ch + conn_ch, hidden_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, 1, kernel_size=1),
+        )
+
+    def forward(self, D, C_fused):
+        if D.shape[-2:] != C_fused.shape[-2:]:
+            raise ValueError(
+                f"Decoder feature and fused connectivity must have the same spatial size, "
+                f"got D={D.shape}, C_fused={C_fused.shape}"
+            )
+        x = torch.cat([D, C_fused], dim=1)
+        return self.head(x)
+
 
 class DconnNet(nn.Module):
-    def __init__(self, num_class=1, conn_num=8):
+    def __init__(
+        self,
+        num_class=1,
+        conn_num=8,
+        conn_layout=None,
+        conn_fusion='none',
+        fusion_residual_scale=0.2,
+        use_seg_aux=False,
+    ):
         super(DconnNet, self).__init__()
+        from connect_loss import resolve_connectivity_layout
 
         self.num_class = num_class
-        self.conn_num = conn_num
+        self.connectivity_layout = resolve_connectivity_layout(conn_num, conn_layout)
+        self.conn_num = self.connectivity_layout['channel_count']
+        self.conn_fusion = str(conn_fusion)
+        self.fusion_residual_scale = float(fusion_residual_scale)
+        self.use_seg_aux = use_seg_aux
 
-        out_planes = num_class * conn_num
+        allowed_fusion_modes = {'none', 'gate', 'scaled_sum', 'conv_residual', 'decoder_guided'}
+        if self.conn_fusion not in allowed_fusion_modes:
+            raise ValueError(
+                f"Unsupported conn_fusion mode: {self.conn_fusion} "
+                f"(supported: {sorted(allowed_fusion_modes)})"
+            )
+
+        out_planes = num_class * self.conn_num
         self.backbone = resnet34(pretrained=True)
-        self.sde_module = SDE_module(512, 512, out_planes, conn_num)
+        self.sde_module = SDE_module(512, 512, out_planes, self.conn_num)
         self.fb5 = FeatureBlock(512, 256, relu=False, last=True)  # 256
         self.fb4 = FeatureBlock(256, 128, relu=False)  # 128
         self.fb3 = FeatureBlock(128, 64, relu=False)  # 64
@@ -65,6 +211,27 @@ class DconnNet(nn.Module):
             # nn.BatchNorm2d(out_planes),
             # nn.ReLU(True)
         )
+
+        if self.conn_fusion != 'none':
+            if self.num_class != 1:
+                raise ValueError("conn_fusion currently supports only num_class=1")
+            if self.conn_num != 8:
+                raise ValueError("conn_fusion currently supports only conn_num=8")
+            if self.connectivity_layout['name'] != 'standard8':
+                raise ValueError("conn_fusion currently supports only conn_layout='standard8'")
+
+            self.cls_pred_inner_conv = nn.Conv2d(32, out_planes, 1)
+            self.cls_pred_outer_conv = nn.Conv2d(32, out_planes, 1)
+
+            if self.conn_fusion == 'gate':
+                self.fusion_gate_conv = nn.Conv2d(out_planes * 2, out_planes, 1)
+            elif self.conn_fusion == 'conv_residual':
+                self.fusion_residual_conv = nn.Conv2d(out_planes, out_planes, 1)
+            elif self.conn_fusion == 'decoder_guided':
+                self.decoder_guided_fusion = DecoderGuidedResidualFusion(dec_ch=32, conn_ch=out_planes, hidden_ch=64)
+
+        if self.use_seg_aux:
+            self.seg_head = ConnectivitySegHead(dec_ch=32, conn_ch=out_planes, hidden_ch=64)
 
     def forward(self, x):
 
@@ -108,10 +275,56 @@ class DconnNet(nn.Module):
 
         final_feat = self.final_decoder(feat_list)
 
+        if self.conn_fusion != 'none':
+            c3_logits = self.cls_pred_inner_conv(final_feat)
+            c3_logits = self.upsample4x_op(c3_logits)
+
+            c5_logits_native = self.cls_pred_outer_conv(final_feat)
+            c5_logits_native = self.upsample4x_op(c5_logits_native)
+            c5_logits_aligned = reorder_outer8_to_standard8(c5_logits_native)
+
+            if self.conn_fusion == 'decoder_guided':
+                final_feat_up = self.upsample4x_op(final_feat)
+                c_fused_logits, beta = self.decoder_guided_fusion(final_feat_up, c3_logits, c5_logits_aligned)
+            else:
+                c_fused_logits = fuse_directional_logits(
+                    c3_logits=c3_logits,
+                    c5_aligned_logits=c5_logits_aligned,
+                    mode=self.conn_fusion,
+                    residual_scale=self.fusion_residual_scale,
+                    gate_conv=getattr(self, 'fusion_gate_conv', None),
+                    residual_conv=getattr(self, 'fusion_residual_conv', None),
+                )
+
+            output_dict = {
+                'fused': c_fused_logits,
+                'inner': c3_logits,
+                'outer': c5_logits_native,
+                'outer_aligned': c5_logits_aligned,
+                'aux': mapped_c5,
+            }
+            if self.conn_fusion == 'decoder_guided':
+                output_dict['fusion_gate'] = beta
+
+            if getattr(self, 'use_seg_aux', False):
+                final_feat_up = self.upsample4x_op(final_feat)
+                output_dict['mask_logit'] = self.seg_head(final_feat_up, c_fused_logits)
+
+            return output_dict
+
         cls_pred = self.cls_pred_conv_2(final_feat)
         cls_pred = self.upsample4x_op(cls_pred)
 
-        return cls_pred, mapped_c5
+        output_dict = {
+            'fused': cls_pred,
+            'aux': mapped_c5,
+        }
+
+        if getattr(self, 'use_seg_aux', False):
+            final_feat_up = self.upsample4x_op(final_feat)
+            output_dict['mask_logit'] = self.seg_head(final_feat_up, cls_pred)
+
+        return output_dict
 
     def _initialize_weights(self):
         for m in self.modules():

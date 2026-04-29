@@ -23,6 +23,17 @@ CANONICAL_8_OFFSETS = [
     (-1, -1),
 ]
 
+OUTER_8_OFFSETS = [
+    (-2, -2),
+    (-2, 0),
+    (-2, 2),
+    (0, -2),
+    (0, 2),
+    (2, -2),
+    (2, 0),
+    (2, 2),
+]
+
 
 def build_center_excluding_offsets(radius):
     offsets = [
@@ -40,23 +51,64 @@ def build_center_excluding_offsets(radius):
 
 CONNECTIVITY_5X5_OFFSETS = build_center_excluding_offsets(radius=2)
 
+CONNECTIVITY_LAYOUTS = {
+    'standard8': {
+        'name': 'standard8',
+        'channel_count': 8,
+        'kernel_size': 3,
+        'include_center': False,
+        'offsets': CANONICAL_8_OFFSETS,
+    },
+    'full24': {
+        'name': 'full24',
+        'channel_count': 24,
+        'kernel_size': 5,
+        'include_center': False,
+        'offsets': CONNECTIVITY_5X5_OFFSETS,
+    },
+    'out8': {
+        'name': 'out8',
+        'channel_count': 8,
+        'kernel_size': 5,
+        'include_center': False,
+        'offsets': OUTER_8_OFFSETS,
+    },
+}
 
-def resolve_connectivity_layout(conn_num):
+
+def default_connectivity_layout_name(conn_num):
     if conn_num == 8:
-        return {
-            'conn_num': 8,
-            'kernel_size': 3,
-            'include_center': False,
-            'offsets': CANONICAL_8_OFFSETS,
-        }
+        return 'standard8'
     if conn_num == 24:
-        return {
-            'conn_num': 24,
-            'kernel_size': 5,
-            'include_center': False,
-            'offsets': CONNECTIVITY_5X5_OFFSETS,
-        }
+        return 'full24'
     raise ValueError(f"Unsupported conn_num {conn_num}, only 8 and 24 are supported")
+
+
+def normalize_conn_layout(conn_num, conn_layout=None):
+    layout_name = default_connectivity_layout_name(conn_num) if conn_layout is None else str(conn_layout)
+    if layout_name not in CONNECTIVITY_LAYOUTS:
+        raise ValueError(
+            f"Unsupported conn_layout {layout_name}, "
+            f"supported: {sorted(CONNECTIVITY_LAYOUTS)}"
+        )
+
+    if conn_num == 8 and layout_name not in {'standard8', 'out8'}:
+        raise ValueError("conn_num=8 supports only conn_layout in {'standard8', 'out8'}")
+    if conn_num == 24 and layout_name != 'full24':
+        raise ValueError("conn_num=24 supports only conn_layout='full24'")
+    return layout_name
+
+
+def resolve_connectivity_layout(conn_num, conn_layout=None):
+    layout_name = normalize_conn_layout(conn_num, conn_layout)
+    layout = dict(CONNECTIVITY_LAYOUTS[layout_name])
+    layout['conn_num'] = layout['channel_count']
+    layout['offsets'] = list(layout['offsets'])
+    return layout
+
+
+def is_default_connectivity_layout(conn_num, conn_layout):
+    return normalize_conn_layout(conn_num, conn_layout) == default_connectivity_layout_name(conn_num)
 
 
 def _shift_tensor(x, dy, dx):
@@ -126,34 +178,38 @@ def connectivity_matrix(multimask, class_num):
     return conn
 
 
-def connectivity_matrix_5x5(multimask, class_num):
-
-    ##### converting segmentation masks to 24-channel 5x5 directional affinity maps ####
+def connectivity_matrix_by_layout(multimask, class_num, conn_num, conn_layout=None):
+    layout = resolve_connectivity_layout(conn_num, conn_layout)
+    if layout['name'] == 'standard8':
+        return connectivity_matrix(multimask, class_num)
 
     [batch, _, rows, cols] = multimask.shape
-    offsets = resolve_connectivity_layout(24)['offsets']
+    offsets = layout['offsets']
     conn = torch.zeros([batch, class_num * len(offsets), rows, cols]).cuda()
     for i in range(class_num):
         mask = multimask[:, i:i + 1, :, :]
-        for channel_idx, shifted in enumerate(shift_n_directions(mask, 24)):
+        for channel_idx, shifted in enumerate(shift_n_directions(mask, conn_num, conn_layout=layout['name'])):
             conn[:, (i * len(offsets)) + channel_idx, :, :] = (mask * shifted).squeeze(1)
 
     conn = conn.float()
     conn = conn.squeeze()
-    # keep batch axis for batch-size 1 to avoid shape mismatch in downstream BCE
     if conn.dim() == 3:
         conn = conn.unsqueeze(0)
-    # print(conn.shape)
     return conn
 
 
-def shift_n_directions(x, conn_num):
+def connectivity_matrix_5x5(multimask, class_num):
+    ##### converting segmentation masks to 24-channel 5x5 directional affinity maps ####
+    return connectivity_matrix_by_layout(multimask, class_num, conn_num=24, conn_layout='full24')
+
+
+def shift_n_directions(x, conn_num, conn_layout=None):
     # x: (B, 1, H, W)
-    offsets = resolve_connectivity_layout(conn_num)['offsets']
+    offsets = resolve_connectivity_layout(conn_num, conn_layout)['offsets']
     return [_shift_tensor(x, dy, dx) for dy, dx in offsets]
 
 
-def distance_affinity_matrix(dist_map, conn_num, sigma=2.0):
+def distance_affinity_matrix(dist_map, conn_num, sigma=2.0, conn_layout=None):
     """
     dist_map : (B, H, W) distance map for each class
     return: (B, conn_num, H, W) directional affinity map for each class
@@ -170,7 +226,7 @@ def distance_affinity_matrix(dist_map, conn_num, sigma=2.0):
 
     D = dist_map.unsqueeze(1)  # (B,1,H,W)
 
-    neighbors_D = shift_n_directions(D, conn_num)
+    neighbors_D = shift_n_directions(D, conn_num, conn_layout=conn_layout)
 
     conn_list = []
     for D_k in neighbors_D:
@@ -267,36 +323,49 @@ def shift_map(x, hori_translation, verti_translation, dy, dx):
     return out
 
 
-def Bilateral_voting_kxk(affinity_map, hori_translation, verti_translation, conn_num=5, second_weight=1.0):
-    radius = conn_num // 2
-    # affinity_map: (B, C, K, H, W), K can be either (2r+1)^2-1 or (2r+1)^2
+def Bilateral_voting_kxk(
+    affinity_map,
+    hori_translation,
+    verti_translation,
+    conn_num=5,
+    second_weight=1.0,
+    offsets=None,
+):
+    # affinity_map: (B, C, K, H, W)
 
     B, C, K, H, W = affinity_map.shape
 
-    full_k = (2 * radius + 1) ** 2
-    without_center_k = full_k - 1
-    if K == full_k:
-        include_center = True
-    elif K == without_center_k:
-        include_center = False
+    if offsets is not None:
+        offsets = list(offsets)
     else:
-        raise ValueError(
-            f"affinity_map channel mismatch for conn_num={conn_num}: "
-            f"got K={K}, expected {without_center_k} or {full_k}"
-        )
+        # Legacy compatibility path: older call-sites infer offsets from
+        # kernel radius/conn_num. New layout-aware paths should pass offsets
+        # explicitly via resolve_connectivity_layout(...)[\"offsets\"].
+        radius = conn_num // 2
+        full_k = (2 * radius + 1) ** 2
+        without_center_k = full_k - 1
+        if K == full_k:
+            include_center = True
+        elif K == without_center_k:
+            include_center = False
+        else:
+            raise ValueError(
+                f"affinity_map channel mismatch for conn_num={conn_num}: "
+                f"got K={K}, expected {without_center_k} or {full_k}"
+            )
 
-    offsets = [
-        offset for offset in CANONICAL_8_OFFSETS
-        if abs(offset[0]) <= radius and abs(offset[1]) <= radius
-    ]
-    if include_center and (0, 0) not in offsets:
-        offsets.append((0, 0))
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if not include_center and dy == 0 and dx == 0:
-                continue
-            if (dy, dx) not in offsets:
-                offsets.append((dy, dx))
+        offsets = [
+            offset for offset in CANONICAL_8_OFFSETS
+            if abs(offset[0]) <= radius and abs(offset[1]) <= radius
+        ]
+        if include_center and (0, 0) not in offsets:
+            offsets.append((0, 0))
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if not include_center and dy == 0 and dx == 0:
+                    continue
+                if (dy, dx) not in offsets:
+                    offsets.append((dy, dx))
 
     if K != len(offsets):
         raise ValueError(f"Internal offset size mismatch: K={K}, offsets={len(offsets)}")
@@ -307,7 +376,10 @@ def Bilateral_voting_kxk(affinity_map, hori_translation, verti_translation, conn
 
     for dy, dx in offsets:
         idx = offset_to_idx[(dy, dx)]
-        rev_idx = offset_to_idx[(-dy, -dx)]
+        reverse_offset = (-dy, -dx)
+        if reverse_offset not in offset_to_idx:
+            raise ValueError(f"Missing reverse offset {reverse_offset} for offset {(dy, dx)}")
+        rev_idx = offset_to_idx[reverse_offset]
 
         rev_map = affinity_map[:, :, rev_idx].contiguous().view(-1, H, W)
         shifted_rev = shift_map(rev_map, hori_translation, verti_translation, dy, dx)
@@ -374,7 +446,18 @@ def density_weight(bin_wide, gt_cnt, density):
 
 
 class connect_loss(nn.Module):
-    def __init__(self, args, hori_translation, verti_translation, density=None, bin_wide=None, label_mode=None, conn_num=8, sigma=2.0):
+    def __init__(
+        self,
+        args,
+        hori_translation,
+        verti_translation,
+        density=None,
+        bin_wide=None,
+        label_mode=None,
+        conn_num=8,
+        sigma=2.0,
+        conn_layout=None,
+    ):
         super(connect_loss, self).__init__()
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
         self.BCEloss = nn.BCELoss(reduction='none')
@@ -387,7 +470,9 @@ class connect_loss(nn.Module):
         self.hori_translation = hori_translation
 
         self.label_mode = label_mode
-        self.conn_num = conn_num
+        self.layout = resolve_connectivity_layout(conn_num, conn_layout)
+        self.conn_layout = self.layout['name']
+        self.conn_num = self.layout['channel_count']
         self.sigma = sigma
         self.dist_aux_loss_name = getattr(self.args, 'dist_aux_loss', 'smooth_l1')
         self.dist_sf_l1_gamma = getattr(self.args, 'dist_sf_l1_gamma', 1.0)
@@ -465,10 +550,12 @@ class connect_loss(nn.Module):
         # Rebuild binary connectivity from the derived vessel mask before
         # computing the edge target. This keeps the edge definition aligned with
         # the binary path instead of reinterpreting raw distance affinity values.
-        if self.conn_num == 8:
-            binary_affinity_target = connectivity_matrix(mask_target, self.args.num_class)
-        else:
-            binary_affinity_target = connectivity_matrix_5x5(mask_target, self.args.num_class)
+        binary_affinity_target = connectivity_matrix_by_layout(
+            mask_target,
+            self.args.num_class,
+            conn_num=self.conn_num,
+            conn_layout=self.conn_layout,
+        )
         edge = self.binary_edge_target_from_affinity(binary_affinity_target)
         return self.edge_loss(vote_out, edge), edge
 
@@ -487,8 +574,8 @@ class connect_loss(nn.Module):
         # affinity_map: (B, 8*C, H, W), B: batch, C: class number
         # target: (B, H, W)
         #######
-        if self.conn_num != 8:
-            raise ValueError("multi-class mode currently supports only conn_num=8")
+        if self.layout['name'] != 'standard8':
+            raise ValueError("multi-class mode currently supports only conn_layout='standard8'")
         target = target.type(torch.LongTensor).cuda()
         batch_num = affinity_map.shape[0]
         onehotmask = F.one_hot(target.long(), self.args.num_class)  # change it to your class number if needed
@@ -552,18 +639,19 @@ class connect_loss(nn.Module):
 
         ### build directional affinity target ###
         if self.label_mode == 'binary':
-            if self.conn_num == 8:
-                con_target = connectivity_matrix(target, self.args.num_class)  # (B, 8, H, W)
-            elif self.conn_num == 24:
-                con_target = connectivity_matrix_5x5(target, self.args.num_class)  # (B, 24, H, W)
-            else:
-                raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 24 are supported")
+            con_target = connectivity_matrix_by_layout(
+                target,
+                self.args.num_class,
+                conn_num=self.conn_num,
+                conn_layout=self.conn_layout,
+            )
             affinity_target = con_target
         else:
             affinity_target = distance_affinity_matrix(
                 target,
                 conn_num=self.conn_num,
                 sigma=self.sigma,
+                conn_layout=self.conn_layout,
             )
 
         # matrix for shifting
@@ -582,13 +670,16 @@ class connect_loss(nn.Module):
         # pred: (B, 1, H, W) score map (distance score map in distance label_mode),
         # bicon_map: (B, 1, 8, H, W) directional affinity map
         class_pred = c_map.view([c_map.shape[0], self.args.num_class, self.conn_num, c_map.shape[2], c_map.shape[3]])
-        if self.conn_num == 8:
+        if self.layout['name'] == 'standard8':
             pred, bicon_map = Bilateral_voting(class_pred, hori_translation, verti_translation)
-        elif self.conn_num == 24:
-            kxk_size = resolve_connectivity_layout(self.conn_num)['kernel_size']
-            pred, bicon_map = Bilateral_voting_kxk(class_pred, hori_translation, verti_translation, conn_num=kxk_size)
         else:
-            raise ValueError(f"Unsupported conn_num {self.conn_num}, only 8 and 24 are supported")
+            pred, bicon_map = Bilateral_voting_kxk(
+                class_pred,
+                hori_translation,
+                verti_translation,
+                conn_num=self.layout['kernel_size'],
+                offsets=self.layout['offsets'],
+            )
 
         if self.label_mode == 'binary':
             edge = torch.where((sum_conn < self.conn_num) & (sum_conn > 0), torch.full_like(sum_conn, 1), torch.full_like(sum_conn, 0))

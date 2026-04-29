@@ -43,14 +43,17 @@ class MyDataset_CREMI(data.Dataset):
             raise FileNotFoundError(f'No CREMI image .npy files found in {img_path}')
 
         self.mask_ls = []
+        self.binary_mask_ls = []
         self.name_ls = []
         missing = []
         for img in self.img_ls:
             stem = os.path.splitext(os.path.basename(img))[0]
             mask = os.path.join(gt_path, stem + gt_suffix)
+            binary_mask = os.path.join(train_root, mode, 'labels', stem + '.npy')
             if not os.path.exists(mask):
                 missing.append(mask)
             self.mask_ls.append(mask)
+            self.binary_mask_ls.append(binary_mask)
             self.name_ls.append(stem)
 
         if missing:
@@ -66,6 +69,11 @@ class MyDataset_CREMI(data.Dataset):
         img = np.load(self.img_ls[index]).astype(np.float32)
         mask = np.load(self.mask_ls[index], allow_pickle=True).astype(np.float32)
 
+        if self.label_mode in ('dist', 'dist_inverted'):
+            binary_mask = np.load(self.binary_mask_ls[index], allow_pickle=True).astype(np.float32)
+        else:
+            binary_mask = mask.copy()
+
         if img.ndim != 2:
             raise ValueError(f'CREMI image must be 2D, got shape {img.shape} for {self.img_ls[index]}')
         if mask.ndim != 2:
@@ -74,20 +82,27 @@ class MyDataset_CREMI(data.Dataset):
         img = cv2.resize(img, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
         mask_interp = cv2.INTER_NEAREST if self.label_mode == 'binary' else cv2.INTER_LINEAR
         mask = cv2.resize(mask, (resize_w, resize_h), interpolation=mask_interp)
+        binary_mask = cv2.resize(binary_mask, (resize_w, resize_h), interpolation=cv2.INTER_NEAREST)
 
         img = np.stack([img, img, img], axis=0)
         img = _normalize_image_to_dconnnet(img)
         mask = np.expand_dims(mask, axis=0).astype(np.float32)
+        binary_mask = np.expand_dims(binary_mask, axis=0).astype(np.float32)
 
         if self.label_mode == 'binary':
             mask = (mask > 0.5).astype(np.float32)
+        binary_mask = (binary_mask > 0.5).astype(np.float32)
 
         img = torch.from_numpy(img)
         mask = torch.from_numpy(mask)
+        binary_mask = torch.from_numpy(binary_mask)
 
-        if self.train:
-            return img, mask
-        return img, mask, self.name_ls[index]
+        return {
+            'image': img,
+            'label': mask,
+            'binary_gt': binary_mask,
+            'name': self.name_ls[index]
+        }
 
     def __len__(self):
         return len(self.img_ls)

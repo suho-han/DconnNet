@@ -122,36 +122,52 @@ def default_loader(img_path, mask_path):
     return img, mask
 
 
-def default_DRIVE_loader(img_path, mask_path, resize_shape=(960, 960), train=False, label_mode='binary'):
+def default_DRIVE_loader(img_path, mask_path, binary_mask_path=None, resize_shape=(960, 960), train=False, label_mode='binary'):
     img = cv2.imread(img_path)
     img = cv2.resize(img, resize_shape)
     if label_mode == 'binary':
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        binary_mask = mask.copy()
     elif label_mode in ['dist', 'dist_inverted']:
         mask = np.load(mask_path, allow_pickle=True)
-    # mask = np.array(Image.open(mask_path))
-    # print(img.shape,mask.shape)
-    mask = cv2.resize(mask, resize_shape)
+        if binary_mask_path is not None:
+            binary_mask = cv2.imread(binary_mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            binary_mask = np.zeros_like(mask)
+
+    mask = cv2.resize(mask, resize_shape, interpolation=cv2.INTER_NEAREST if label_mode == 'binary' else cv2.INTER_LINEAR)
+    binary_mask = cv2.resize(binary_mask, resize_shape, interpolation=cv2.INTER_NEAREST)
+
     if train:
         img = randomHueSaturationValue(img, hue_shift_limit=(-30, 30), sat_shift_limit=(-5, 5), val_shift_limit=(-15, 15))
-
-        img, mask = randomShiftScaleRotate(img, mask, shift_limit=(-0.1, 0.1), scale_limit=(-0.1, 0.1), aspect_limit=(-0.1, 0.1), rotate_limit=(-0, 0))
-        img, mask = randomHorizontalFlip(img, mask)
-        img, mask = randomVerticleFlip(img, mask)
-        img, mask = randomRotate90(img, mask)
+        
+        # Combine masks to apply the same random transformation
+        combined_mask = np.stack([mask, binary_mask], axis=-1)
+        img, combined_mask = randomShiftScaleRotate(img, combined_mask, shift_limit=(-0.1, 0.1), scale_limit=(-0.1, 0.1), aspect_limit=(-0.1, 0.1), rotate_limit=(-0, 0))
+        img, combined_mask = randomHorizontalFlip(img, combined_mask)
+        img, combined_mask = randomVerticleFlip(img, combined_mask)
+        img, combined_mask = randomRotate90(img, combined_mask)
+        mask = combined_mask[..., 0]
+        binary_mask = combined_mask[..., 1]
 
     mask = np.expand_dims(mask, axis=2)
+    binary_mask = np.expand_dims(binary_mask, axis=2)
     img = np.array(img, np.float32).transpose(2, 0, 1) / 255.0 * 3.2 - 1.6
     mask = np.array(mask, np.float32).transpose(2, 0, 1)
+    binary_mask = np.array(binary_mask, np.float32).transpose(2, 0, 1)
+    
     if label_mode == 'binary':
         mask = mask / 255.0
         mask[mask >= 0.5] = 1
         mask[mask <= 0.5] = 0
     elif label_mode in ['dist', 'dist_inverted']:
-        # Distance maps are already normalized in [0, 1]; avoid extra /255 scaling.
         pass
-    # mask = abs(mask-1)
-    return img, mask
+    
+    binary_mask = binary_mask / 255.0
+    binary_mask[binary_mask >= 0.5] = 1
+    binary_mask[binary_mask <= 0.5] = 0
+
+    return img, mask, binary_mask
 
 
 class Normalize(object):
@@ -220,9 +236,11 @@ class MyDataset_CHASE(data.Dataset):
         self.label_mode = label_mode
         img_path = train_root+'/images/'
         gt_path = train_root+'/gt/'
+        binary_gt_path = train_root+'/gt/'
 
         img_ls = []
         mask_ls = []
+        binary_mask_ls = []
         name_ls = []
 
         if self.label_mode == 'binary':
@@ -241,21 +259,28 @@ class MyDataset_CHASE(data.Dataset):
 
             gt1 = gt_path+'Image_'+str(pat_id)+'L' + label_postfix
             gt2 = gt_path+'Image_'+str(pat_id)+'R' + label_postfix
+            
+            binary_gt1 = binary_gt_path+'Image_'+str(pat_id)+'L' + '_1stHO.png'
+            binary_gt2 = binary_gt_path+'Image_'+str(pat_id)+'R' + '_1stHO.png'
+
             name = str(pat_id)
             img_ls.append(img1)
             mask_ls.append(gt1)
+            binary_mask_ls.append(binary_gt1)
             name_ls.append(name+'L')
-            name_ls.append(name+'R')
+            
             img_ls.append(img2)
             mask_ls.append(gt2)
+            binary_mask_ls.append(binary_gt2)
+            name_ls.append(name+'R')
 
         self.train = train
         # print(file)
 
         self.name_ls = name_ls
         self.img_ls = img_ls
-
         self.mask_ls = mask_ls
+        self.binary_mask_ls = binary_mask_ls
 
         self.normalize = Normalize()
         self.randomcrop = RandomCrop()
@@ -265,17 +290,19 @@ class MyDataset_CHASE(data.Dataset):
 
     def __getitem__(self, index):
         resize_shape = tuple(self.args.resize[:2])
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
+        binary_mask_path = self.binary_mask_ls[index] if self.label_mode in ['dist', 'dist_inverted'] else None
+        img, mask, binary_mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], binary_mask_path, resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)
-        # mask = torch.where(mask>0.5,1,0)
-        # conn = connectivity_matrix(mask.unsqueeze(0))
-        # if self.args.resize:
-        #     img = Resize(img[0], None,512,512)
-        # print(img.shape,mask.shape,conn.shape)
-        # print(img.max())
-        return img.squeeze(0), mask, self.name_ls[index]
+        binary_mask = torch.Tensor(binary_mask)
+        
+        return {
+            'image': img.squeeze(0) if img.ndim == 4 else img,
+            'label': mask,
+            'binary_gt': binary_mask,
+            'name': self.name_ls[index]
+        }
 
     def __len__(self):
         return len(self.img_ls)
@@ -291,6 +318,7 @@ class MyDataset_DRIVE(data.Dataset):
 
         img_ls = []
         mask_ls = []
+        binary_mask_ls = []
         name_ls = []
 
         if self.label_mode == 'binary':
@@ -305,10 +333,13 @@ class MyDataset_DRIVE(data.Dataset):
         img_list = glob.glob(img_path+'*.tif')
         for img_id in img_list:
             img = img_path+str(img_id.split('/')[-1])
-            gt = gt_path+str(img_id.split('/')[-1].split('.tif')[0])+label_postfix
-            name = str(img_id.split('/')[-1].split('.tif')[0])
+            stem = str(img_id.split('/')[-1].split('.tif')[0])
+            gt = gt_path+stem+label_postfix
+            binary_gt = train_root+'/'+mode+'/masks/'+stem+'.gif'
+            name = stem
             img_ls.append(img)
             mask_ls.append(gt)
+            binary_mask_ls.append(binary_gt)
             name_ls.append(name)
 
         self.train = train
@@ -318,6 +349,7 @@ class MyDataset_DRIVE(data.Dataset):
         self.img_ls = img_ls
 
         self.mask_ls = mask_ls
+        self.binary_mask_ls = binary_mask_ls
 
         self.normalize = Normalize()
         self.randomcrop = RandomCrop()
@@ -327,17 +359,19 @@ class MyDataset_DRIVE(data.Dataset):
 
     def __getitem__(self, index):
         resize_shape = tuple(self.args.resize[:2])
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
+        binary_mask_path = self.binary_mask_ls[index] if self.label_mode in ['dist', 'dist_inverted'] else None
+        img, mask, binary_mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], binary_mask_path, resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)
-        # mask = torch.where(mask>0.5,1,0)
-        # conn = connectivity_matrix(mask.unsqueeze(0))
-        # if self.args.resize:
-        #     img = Resize(img[0], None,512,512)
-        # print(img.shape,mask.shape,conn.shape)
-        # print(img.max())
-        return img.squeeze(0), mask, self.name_ls[index]
+        binary_mask = torch.Tensor(binary_mask)
+        
+        return {
+            'image': img.squeeze(0) if img.ndim == 4 else img, # wait, default_DRIVE_loader returns (3, H, W). squeeze(0) is not needed. Actually previous code did img.squeeze(0), wait!
+            'label': mask,
+            'binary_gt': binary_mask,
+            'name': self.name_ls[index]
+        }
 
     def __len__(self):
         return len(self.img_ls)
@@ -350,9 +384,11 @@ class MyDataset_OCTA500(data.Dataset):
         self.label_mode = label_mode
         img_path = train_root+'/'+mode+'/images/'
         gt_path = train_root+'/'+mode+'/labels/'
+        binary_gt_path = train_root+'/'+mode+'/labels/'
 
         img_ls = []
         mask_ls = []
+        binary_mask_ls = []
         name_ls = []
 
         if self.label_mode == 'binary':
@@ -366,11 +402,14 @@ class MyDataset_OCTA500(data.Dataset):
 
         img_list = glob.glob(img_path+'*.bmp')
         for img_id in img_list:
+            stem = str(img_id.split('/')[-1].split('.bmp')[0])
             img = img_path+str(img_id.split('/')[-1])
-            gt = gt_path+str(img_id.split('/')[-1].split('.bmp')[0])+label_postfix
-            name = str(img_id.split('/')[-1].split('.bmp')[0])
+            gt = gt_path+stem+label_postfix
+            binary_gt = binary_gt_path+stem+'.bmp'
+            name = stem
             img_ls.append(img)
             mask_ls.append(gt)
+            binary_mask_ls.append(binary_gt)
             name_ls.append(name)
 
         self.train = train
@@ -378,8 +417,8 @@ class MyDataset_OCTA500(data.Dataset):
 
         self.name_ls = name_ls
         self.img_ls = img_ls
-
         self.mask_ls = mask_ls
+        self.binary_mask_ls = binary_mask_ls
 
         self.normalize = Normalize()
         self.randomcrop = RandomCrop()
@@ -389,17 +428,19 @@ class MyDataset_OCTA500(data.Dataset):
 
     def __getitem__(self, index):
         resize_shape = tuple(self.args.resize[:2])
-        img, mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], resize_shape, self.train, self.label_mode)
+        binary_mask_path = self.binary_mask_ls[index] if self.label_mode in ['dist', 'dist_inverted'] else None
+        img, mask, binary_mask = default_DRIVE_loader(self.img_ls[index], self.mask_ls[index], binary_mask_path, resize_shape, self.train, self.label_mode)
 
         img = torch.Tensor(img)
         mask = torch.Tensor(mask)
-        # mask = torch.where(mask>0.5,1,0)
-        # conn = connectivity_matrix(mask.unsqueeze(0))
-        # if self.args.resize:
-        #     img = Resize(img[0], None,512,512)
-        # print(img.shape,mask.shape,conn.shape)
-        # print(img.max())
-        return img.squeeze(0), mask, self.name_ls[index]
+        binary_mask = torch.Tensor(binary_mask)
+        
+        return {
+            'image': img.squeeze(0) if img.ndim == 4 else img,
+            'label': mask,
+            'binary_gt': binary_mask,
+            'name': self.name_ls[index]
+        }
 
     def __len__(self):
         return len(self.img_ls)

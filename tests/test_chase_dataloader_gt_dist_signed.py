@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,6 +6,10 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from data_loader.GetDataset_CHASE import MyDataset_CHASE
 
@@ -20,7 +25,10 @@ class CHASEWithSignedDist(Dataset):
         return len(self.base)
 
     def __getitem__(self, index):
-        img, mask, name = self.base[index]
+        sample = self.base[index]
+        img = sample["image"]
+        mask = sample["label"]
+        name = sample["name"]
         # name is like "1L" or "1R" from MyDataset_CHASE
         dist_path = self.dist_dir / f"Image_{name}_1stHO_dist.npy"
         dist = torch.from_numpy(np.load(dist_path)).float()
@@ -57,7 +65,7 @@ def test_chase_dataloader_with_dist(tmp_path):
     _write_chase_mock_sample(tmp_path, pat_id=1, side="L")
     _write_chase_mock_sample(tmp_path, pat_id=1, side="R")
 
-    args = SimpleNamespace()
+    args = SimpleNamespace(resize=[960, 960])
     dataset = CHASEWithSignedDist(args=args, train_root=str(tmp_path), pat_ls=[1], mode="test")
 
     assert len(dataset) == 2

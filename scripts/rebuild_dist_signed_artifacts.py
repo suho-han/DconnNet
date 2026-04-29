@@ -12,7 +12,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from connect_loss import Bilateral_voting, Bilateral_voting_kxk, distance_affinity_matrix, resolve_connectivity_layout
+from connect_loss import (
+    Bilateral_voting,
+    Bilateral_voting_kxk,
+    distance_affinity_matrix,
+    normalize_conn_layout,
+    resolve_connectivity_layout,
+)
 from data_loader.GetDataset_CHASE import MyDataset_CHASE
 from model.DconnNet import DconnNet
 
@@ -62,6 +68,7 @@ def parse_args():
     p.add_argument("--resize", type=int, nargs=2, default=[960, 960])
     p.add_argument("--num_class", type=int, default=1)
     p.add_argument("--conn_num", type=int, default=8, choices=[8, 24])
+    p.add_argument("--conn_layout", type=str, default=None, choices=["standard8", "full24", "out8"])
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--max_batches", type=int, default=6)
@@ -74,7 +81,13 @@ def parse_args():
     p.add_argument("--epochwise_csv_name", type=str, default="epochwise_voting_debug.csv")
     p.add_argument("--meta_name", type=str, default="best_model_meta.txt")
     p.add_argument("--report_name", type=str, default="debug_report.md")
-    return p.parse_args()
+    args = p.parse_args()
+    args.conn_layout = normalize_conn_layout(args.conn_num, args.conn_layout)
+    args.connectivity_layout = resolve_connectivity_layout(args.conn_num, args.conn_layout)
+    args.conn_channels = args.connectivity_layout["channel_count"]
+    if args.num_class != 1 and args.conn_layout != "standard8":
+        raise ValueError("rebuild_dist_signed_artifacts currently supports non-standard conn_layout only for single-class runs")
+    return args
 
 
 def make_chase_split(exp_id: int) -> Tuple[List[str], List[str]]:
@@ -103,13 +116,35 @@ def shift_2d(x: torch.Tensor, dy: int, dx: int) -> torch.Tensor:
     return out
 
 
-def pair_alignment_scores(class_pred_bin: torch.Tensor) -> np.ndarray:
+def pair_alignment_scores(class_pred_bin: torch.Tensor, offsets: List[Tuple[int, int]]) -> np.ndarray:
     a = class_pred_bin[:, 0]
-    p0 = float((a[:, 0:1] * shift_2d(a[:, 7:8], dy=1, dx=1)).mean().item())
-    p1 = float((a[:, 1:2] * shift_2d(a[:, 6:7], dy=1, dx=0)).mean().item())
-    p2 = float((a[:, 2:3] * shift_2d(a[:, 5:6], dy=1, dx=-1)).mean().item())
-    p3 = float((a[:, 3:4] * shift_2d(a[:, 4:5], dy=0, dx=1)).mean().item())
-    return np.array([p0, p1, p2, p3], dtype=np.float64)
+    offset_to_idx = {offset: idx for idx, offset in enumerate(offsets)}
+    pair_values: List[float] = []
+    visited: set[Tuple[int, int]] = set()
+    for offset in offsets:
+        if offset in visited:
+            continue
+        reverse_offset = (-offset[0], -offset[1])
+        if reverse_offset not in offset_to_idx:
+            raise ValueError(
+                f"pair_alignment_scores requires every offset to have a reverse pair, "
+                f"missing {reverse_offset} for offset {offset}"
+            )
+        reverse_idx = offset_to_idx[reverse_offset]
+        idx = offset_to_idx[offset]
+        pair_values.append(
+            float((a[:, idx:idx + 1] * shift_2d(a[:, reverse_idx:reverse_idx + 1], dy=offset[0], dx=offset[1])).mean().item())
+        )
+        visited.add(offset)
+        visited.add(reverse_offset)
+        if len(pair_values) == 4:
+            break
+    if len(pair_values) != 4:
+        raise ValueError(
+            f"pair_alignment_scores expects exactly 4 reverse-offset pairs, got {len(pair_values)} "
+            f"from offsets={offsets}"
+        )
+    return np.array(pair_values, dtype=np.float64)
 
 
 def apply_connectivity_voting(
@@ -117,15 +152,17 @@ def apply_connectivity_voting(
     hori: torch.Tensor,
     vert: torch.Tensor,
     conn_num: int,
+    conn_layout: str | None = None,
 ):
-    layout = resolve_connectivity_layout(conn_num)
-    if conn_num == 8:
+    layout = resolve_connectivity_layout(conn_num, conn_layout)
+    if layout["name"] == "standard8":
         return Bilateral_voting(conn_map, hori, vert)
     return Bilateral_voting_kxk(
         conn_map,
         hori,
         vert,
         conn_num=layout['kernel_size'],
+        offsets=layout['offsets'],
     )
 
 
@@ -206,11 +243,14 @@ def evaluate_epoch_checkpoint(
     hori: torch.Tensor,
     vert: torch.Tensor,
     conn_num: int,
+    conn_channels: int,
+    conn_layout: str,
     max_batches: int,
 ) -> EpochResult:
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state)
     model.eval()
+    layout = resolve_connectivity_layout(conn_num, conn_layout)
 
     logits_means: List[float] = []
     logits_stds: List[float] = []
@@ -229,17 +269,18 @@ def evaluate_epoch_checkpoint(
             x, y, _ = batch
             x = x.to(device)
             y = y.float().to(device)
-            out, _ = model(x)
+            out_dict = model(x)
+            out = out_dict['fused']
             sig = torch.sigmoid(out)
-            cp_sig = sig.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
-            cp_logit = out.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
+            cp_sig = sig.view([x.shape[0], -1, conn_channels, x.shape[2], x.shape[3]])
+            cp_logit = out.view([x.shape[0], -1, conn_channels, x.shape[2], x.shape[3]])
             bin_sig = (cp_sig > 0.5).float()
             bin_logit = (cp_logit > 0).float()
 
             hori_batch = hori.repeat(x.shape[0], 1, 1, 1)
             vert_batch = vert.repeat(x.shape[0], 1, 1, 1)
-            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num)
-            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num)
+            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num, conn_layout)
+            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num, conn_layout)
             pred_sig = (pred_sig_raw > 0).float()
             pred_logit = (pred_logit_raw > 0).float()
 
@@ -251,7 +292,7 @@ def evaluate_epoch_checkpoint(
             vote_logit0.append(float(pred_logit.mean().item()))
             gt_pos0.append(float((y > 0).float().mean().item()))
             dir_logit0.append(bin_logit[:, 0].mean(dim=(0, 2, 3)).detach().cpu().numpy())
-            pair_vals.append(pair_alignment_scores(bin_logit))
+            pair_vals.append(pair_alignment_scores(bin_logit, layout["offsets"]))
 
     dir_arr = np.stack(dir_logit0, axis=0).mean(axis=0)
     pair_arr = np.stack(pair_vals, axis=0).mean(axis=0)
@@ -303,6 +344,8 @@ def evaluate_single_checkpoint_detailed(
     hori: torch.Tensor,
     vert: torch.Tensor,
     conn_num: int,
+    conn_channels: int,
+    conn_layout: str,
     max_batches: int,
     tau: float,
     sigma: float,
@@ -311,6 +354,7 @@ def evaluate_single_checkpoint_detailed(
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state)
     model.eval()
+    layout = resolve_connectivity_layout(conn_num, conn_layout)
 
     logits_mean = []
     logits_std = []
@@ -333,17 +377,18 @@ def evaluate_single_checkpoint_detailed(
             x = x.to(device)
             y = y.float().to(device)
 
-            out, _ = model(x)
+            out_dict = model(x)
+            out = out_dict['fused']
             sig = torch.sigmoid(out)
-            cp_sig = sig.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
-            cp_logit = out.view([x.shape[0], -1, conn_num, x.shape[2], x.shape[3]])
+            cp_sig = sig.view([x.shape[0], -1, conn_channels, x.shape[2], x.shape[3]])
+            cp_logit = out.view([x.shape[0], -1, conn_channels, x.shape[2], x.shape[3]])
             bin_sig = (cp_sig > 0.5).float()
             bin_logit = (cp_logit > 0).float()
 
             hori_batch = hori.repeat(x.shape[0], 1, 1, 1)
             vert_batch = vert.repeat(x.shape[0], 1, 1, 1)
-            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num)
-            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num)
+            pred_sig_raw, _ = apply_connectivity_voting(bin_sig, hori_batch, vert_batch, conn_num, conn_layout)
+            pred_logit_raw, _ = apply_connectivity_voting(bin_logit, hori_batch, vert_batch, conn_num, conn_layout)
             pred_sig = (pred_sig_raw > 0).float()
             pred_logit = (pred_logit_raw > 0).float()
 
@@ -356,12 +401,17 @@ def evaluate_single_checkpoint_detailed(
             gt_gt_05.append(float((y > 0.5).float().mean().item()))
             vote_pos_sig05.append(float(pred_sig.mean().item()))
             vote_pos_logit0.append(float(pred_logit.mean().item()))
-            pair_sig05.append(pair_alignment_scores(bin_sig))
-            pair_logit0.append(pair_alignment_scores(bin_logit))
+            pair_sig05.append(pair_alignment_scores(bin_sig, layout["offsets"]))
+            pair_logit0.append(pair_alignment_scores(bin_logit, layout["offsets"]))
 
             if label_mode in ["dist", "dist_inverted"]:
                 score_target = 1.0 - torch.exp(-y / tau)
-                affinity_target = distance_affinity_matrix(y, conn_num=conn_num, sigma=sigma)
+                affinity_target = distance_affinity_matrix(
+                    y,
+                    conn_num=conn_num,
+                    sigma=sigma,
+                    conn_layout=conn_layout,
+                )
                 score_target_mean.append(float(score_target.mean().item()))
                 affinity_target_mean.append(float(affinity_target.mean().item()))
 
@@ -485,7 +535,11 @@ def main():
     if not ckpts:
         raise RuntimeError(f"No checkpoints found in {ckpt_dir}")
 
-    model = DconnNet(num_class=args.num_class, conn_num=args.conn_num).to(device)
+    model = DconnNet(
+        num_class=args.num_class,
+        conn_num=args.conn_num,
+        conn_layout=args.conn_layout,
+    ).to(device)
     h, w = args.resize
     hori, vert = build_translation(args.num_class, h, w, device)
 
@@ -502,6 +556,8 @@ def main():
             hori=hori,
             vert=vert,
             conn_num=args.conn_num,
+            conn_channels=args.conn_channels,
+            conn_layout=args.conn_layout,
             max_batches=args.max_batches,
         )
         epochwise_rows.append(row)
@@ -533,6 +589,8 @@ def main():
         hori=hori,
         vert=vert,
         conn_num=args.conn_num,
+        conn_channels=args.conn_channels,
+        conn_layout=args.conn_layout,
         max_batches=args.max_batches,
         tau=args.tau,
         sigma=args.sigma,

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.utils as utils
 from torch.optim import lr_scheduler
+from tqdm.auto import tqdm
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -45,6 +46,42 @@ except Exception:
             yield loss
 
     amp = _AmpFallback()
+
+
+def compose_fusion_profile_loss_terms(
+    profile,
+    lambda_inner,
+    lambda_outer,
+    lambda_fused,
+    fused_terms,
+    inner_terms,
+    outer_terms,
+):
+    profile_name = str(profile).upper()
+    if profile_name not in {'A', 'B', 'C'}:
+        raise ValueError(f"Unsupported fusion_loss_profile={profile}")
+
+    seg = fused_terms['vote'] + fused_terms['dice']
+    fused_affinity = fused_terms['affinity']
+
+    total = seg + float(lambda_fused) * fused_affinity
+    terms = {
+        'total': total,
+        'seg': seg,
+        'vote': fused_terms['vote'],
+        'dice': fused_terms['dice'],
+        'fused_affinity': fused_affinity,
+    }
+
+    if profile_name in {'B', 'C'}:
+        total = total + float(lambda_inner) * inner_terms['affinity']
+        terms['inner_affinity'] = inner_terms['affinity']
+    if profile_name == 'C':
+        total = total + float(lambda_outer) * outer_terms['affinity']
+        terms['outer_affinity'] = outer_terms['affinity']
+
+    terms['total'] = total
+    return total, terms
 
 
 class EarlyStopping:
@@ -138,6 +175,24 @@ class Solver(object):
         self.optim = optim
         self.NumClass = self.args.num_class
         self.lr = self.args.lr
+        self.conn_fusion = str(getattr(self.args, 'conn_fusion', 'none'))
+        self.fusion_enabled = self.conn_fusion != 'none'
+        self.fusion_loss_profile = str(getattr(self.args, 'fusion_loss_profile', 'A')).upper()
+        self.fusion_lambda_inner = float(getattr(self.args, 'fusion_lambda_inner', 0.2))
+        self.fusion_lambda_outer = float(getattr(self.args, 'fusion_lambda_outer', 0.05))
+        self.fusion_lambda_fused = float(getattr(self.args, 'fusion_lambda_fused', 0.3))
+        self.connectivity_layout = resolve_connectivity_layout(
+            self.args.conn_num,
+            getattr(self.args, 'conn_layout', None),
+        )
+        self.conn_channels = self.connectivity_layout['channel_count']
+        if self.fusion_enabled:
+            if self.NumClass != 1:
+                raise ValueError("conn_fusion currently supports only num_class=1")
+            if self.conn_channels != 8:
+                raise ValueError("conn_fusion currently supports only conn_num=8")
+            if self.connectivity_layout['name'] != 'standard8':
+                raise ValueError("conn_fusion currently supports only conn_layout=standard8")
         H, W = args.resize
 
         self.hori_translation = torch.zeros([1, self.NumClass, W, W])
@@ -326,7 +381,14 @@ class Solver(object):
 
     def _unpack_test_batch(self, test_data, batch_idx):
         sample_name_source = None
-        if isinstance(test_data, (list, tuple)):
+        binary_gt = None
+
+        if isinstance(test_data, dict):
+            X_test = test_data['image']
+            y_test_raw = test_data['label']
+            binary_gt = test_data.get('binary_gt', None)
+            sample_name_source = test_data.get('name', None)
+        elif isinstance(test_data, (list, tuple)):
             if len(test_data) < 2:
                 raise ValueError('test_data must contain at least image and label tensors')
 
@@ -340,14 +402,17 @@ class Solver(object):
                 if len(test_data) >= 3:
                     sample_name_source = test_data[2]
         else:
-            raise TypeError('test_data must be a tuple/list from DataLoader')
+            raise TypeError('test_data must be a dict or tuple/list from DataLoader')
 
         if not torch.is_tensor(X_test) or not torch.is_tensor(y_test_raw):
             raise TypeError('image and label in test_data must be tensors')
 
+        if binary_gt is not None:
+            binary_gt = binary_gt.cuda()
+
         batch_size = int(X_test.shape[0])
         sample_names = self._normalize_sample_names(sample_name_source, batch_size, batch_idx)
-        return X_test, y_test_raw, sample_names
+        return X_test, y_test_raw, sample_names, binary_gt
 
     def get_density(self, pos_cnt, bins=50):
         # only used for Retouch in this code
@@ -413,19 +478,17 @@ class Solver(object):
         """
         Convert directional affinity / connectivity maps to a voted score map.
         """
-        layout = resolve_connectivity_layout(self.args.conn_num)
-        if self.args.conn_num == 8:
+        layout = self.connectivity_layout
+        if layout['name'] == 'standard8':
             pred_map, vote_map = Bilateral_voting(conn_map, hori_translation, verti_translation)
-        elif self.args.conn_num == 24:
-            kxk_size = layout['kernel_size']
+        else:
             pred_map, vote_map = Bilateral_voting_kxk(
                 conn_map,
                 hori_translation,
                 verti_translation,
-                conn_num=kxk_size,
+                conn_num=layout['kernel_size'],
+                offsets=layout['offsets'],
             )
-        else:
-            raise ValueError(f"Unsupported conn_num {self.args.conn_num}, only 8 and 24 are supported")
         return pred_map, vote_map
 
     def connectivity_to_mask(self, conn_map, hori_translation, verti_translation):
@@ -438,6 +501,95 @@ class Solver(object):
         )
         pred_mask = (pred_mask > 0).float()
         return pred_mask
+
+    def _unpack_model_outputs(self, model_output):
+        if isinstance(model_output, dict):
+            if self.fusion_enabled:
+                required = {'fused', 'inner', 'outer'}
+                missing = sorted(required - set(model_output.keys()))
+                if missing:
+                    raise ValueError(f"Fusion model output is missing keys: {missing}")
+            else:
+                required = {'fused', 'aux'}
+                missing = sorted(required - set(model_output.keys()))
+                if missing:
+                    raise ValueError(f"Baseline model output is missing keys: {missing}")
+            
+            return model_output
+
+        if isinstance(model_output, (tuple, list)) and len(model_output) == 2:
+            return {
+                'fused': model_output[0],
+                'aux': model_output[1],
+            }
+
+        raise TypeError(
+            "Unexpected model output type. Expected tuple(len=2) for legacy mode "
+            "or dict with keys {fused, inner, outer} for fusion mode."
+        )
+
+    def _compute_fusion_profile_loss(self, output_dict, target, binary_gt=None, collect_edge_stats=False):
+        if not self.fusion_enabled:
+            raise RuntimeError("_compute_fusion_profile_loss can be used only when conn_fusion is enabled")
+        if not hasattr(self, 'loss_func_outer'):
+            raise RuntimeError("Fusion outer loss function is not initialized")
+
+        fused_logits = output_dict['fused']
+        inner_logits = output_dict['inner']
+        outer_logits = output_dict['outer']
+
+        if (
+            collect_edge_stats
+            and self.loss_func.label_mode in ['dist', 'dist_inverted']
+            and hasattr(self.loss_func, 'set_dist_edge_stat_collection')
+        ):
+            self.loss_func.set_dist_edge_stat_collection(True)
+        _, fused_terms = self.loss_func(fused_logits, target, return_details=True)
+        if (
+            collect_edge_stats
+            and self.loss_func.label_mode in ['dist', 'dist_inverted']
+            and hasattr(self.loss_func, 'set_dist_edge_stat_collection')
+        ):
+            self.loss_func.set_dist_edge_stat_collection(False)
+
+        _, inner_terms = self.loss_func(inner_logits, target, return_details=True)
+        _, outer_terms = self.loss_func_outer(outer_logits, target, return_details=True)
+
+        total, terms = compose_fusion_profile_loss_terms(
+            profile=self.fusion_loss_profile,
+            lambda_inner=self.fusion_lambda_inner,
+            lambda_outer=self.fusion_lambda_outer,
+            lambda_fused=self.fusion_lambda_fused,
+            fused_terms=fused_terms,
+            inner_terms=inner_terms,
+            outer_terms=outer_terms,
+        )
+
+        if getattr(self.args, 'conn_fusion', 'none') == 'decoder_guided':
+            base_fused_total = total
+            c3_aux = inner_terms.get('total', inner_terms['affinity'])
+            c5_aux = outer_terms.get('total', outer_terms['affinity'])
+            c3_weight = float(getattr(self.args, 'conn_aux_c3_weight', 0.0))
+            c5_weight = float(getattr(self.args, 'conn_aux_c5_weight', 0.0))
+            total = base_fused_total + c3_weight * c3_aux + c5_weight * c5_aux
+            terms['dgrf_fused_main'] = base_fused_total
+            terms['dgrf_c3_aux'] = c3_aux
+            terms['dgrf_c5_aux'] = c5_aux
+            if 'fusion_gate' in output_dict:
+                gate_loss = output_dict['fusion_gate'].mean()
+                total = total + float(getattr(self.args, 'fusion_gate_reg_weight', 0.0)) * gate_loss
+                terms['gate'] = gate_loss
+
+        if getattr(self.args, 'use_seg_aux', False) and 'mask_logit' in output_dict and binary_gt is not None:
+            if binary_gt.ndim == 3:
+                binary_gt = binary_gt.unsqueeze(1)
+            seg_loss = F.binary_cross_entropy_with_logits(output_dict['mask_logit'], binary_gt)
+            total = total + getattr(self.args, 'seg_aux_weight', 0.0) * seg_loss
+            terms['seg_aux'] = seg_loss
+
+        terms['total'] = total
+
+        return total, terms
 
     def _resolve_training_runtime_configs(self):
         monitoring_config = getattr(self.args, 'monitoring_config', {}) or {}
@@ -510,7 +662,29 @@ class Solver(object):
         tb_dir = os.path.join(self.args.save, 'tensorboard', f'exp')
         writer = SummaryWriter(log_dir=tb_dir)
 
-        if self.args.use_SDL:
+        if self.fusion_enabled and self.args.use_SDL:
+            raise ValueError("conn_fusion mode does not support --use_SDL in this implementation")
+
+        if self.fusion_enabled:
+            self.loss_func = connect_loss(
+                self.args,
+                self.hori_translation,
+                self.verti_translation,
+                label_mode=label_mode,
+                conn_num=8,
+                sigma=self.args.sigma,
+                conn_layout='standard8',
+            )
+            self.loss_func_outer = connect_loss(
+                self.args,
+                self.hori_translation,
+                self.verti_translation,
+                label_mode=label_mode,
+                conn_num=8,
+                sigma=self.args.sigma,
+                conn_layout='out8',
+            )
+        elif self.args.use_SDL:
             assert 'retouch' in self.args.dataset, (
                 'Please input the calculated distribution data of your own dataset, '
                 'if you are now using Retouch'
@@ -530,7 +704,9 @@ class Solver(object):
                 label_mode=label_mode,
                 conn_num=self.args.conn_num,
                 sigma=self.args.sigma,
+                conn_layout=getattr(self.args, 'conn_layout', None),
             )
+            self.loss_func_outer = None
         else:
             self.loss_func = connect_loss(
                 self.args,
@@ -539,7 +715,9 @@ class Solver(object):
                 label_mode=label_mode,
                 conn_num=self.args.conn_num,
                 sigma=self.args.sigma,
+                conn_layout=getattr(self.args, 'conn_layout', None),
             )
+            self.loss_func_outer = None
 
         net, optimizer = amp.initialize(model, optim, opt_level='O2')
 
@@ -588,6 +766,17 @@ class Solver(object):
             global_step = 0
             train_start_time = time.perf_counter()
             completed_epoch = 0
+            dataset_name = str(getattr(self.args, 'dataset', 'unknown'))
+            output_dir_name = str(getattr(self.args, 'output_dir', ''))
+            if output_dir_name == '':
+                output_dir_name = str(getattr(self.args, 'save', 'output'))
+            progress_prefix = f'({dataset_name}) *({output_dir_name})'
+            epoch_progress = tqdm(
+                range(self.args.epochs),
+                desc=f'{progress_prefix} Epoch',
+                dynamic_ncols=True,
+                leave=True,
+            )
             epoch_metrics = {
                 'dice': float('nan'),
                 'jac': float('nan'),
@@ -600,11 +789,14 @@ class Solver(object):
                 'train_loss': float('nan'),
                 'val_loss_terms': {},
             }
-            for epoch in range(self.args.epochs):
+            for epoch in epoch_progress:
                 current_epoch = epoch + 1
                 completed_epoch = current_epoch
                 net.train()
                 train_loss_epoch = []
+                epoch_progress.set_description(
+                    f'{progress_prefix} Epoch {current_epoch}/{self.args.epochs}'
+                )
                 if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'reset_dist_edge_stats'):
                     self.loss_func.reset_dist_edge_stats()
 
@@ -622,40 +814,73 @@ class Solver(object):
                     for param_group in optim.param_groups:
                         param_group['lr'] = curr_lr
 
-                for i_batch, sample_batched in enumerate(train_loader):
-                    X = sample_batched[0]
-                    y = sample_batched[1]
+                with tqdm(
+                    enumerate(train_loader),
+                    total=len(train_loader),
+                    desc=f'{progress_prefix} Train',
+                    dynamic_ncols=True,
+                    leave=False,
+                ) as train_progress:
+                    for i_batch, sample_batched in train_progress:
+                        if isinstance(sample_batched, dict):
+                            X = sample_batched['image']
+                            y = sample_batched['label']
+                            binary_gt = sample_batched.get('binary_gt', None)
+                        else:
+                            X = sample_batched[0]
+                            y = sample_batched[1]
+                            binary_gt = None
 
-                    X = X.cuda()
-                    y = y.float().cuda()
+                        X = X.cuda()
+                        y = y.float().cuda()
+                        if binary_gt is not None:
+                            binary_gt = binary_gt.cuda()
 
-                    optim.zero_grad()
-                    output, aux_out = net(X)
+                        optim.zero_grad()
+                        model_output = self._unpack_model_outputs(net(X))
 
-                    if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
-                        self.loss_func.set_dist_edge_stat_collection(True)
-                    loss_main, loss_main_dict = self.loss_func(output, y, return_details=True)
-                    if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
-                        self.loss_func.set_dist_edge_stat_collection(False)
-                    loss_aux, loss_aux_dict = self.loss_func(aux_out, y, return_details=True)
-                    loss = loss_main + 0.3 * loss_aux
+                        if self.fusion_enabled:
+                            loss, loss_main_dict = self._compute_fusion_profile_loss(
+                                model_output,
+                                y,
+                                binary_gt=binary_gt,
+                                collect_edge_stats=True,
+                            )
+                            loss_aux_dict = {}
+                        else:
+                            output = model_output['fused']
+                            aux_out = model_output['aux']
+                            if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
+                                self.loss_func.set_dist_edge_stat_collection(True)
+                            loss_main, loss_main_dict = self.loss_func(output, y, return_details=True)
+                            if label_mode in ['dist', 'dist_inverted'] and hasattr(self.loss_func, 'set_dist_edge_stat_collection'):
+                                self.loss_func.set_dist_edge_stat_collection(False)
+                            loss_aux, loss_aux_dict = self.loss_func(aux_out, y, return_details=True)
+                            loss = loss_main + 0.3 * loss_aux
 
-                    with amp.scale_loss(loss, optimizer) as scale_loss:
-                        scale_loss.backward()
+                            if getattr(self.args, 'use_seg_aux', False) and 'mask_logit' in model_output and binary_gt is not None:
+                                if binary_gt.ndim == 3:
+                                    binary_gt = binary_gt.unsqueeze(1)
+                                seg_loss = F.binary_cross_entropy_with_logits(model_output['mask_logit'], binary_gt)
+                                loss = loss + getattr(self.args, 'seg_aux_weight', 0.0) * seg_loss
+                                loss_main_dict['seg_aux'] = seg_loss
 
-                    optim.step()
-                    train_loss_epoch.append(loss.item())
-                    writer.add_scalar('train/loss_total', float(loss.item()), global_step)
-                    for key, value in loss_main_dict.items():
-                        writer.add_scalar(f'train/main/{key}', float(value.detach().item()), global_step)
-                    for key, value in loss_aux_dict.items():
-                        writer.add_scalar(f'train/aux/{key}', float(value.detach().item()), global_step)
-                    global_step += 1
+                        with amp.scale_loss(loss, optimizer) as scale_loss:
+                            scale_loss.backward()
 
-                    print(
-                        '[epoch:' + str(epoch) + '][Iteration : ' + str(i_batch) + '/' +
-                        str(len(train_loader)) + '] Total:%.3f' % (loss.item())
-                    )
+                        optim.step()
+                        train_loss_epoch.append(loss.item())
+                        writer.add_scalar('train/loss_total', float(loss.item()), global_step)
+                        for key, value in loss_main_dict.items():
+                            writer.add_scalar(f'train/main/{key}', float(value.detach().item()), global_step)
+                        for key, value in loss_aux_dict.items():
+                            writer.add_scalar(f'train/aux/{key}', float(value.detach().item()), global_step)
+                        global_step += 1
+
+                        train_progress.set_postfix(
+                            loss=f'{float(loss.item()):.4f}',
+                            lr=f'{float(optim.param_groups[0]["lr"]):.2e}',
+                        )
 
                 mean_train_loss = float(np.mean(train_loss_epoch)) if train_loss_epoch else float('nan')
                 should_save_batch_triplet = ((epoch + 1) % save_per_epochs == 0)
@@ -675,7 +900,7 @@ class Solver(object):
 
                 stop_training = False
                 if val_loader is not None:
-                    print('RUN VALIDATION ON validation split.')
+                    tqdm.write('RUN VALIDATION ON validation split.')
 
                     epoch_metrics = self.test_epoch(
                         net,
@@ -734,31 +959,31 @@ class Solver(object):
                                 f'best_betti_error_1={epoch_metrics["betti_error_1"]:.6f}\n'
                             )
                         if stop_state['used_tie_break']:
-                            print(
+                            tqdm.write(
                                 'Validation Dice tie detected; lower validation loss selected best checkpoint '
                                 f'({stop_state["best_val_loss"]:.6f}).'
                             )
                         else:
                             if math.isnan(prev_best_dice):
-                                print(
+                                tqdm.write(
                                     'Best model updated based on validation Dice '
                                     f'({stop_state["best_val_dice"]:.6f}).'
                                 )
                             else:
-                                print(
+                                tqdm.write(
                                     'Validation Dice improved from '
                                     f'{prev_best_dice:.6f} to {stop_state["best_val_dice"]:.6f}. '
                                     'Saving best checkpoint.'
                                 )
 
                     if stop_state['waiting_for_boundary']:
-                        print(
+                        tqdm.write(
                             f'Patience reached for {monitor_label}; waiting for stop boundary at every '
                             f'{early_stopper.stop_interval} epochs. '
                             f'Current epoch: {current_epoch}.'
                         )
                     if stop_state['should_stop']:
-                        print(
+                        tqdm.write(
                             f'Early stopping triggered. No improvement in {monitor_label} for '
                             f'{early_stopper.patience} epochs.'
                         )
@@ -809,35 +1034,27 @@ class Solver(object):
                     writer.add_scalar('train/edge_mean', float(dist_edge_stats['edge_mean']), current_epoch)
                     writer.add_scalar('train/edge_nonzero_ratio', float(dist_edge_stats['edge_nonzero_ratio']), current_epoch)
 
+                epoch_postfix = {'train_loss': f'{mean_train_loss:.6f}'}
                 if val_loader is not None:
-                    print(f'Epoch [{current_epoch}/{self.args.epochs}]')
-                    print(f'Train Loss: {mean_train_loss:.6f}')
-                    print(f'Val Loss: {float(epoch_metrics["val_loss"]):.6f}')
-                    print(f'Val Dice: {float(epoch_metrics["dice"]):.6f}')
+                    epoch_postfix['val_loss'] = f'{float(epoch_metrics["val_loss"]):.6f}'
+                    epoch_postfix['val_dice'] = f'{float(epoch_metrics["dice"]):.6f}'
                     if early_stopper is not None and not math.isnan(float(early_stopper.best_val_dice)):
-                        print(f'Best Val Dice: {float(early_stopper.best_val_dice):.6f}')
+                        epoch_postfix['best_val_dice'] = f'{float(early_stopper.best_val_dice):.6f}'
                     else:
-                        print('Best Val Dice: nan')
+                        epoch_postfix['best_val_dice'] = 'nan'
                     if early_stopper is not None and early_stopper.enabled:
-                        print(f'EarlyStopping Counter: {int(early_stopper.counter)}/{int(early_stopper.patience)}')
+                        epoch_postfix['es'] = f'{int(early_stopper.counter)}/{int(early_stopper.patience)}'
                     else:
-                        print('EarlyStopping Counter: disabled')
-                elif dist_edge_stats is None:
-                    print('[Epoch :%d] total loss:%.3f ' % (epoch, mean_train_loss))
-                else:
-                    print(
-                        '[Epoch :%d] total loss:%.3f edge_mean:%.6f edge_nonzero:%.6f '
-                        % (
-                            epoch,
-                            mean_train_loss,
-                            dist_edge_stats['edge_mean'],
-                            dist_edge_stats['edge_nonzero_ratio'],
-                        )
-                    )
+                        epoch_postfix['es'] = 'disabled'
+                elif dist_edge_stats is not None:
+                    epoch_postfix['edge_mean'] = f'{float(dist_edge_stats["edge_mean"]):.6f}'
+                    epoch_postfix['edge_nonzero'] = f'{float(dist_edge_stats["edge_nonzero_ratio"]):.6f}'
+                epoch_progress.set_postfix(epoch_postfix)
                 elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
                 self._write_epoch_result_row(current_epoch, epoch_metrics, elapsed_hms)
                 if stop_training:
                     break
+            epoch_progress.close()
 
             if completed_epoch == 0:
                 raise ValueError('Training loop completed zero epochs; please set --epochs >= 1.')
@@ -899,161 +1116,187 @@ class Solver(object):
             self.args.save, 'models', f'{split_name}_sample_metrics.csv'
         )
         os.makedirs(os.path.dirname(sample_csv), exist_ok=True)
+        dataset_name = str(getattr(self.args, 'dataset', 'unknown'))
+        output_dir_name = str(getattr(self.args, 'output_dir', ''))
+        if output_dir_name == '':
+            output_dir_name = str(getattr(self.args, 'save', 'output'))
+        progress_prefix = f'({dataset_name}) *({output_dir_name})'
 
         with torch.no_grad():
-            for j_batch, test_data in enumerate(loader):
-                X_test_raw, y_test_raw_raw, sample_names = self._unpack_test_batch(test_data, j_batch)
-                X_test = X_test_raw
-                y_test_raw = y_test_raw_raw
+            with tqdm(
+                enumerate(loader),
+                total=len(loader),
+                desc=f'{progress_prefix} {split_name.capitalize()} Eval',
+                dynamic_ncols=True,
+                leave=False,
+            ) as eval_progress:
+                for j_batch, test_data in eval_progress:
+                    X_test_raw, y_test_raw_raw, sample_names, binary_gt = self._unpack_test_batch(test_data, j_batch)
+                    X_test = X_test_raw
+                    y_test_raw = y_test_raw_raw
 
-                X_test = X_test.cuda()
-                y_test_raw = y_test_raw.float().cuda()
+                    X_test = X_test.cuda()
+                    y_test_raw = y_test_raw.float().cuda()
 
-                output_test, aux_out = model(X_test)
-
-                val_loss_main, val_main_dict = self.loss_func(output_test, y_test_raw, return_details=True)
-                val_loss_aux, _ = self.loss_func(aux_out, y_test_raw, return_details=True)
-                val_loss = val_loss_main + 0.3 * val_loss_aux
-                self.val_loss_ls.append(val_loss.item())
-                if j_batch == 0:
-                    val_term_sums = {k: 0.0 for k in val_main_dict.keys()}
-                    val_term_counts = 0
-                for k, v in val_main_dict.items():
-                    val_term_sums[k] += float(v.detach().item())
-                val_term_counts += 1
-
-                batch, _, H, W = X_test.shape
-
-                hori_translation = self.hori_translation.repeat(batch, 1, 1, 1).cuda()
-                verti_translation = self.verti_translation.repeat(batch, 1, 1, 1).cuda()
-
-                if self.args.num_class == 1:
-                    if self.loss_func.label_mode in ['dist', 'dist_inverted']:
-                        # Keep eval path aligned with the distance training path:
-                        # sigmoid affinity -> bilateral voting -> mask-probability threshold.
-                        pred_conn_prob = torch.sigmoid(output_test).view(
-                            [batch, -1, self.args.conn_num, H, W]
+                    model_output = self._unpack_model_outputs(model(X_test))
+                    if self.fusion_enabled:
+                        output_test = model_output['fused']
+                        val_loss, val_main_dict = self._compute_fusion_profile_loss(
+                            model_output,
+                            y_test_raw,
+                            binary_gt=binary_gt,
+                            collect_edge_stats=False,
                         )
-                        pred_score, _ = self.apply_connectivity_voting(
-                            pred_conn_prob, hori_translation, verti_translation
-                        )
-                        pred = self.dist_score_to_binary(pred_score.view(batch, 1, H, W))
-                        gt_mask = self.dist_to_binary(y_test_raw, self.loss_func.label_mode)
                     else:
-                        # Preserve upstream binary evaluation path.
-                        output_prob = torch.sigmoid(output_test)
-                        pred_conn_prob = output_prob.view([batch, -1, self.args.conn_num, H, W])
-                        pred_bin = (pred_conn_prob > 0.5).float()
-                        gt_mask = (y_test_raw > 0.5).float()
-                        pred = self.connectivity_to_mask(
-                            pred_bin, hori_translation, verti_translation
+                        output_test = model_output['fused']
+                        aux_out = model_output['aux']
+                        val_loss_main, val_main_dict = self.loss_func(output_test, y_test_raw, return_details=True)
+                        val_loss_aux, _ = self.loss_func(aux_out, y_test_raw, return_details=True)
+                        val_loss = val_loss_main + 0.3 * val_loss_aux
+
+                        if getattr(self.args, 'use_seg_aux', False) and 'mask_logit' in model_output and binary_gt is not None:
+                            if binary_gt.ndim == 3:
+                                binary_gt = binary_gt.unsqueeze(1)
+                            seg_loss = F.binary_cross_entropy_with_logits(model_output['mask_logit'], binary_gt)
+                            val_loss = val_loss + getattr(self.args, 'seg_aux_weight', 0.0) * seg_loss
+                            val_main_dict['seg_aux'] = seg_loss
+                    self.val_loss_ls.append(val_loss.item())
+                    if j_batch == 0:
+                        val_term_sums = {k: 0.0 for k in val_main_dict.keys()}
+                        val_term_counts = 0
+                    for k, v in val_main_dict.items():
+                        val_term_sums[k] += float(v.detach().item())
+                    val_term_counts += 1
+
+                    batch, _, H, W = X_test.shape
+
+                    hori_translation = self.hori_translation.repeat(batch, 1, 1, 1).cuda()
+                    verti_translation = self.verti_translation.repeat(batch, 1, 1, 1).cuda()
+
+                    if self.args.num_class == 1:
+                        if self.loss_func.label_mode in ['dist', 'dist_inverted']:
+                            # Keep eval path aligned with the distance training path:
+                            # sigmoid affinity -> bilateral voting -> mask-probability threshold.
+                            pred_conn_prob = torch.sigmoid(output_test).view(
+                                [batch, -1, self.conn_channels, H, W]
+                            )
+                            pred_score, _ = self.apply_connectivity_voting(
+                                pred_conn_prob, hori_translation, verti_translation
+                            )
+                            pred = self.dist_score_to_binary(pred_score.view(batch, 1, H, W))
+                            gt_mask = self.dist_to_binary(y_test_raw, self.loss_func.label_mode)
+                        else:
+                            # Preserve upstream binary evaluation path.
+                            output_prob = torch.sigmoid(output_test)
+                            pred_conn_prob = output_prob.view([batch, -1, self.conn_channels, H, W])
+                            pred_bin = (pred_conn_prob > 0.5).float()
+                            gt_mask = (y_test_raw > 0.5).float()
+                            pred = self.connectivity_to_mask(
+                                pred_bin, hori_translation, verti_translation
+                            )
+
+                        if gt_mask.dim() == 3:
+                            gt_mask = gt_mask.unsqueeze(1)
+
+                        pred_to_save = pred
+                        mask_to_save = gt_mask
+
+                        dice, Jac = self.per_class_dice(pred, gt_mask)
+                        sample_cldc = []
+                        sample_betti_error_0 = []
+                        sample_betti_error_1 = []
+                        if self.args.dataset in ('isic', 'cremi'):
+                            sample_precision, sample_accuracy = self._compute_binary_precision_accuracy(pred, gt_mask)
+                        else:
+                            sample_precision = torch.full((batch,), float('nan'), device=pred.device)
+                            sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
+                        self.precision_ls += sample_precision.detach().cpu().tolist()
+                        self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
+                        for b_idx in range(batch):
+                            pred_np = pred[b_idx, 0].detach().cpu().numpy()
+                            target_np = gt_mask[b_idx, 0].detach().cpu().numpy()
+                            cldc = float(clDice(pred_np, target_np))
+                            sample_cldc.append(cldc)
+                            self.cldc_ls.append(cldc)
+                            betti0_error_ls, betti1_error_ls = getBettiErrors(
+                                pred[b_idx, 0], gt_mask[b_idx, 0]
+                            )
+                            sample_betti_error_0.append(
+                                float(np.mean(betti0_error_ls)) if len(betti0_error_ls) > 0 else float('nan')
+                            )
+                            sample_betti_error_1.append(
+                                float(np.mean(betti1_error_ls)) if len(betti1_error_ls) > 0 else float('nan')
+                            )
+                            self.betti_error_0_ls.append(sample_betti_error_0[-1])
+                            self.betti_error_1_ls.append(sample_betti_error_1[-1])
+                    else:
+                        # multi-class branch
+                        y_test = y_test_raw.long()
+                        class_pred = output_test.view([batch, -1, self.conn_channels, H, W])
+                        final_pred, _ = self.apply_connectivity_voting(
+                            class_pred, hori_translation, verti_translation
+                        )
+                        pred = get_mask(final_pred)
+                        pred = self.one_hot(pred, X_test.shape)
+
+                        pred_to_save = torch.argmax(pred, dim=1, keepdim=True)
+                        mask_to_save = torch.argmax(y_test_raw, dim=1, keepdim=True)
+
+                        dice, Jac = self.per_class_dice(pred, y_test)
+                        sample_cldc = [float('nan')] * batch
+                        sample_betti_error_0 = [float('nan')] * batch
+                        sample_betti_error_1 = [float('nan')] * batch
+                        if self.args.dataset in ('isic', 'cremi'):
+                            pred_label = pred_to_save.squeeze(1).long()
+                            true_label = mask_to_save.squeeze(1).long()
+                            sample_precision, sample_accuracy = self._compute_multiclass_precision_accuracy(
+                                pred_label,
+                                true_label,
+                                self.args.num_class,
+                            )
+                        else:
+                            sample_precision = torch.full((batch,), float('nan'), device=pred.device)
+                            sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
+                        self.precision_ls += sample_precision.detach().cpu().tolist()
+                        self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
+                        self.betti_error_0_ls += sample_betti_error_0
+                        self.betti_error_1_ls += sample_betti_error_1
+
+                    if save_batch_triplet:
+                        self.save_checkpoint_batch_triplet(
+                            X_test, pred_to_save, mask_to_save, epoch + 1, j_batch
                         )
 
-                    if gt_mask.dim() == 3:
-                        gt_mask = gt_mask.unsqueeze(1)
-
-                    pred_to_save = pred
-                    mask_to_save = gt_mask
-
-                    dice, Jac = self.per_class_dice(pred, gt_mask)
-                    sample_cldc = []
-                    sample_betti_error_0 = []
-                    sample_betti_error_1 = []
-                    if self.args.dataset in ('isic', 'cremi'):
-                        sample_precision, sample_accuracy = self._compute_binary_precision_accuracy(pred, gt_mask)
+                    # For multi-class segmentation, exclude BG class from averaged metrics
+                    if self.args.num_class > 1:
+                        sample_dice = torch.mean(dice[:, 1:], 1)
+                        sample_jac = torch.mean(Jac[:, 1:], 1)
+                        self.dice_ls += sample_dice.tolist()
+                        self.Jac_ls += sample_jac.tolist()
                     else:
-                        sample_precision = torch.full((batch,), float('nan'), device=pred.device)
-                        sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
-                    self.precision_ls += sample_precision.detach().cpu().tolist()
-                    self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
+                        sample_dice = dice[:, 0]
+                        sample_jac = Jac[:, 0]
+                        self.dice_ls += sample_dice.tolist()
+                        self.Jac_ls += sample_jac.tolist()
+
                     for b_idx in range(batch):
-                        pred_np = pred[b_idx, 0].detach().cpu().numpy()
-                        target_np = gt_mask[b_idx, 0].detach().cpu().numpy()
-                        cldc = float(clDice(pred_np, target_np))
-                        sample_cldc.append(cldc)
-                        self.cldc_ls.append(cldc)
-                        betti0_error_ls, betti1_error_ls = getBettiErrors(
-                            pred[b_idx, 0], gt_mask[b_idx, 0]
-                        )
-                        sample_betti_error_0.append(
-                            float(np.mean(betti0_error_ls)) if len(betti0_error_ls) > 0 else float('nan')
-                        )
-                        sample_betti_error_1.append(
-                            float(np.mean(betti1_error_ls)) if len(betti1_error_ls) > 0 else float('nan')
-                        )
-                        self.betti_error_0_ls.append(sample_betti_error_0[-1])
-                        self.betti_error_1_ls.append(sample_betti_error_1[-1])
-                else:
-                    # multi-class branch
-                    y_test = y_test_raw.long()
-                    class_pred = output_test.view([batch, -1, self.args.conn_num, H, W])
-                    final_pred, _ = self.apply_connectivity_voting(
-                        class_pred, hori_translation, verti_translation
-                    )
-                    pred = get_mask(final_pred)
-                    pred = self.one_hot(pred, X_test.shape)
+                        sample_metric_rows.append({
+                            'epoch': int(epoch + 1),
+                            'batch': int(j_batch),
+                            'sample_in_batch': int(b_idx),
+                            'sample_name': sample_names[b_idx],
+                            'val_loss': float(val_loss.item()),
+                            'dice': float(sample_dice[b_idx].item()),
+                            'jac': float(sample_jac[b_idx].item()),
+                            'cldice': float(sample_cldc[b_idx]),
+                            'precision': float(sample_precision[b_idx].item()),
+                            'accuracy': float(sample_accuracy[b_idx].item()),
+                            'betti_error_0': float(sample_betti_error_0[b_idx]),
+                            'betti_error_1': float(sample_betti_error_1[b_idx]),
+                        })
 
-                    pred_to_save = torch.argmax(pred, dim=1, keepdim=True)
-                    mask_to_save = torch.argmax(y_test_raw, dim=1, keepdim=True)
-
-                    dice, Jac = self.per_class_dice(pred, y_test)
-                    sample_cldc = [float('nan')] * batch
-                    sample_betti_error_0 = [float('nan')] * batch
-                    sample_betti_error_1 = [float('nan')] * batch
-                    if self.args.dataset in ('isic', 'cremi'):
-                        pred_label = pred_to_save.squeeze(1).long()
-                        true_label = mask_to_save.squeeze(1).long()
-                        sample_precision, sample_accuracy = self._compute_multiclass_precision_accuracy(
-                            pred_label,
-                            true_label,
-                            self.args.num_class,
-                        )
-                    else:
-                        sample_precision = torch.full((batch,), float('nan'), device=pred.device)
-                        sample_accuracy = torch.full((batch,), float('nan'), device=pred.device)
-                    self.precision_ls += sample_precision.detach().cpu().tolist()
-                    self.accuracy_ls += sample_accuracy.detach().cpu().tolist()
-                    self.betti_error_0_ls += sample_betti_error_0
-                    self.betti_error_1_ls += sample_betti_error_1
-
-                if save_batch_triplet:
-                    self.save_checkpoint_batch_triplet(
-                        X_test, pred_to_save, mask_to_save, epoch + 1, j_batch
-                    )
-
-                # For multi-class segmentation, exclude BG class from averaged metrics
-                if self.args.num_class > 1:
-                    sample_dice = torch.mean(dice[:, 1:], 1)
-                    sample_jac = torch.mean(Jac[:, 1:], 1)
-                    self.dice_ls += sample_dice.tolist()
-                    self.Jac_ls += sample_jac.tolist()
-                else:
-                    sample_dice = dice[:, 0]
-                    sample_jac = Jac[:, 0]
-                    self.dice_ls += sample_dice.tolist()
-                    self.Jac_ls += sample_jac.tolist()
-
-                for b_idx in range(batch):
-                    sample_metric_rows.append({
-                        'epoch': int(epoch + 1),
-                        'batch': int(j_batch),
-                        'sample_in_batch': int(b_idx),
-                        'sample_name': sample_names[b_idx],
-                        'val_loss': float(val_loss.item()),
-                        'dice': float(sample_dice[b_idx].item()),
-                        'jac': float(sample_jac[b_idx].item()),
-                        'cldice': float(sample_cldc[b_idx]),
-                        'precision': float(sample_precision[b_idx].item()),
-                        'accuracy': float(sample_accuracy[b_idx].item()),
-                        'betti_error_0': float(sample_betti_error_0[b_idx]),
-                        'betti_error_1': float(sample_betti_error_1[b_idx]),
-                    })
-
-                if j_batch % (max(1, int(len(loader) / 5))) == 0:
-                    print(
-                        '[Iteration : ' + str(j_batch) + '/' + str(len(loader)) +
-                        '] Total DSC:%.3f ' % (np.mean(self.dice_ls))
-                    )
+                    if j_batch % (max(1, int(len(loader) / 5))) == 0:
+                        eval_progress.set_postfix(dice=f'{float(np.mean(self.dice_ls)):.3f}')
 
             Jac_ls = np.array(self.Jac_ls)
             total_val_loss = float(np.mean(self.val_loss_ls)) if self.val_loss_ls else float('nan')

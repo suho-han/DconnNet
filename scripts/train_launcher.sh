@@ -16,6 +16,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 127
 fi
 
+# Supported flags (forwarded to python helper):
+#   --config <yaml> [--device N] [--batch-size N] [--dry_run] [--smoke] [--smoke_limit N]
+
 CONFIG_PATH=""
 PREV=""
 for ARG in "$@"; do
