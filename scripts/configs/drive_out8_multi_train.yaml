@@ -1,11 +1,11 @@
 dataset: [ drive ]
 mode: multi
-device: 0
+device: 3
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500
   folds: 1
-  # octa_variants: [ 3M, 6M ]
-  conn_nums: [ 8, 24 ]
+  conn_nums: [ 8 ]
+  conn_layouts: [ out8 ]
   label_modes: [ binary, dist, dist_inverted ]
   dist_aux_losses: [ smooth_l1 ]

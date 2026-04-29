@@ -1,0 +1,18 @@
+dataset: [ drive, chase ]
+mode: multi
+device: 0
+dist_sf_l1_gamma: 1.0
+multi:
+  epochs: 500
+  folds: 1
+  conn_nums: [ 8 ]
+  conn_layouts: [ standard8 ]
+  fusion_lambda_inner: 0.2
+  fusion_lambda_outer: 0.05
+  fusion_lambda_fused: 0.3
+  label_modes: [ binary, dist, dist_inverted ]
+  dist_aux_losses: [ smooth_l1, gjml_sf_l1 ]
+  fusion_matrix:
+    - conn_fusion: scaled_sum
+      fusion_loss_profiles: [ A ]
+      fusion_residual_scales: [ 0.1, 0.2, 0.3, 0.5 ]

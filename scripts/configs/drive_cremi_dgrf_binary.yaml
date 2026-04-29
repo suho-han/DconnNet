@@ -1,0 +1,14 @@
+dataset: [ drive, cremi ]
+mode: multi
+device: 3
+dist_sf_l1_gamma: 1.0
+multi:
+  skip_completed: true
+  epochs: 500
+  folds: 1
+  conn_nums: [ 8 ]
+  conn_layouts: [ standard8 ]
+  label_modes: [ binary ]
+  fusion_matrix:
+    - conn_fusion: decoder_guided
+      fusion_loss_profiles: [ A ]

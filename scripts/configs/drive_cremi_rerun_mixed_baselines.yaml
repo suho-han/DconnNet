@@ -1,0 +1,51 @@
+dataset: [ drive, cremi ]
+mode: multi
+device: 3
+dist_sf_l1_gamma: 1.0
+multi:
+  # Re-run only the mixed baseline folders to restore clean baseline metrics.
+  # This intentionally writes to the original output tree.
+  output_dir: output
+  epochs: 500
+  folds: 1
+  # Disable default Cartesian grid generation; use explicit experiments only.
+  conn_nums: [ ]
+  label_modes: [ ]
+  dist_aux_losses: [ ]
+  experiments:
+    - dataset: drive
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: binary
+      dist_aux_loss: smooth_l1
+      conn_fusion: none
+    - dataset: drive
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist
+      dist_aux_loss: smooth_l1
+      conn_fusion: none
+    - dataset: drive
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: none
+    - dataset: cremi
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: binary
+      dist_aux_loss: smooth_l1
+      conn_fusion: none
+    - dataset: cremi
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist
+      dist_aux_loss: smooth_l1
+      conn_fusion: none
+    - dataset: cremi
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: none

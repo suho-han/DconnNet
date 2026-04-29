@@ -1,0 +1,24 @@
+dataset: [ drive ]
+mode: multi
+device: 3
+dist_sf_l1_gamma: 1.0
+multi:
+  epochs: 500
+  folds: 1
+  conn_nums: [ 8 ]
+  conn_layouts: [ standard8 ]
+  fusion_lambda_inner: 0.2
+  fusion_lambda_outer: 0.05
+  fusion_lambda_fused: 0.3
+  fusion_residual_scale: 0.2
+  label_modes: [ binary, dist, dist_inverted ]
+  dist_aux_losses: [ smooth_l1 ]
+  octa_variants: [ 3M, 6M ]
+  fusion_matrix:
+    - conn_fusion: gate
+      fusion_loss_profiles: [ A, B, C ]
+    - conn_fusion: conv_residual
+      fusion_loss_profiles: [ A, C ]
+    - conn_fusion: scaled_sum
+      fusion_loss_profiles: [ A ]
+      fusion_residual_scales: [ 0.1, 0.2, 0.3, 0.5 ]

@@ -1,0 +1,41 @@
+dataset: [ chase, cremi, isic2018, octa500 ]
+mode: multi
+device: 2
+dist_sf_l1_gamma: 1.0
+multi:
+  skip_completed: true
+  epochs: 500
+  folds: 1
+  experiments_only: true
+  experiments:
+    - datasets: [ chase, cremi, isic2018 ]
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: binary
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5
+
+    - datasets: [ octa500 ]
+      octa_variant: 3M
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: binary
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5
+
+    - datasets: [ octa500 ]
+      octa_variant: 6M
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: binary
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5

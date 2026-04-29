@@ -1,0 +1,102 @@
+dataset: [ drive, cremi ]
+mode: multi
+device: 3
+dist_sf_l1_gamma: 1.0
+multi:
+  skip_completed: true
+  epochs: 500
+  folds: 1
+  experiments_only: true
+  experiments:
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.3
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.1
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.2
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.3
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.1
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.2
+
+    - conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: decoder_guided
+      fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5
