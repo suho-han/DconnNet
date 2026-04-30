@@ -1,10 +1,10 @@
 dataset: isic2018
 mode: multi
-device: 0
+device: 3
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500
   folds: 1
-  conn_nums: [8, 24]
-  label_modes: [binary, dist, dist_inverted]
-  dist_aux_losses: [gjml_sf_l1, smooth_l1]
+  conn_nums: [ 8, 24 ]
+  label_modes: [ binary, dist, dist_inverted ]
+  dist_aux_losses: [ gjml_sf_l1, smooth_l1 ]

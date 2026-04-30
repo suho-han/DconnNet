@@ -1,6 +1,6 @@
 dataset: chase
 mode: single
-device: 0
+device: 3
 dist_sf_l1_gamma: 1.0
 single:
   conn_num: 8

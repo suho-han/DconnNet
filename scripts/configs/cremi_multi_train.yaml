@@ -1,6 +1,6 @@
 dataset: cremi
 mode: multi
-device: 0
+device: 3
 batch_size: 8
 # dist_sf_l1_gamma: 1.0
 multi:

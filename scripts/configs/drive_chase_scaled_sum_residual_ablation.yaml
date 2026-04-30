@@ -1,18 +1,84 @@
-dataset: [ drive, chase ]
+dataset: [ chase ]
 mode: multi
-device: 0
+device: 3
 dist_sf_l1_gamma: 1.0
 multi:
   epochs: 500
   folds: 1
-  conn_nums: [ 8 ]
-  conn_layouts: [ standard8 ]
+  experiments_only: true
   fusion_lambda_inner: 0.2
   fusion_lambda_outer: 0.05
   fusion_lambda_fused: 0.3
-  label_modes: [ binary, dist, dist_inverted ]
-  dist_aux_losses: [ smooth_l1, gjml_sf_l1 ]
-  fusion_matrix:
-    - conn_fusion: scaled_sum
-      fusion_loss_profiles: [ A ]
-      fusion_residual_scales: [ 0.1, 0.2, 0.3, 0.5 ]
+  experiments:
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.5
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.1
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.2
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.3
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: smooth_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.5
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.1
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.2
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.3
+    - dataset: chase
+      conn_num: 8
+      conn_layout: standard8
+      label_mode: dist_inverted
+      dist_aux_loss: gjml_sf_l1
+      conn_fusion: scaled_sum
+      fusion_loss_profile: A
+      fusion_residual_scale: 0.5
