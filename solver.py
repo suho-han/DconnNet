@@ -1,5 +1,4 @@
 import csv
-import math
 import os
 import time
 from contextlib import contextmanager
@@ -29,10 +28,24 @@ except Exception:
         def close(self):
             pass
 
-from connect_loss import Bilateral_voting, Bilateral_voting_kxk, connect_loss, resolve_connectivity_layout
+from connect_loss import Bilateral_voting, Bilateral_voting_kxk, resolve_connectivity_layout
 from lr_update import get_lr
 from metrics.cal_betti import getBettiErrors
 from metrics.cldice import clDice
+from src.losses import compose_fusion_profile_loss_terms as _compose_fusion_profile_loss_terms
+from src.losses.factory import build_loss_functions
+from src.metrics import compute_binary_precision_accuracy, compute_multiclass_precision_accuracy
+from src.metrics import get_mask as get_mask_from_logits
+from src.metrics import one_hot as one_hot_encode
+from src.metrics import per_class_dice as compute_per_class_dice
+from src.scripts import run_test_only_eval, run_validation_epoch
+from src.utils.monitoring import EarlyStopping as _EarlyStopping
+from src.utils.monitoring import build_epoch_postfix, format_elapsed_hms, is_nan_metric
+from src.utils.results import create_exp_directory as _create_exp_directory
+from src.utils.results import write_epoch_result_row as _write_epoch_result_row
+from src.utils.results import write_eval_summary as _write_eval_summary
+
+from model.DconnNet import normalize_conn_fusion_mode
 
 try:
     from apex import amp
@@ -57,116 +70,19 @@ def compose_fusion_profile_loss_terms(
     inner_terms,
     outer_terms,
 ):
-    profile_name = str(profile).upper()
-    if profile_name not in {'A', 'B', 'C'}:
-        raise ValueError(f"Unsupported fusion_loss_profile={profile}")
-
-    seg = fused_terms['vote'] + fused_terms['dice']
-    fused_affinity = fused_terms['affinity']
-
-    total = seg + float(lambda_fused) * fused_affinity
-    terms = {
-        'total': total,
-        'seg': seg,
-        'vote': fused_terms['vote'],
-        'dice': fused_terms['dice'],
-        'fused_affinity': fused_affinity,
-    }
-
-    if profile_name in {'B', 'C'}:
-        total = total + float(lambda_inner) * inner_terms['affinity']
-        terms['inner_affinity'] = inner_terms['affinity']
-    if profile_name == 'C':
-        total = total + float(lambda_outer) * outer_terms['affinity']
-        terms['outer_affinity'] = outer_terms['affinity']
-
-    terms['total'] = total
-    return total, terms
+    return _compose_fusion_profile_loss_terms(
+        profile=profile,
+        lambda_inner=lambda_inner,
+        lambda_outer=lambda_outer,
+        lambda_fused=lambda_fused,
+        fused_terms=fused_terms,
+        inner_terms=inner_terms,
+        outer_terms=outer_terms,
+    )
 
 
-class EarlyStopping:
-    def __init__(
-        self,
-        monitor_metric='val_dice',
-        mode='max',
-        patience=20,
-        min_delta=0.001,
-        tie_break_with_loss=True,
-        tie_eps=1e-4,
-        stop_interval=10,
-    ):
-        self.monitor_metric = monitor_metric
-        self.mode = mode
-        self.patience = int(patience)
-        self.min_delta = float(min_delta)
-        self.tie_break_with_loss = bool(tie_break_with_loss)
-        self.tie_eps = float(tie_eps)
-        self.stop_interval = max(1, int(stop_interval))
-
-        self.enabled = self.patience > 0
-        self.best_monitor = float('nan')
-        self.best_val_dice = float('nan')
-        self.best_val_loss = float('nan')
-        self.best_epoch = 0
-        self.counter = 0
-        self.pending_stop = False
-
-    def _is_improved(self, monitor_value):
-        if self.best_epoch == 0:
-            return not math.isnan(float(monitor_value))
-        if math.isnan(float(monitor_value)):
-            return False
-        if self.mode == 'max':
-            return monitor_value > (self.best_monitor + self.min_delta)
-        return monitor_value < (self.best_monitor - self.min_delta)
-
-    def _is_tie_break_improved(self, val_dice, val_loss):
-        if self.monitor_metric != 'val_dice':
-            return False
-        if not self.tie_break_with_loss:
-            return False
-        if self.best_epoch == 0:
-            return False
-        if math.isnan(float(val_dice)) or math.isnan(float(val_loss)) or math.isnan(float(self.best_val_loss)):
-            return False
-        if abs(float(val_dice) - float(self.best_val_dice)) > self.tie_eps:
-            return False
-        return float(val_loss) < float(self.best_val_loss)
-
-    def step(self, monitor_value, val_dice, val_loss, epoch):
-        improved = self._is_improved(monitor_value)
-        used_tie_break = False
-        if not improved and self._is_tie_break_improved(val_dice, val_loss):
-            improved = True
-            used_tie_break = True
-
-        if improved:
-            self.best_monitor = float(monitor_value)
-            self.best_val_dice = float(val_dice)
-            self.best_val_loss = float(val_loss)
-            self.best_epoch = int(epoch)
-            self.counter = 0
-            self.pending_stop = False
-        else:
-            if self.enabled:
-                self.counter += 1
-                if self.counter >= self.patience:
-                    self.pending_stop = True
-
-        should_stop = bool(self.enabled and self.pending_stop and (int(epoch) % self.stop_interval == 0))
-        waiting_for_boundary = bool(self.enabled and self.pending_stop and not should_stop)
-
-        return {
-            'improved': improved,
-            'used_tie_break': used_tie_break,
-            'counter': int(self.counter),
-            'best_monitor': float(self.best_monitor),
-            'best_val_dice': float(self.best_val_dice),
-            'best_val_loss': float(self.best_val_loss),
-            'best_epoch': int(self.best_epoch),
-            'should_stop': should_stop,
-            'waiting_for_boundary': waiting_for_boundary,
-        }
+class EarlyStopping(_EarlyStopping):
+    pass
 
 
 class Solver(object):
@@ -175,7 +91,7 @@ class Solver(object):
         self.optim = optim
         self.NumClass = self.args.num_class
         self.lr = self.args.lr
-        self.conn_fusion = str(getattr(self.args, 'conn_fusion', 'none'))
+        self.conn_fusion = normalize_conn_fusion_mode(getattr(self.args, 'conn_fusion', 'none'))
         self.fusion_enabled = self.conn_fusion != 'none'
         self.fusion_loss_profile = str(getattr(self.args, 'fusion_loss_profile', 'A')).upper()
         self.fusion_lambda_inner = float(getattr(self.args, 'fusion_lambda_inner', 0.2))
@@ -207,45 +123,13 @@ class Solver(object):
         self.verti_translation = self.verti_translation.float()
 
     def create_exp_directory(self):
-        exp_model_dir = os.path.join(self.args.save, 'models')
-        if not os.path.exists(exp_model_dir):
-            os.makedirs(exp_model_dir)
-
-        results_csv = 'results.csv'
-        with open(os.path.join(self.args.save, results_csv), 'w') as f:
-            f.write(
-                'epoch,train_loss,val_loss,dice,Jac,clDice,precision,accuracy,betti_error_0,betti_error_1,elapsed_hms\n'
-            )
+        _create_exp_directory(self.args.save)
 
     def _format_elapsed_hms(self, elapsed_seconds):
-        if elapsed_seconds is None or math.isnan(float(elapsed_seconds)):
-            return ''
-
-        total_seconds = max(0, int(round(float(elapsed_seconds))))
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
-        return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+        return format_elapsed_hms(elapsed_seconds)
 
     def _write_epoch_result_row(self, epoch, metrics, elapsed_hms=''):
-        results_csv = 'results.csv'
-        with open(os.path.join(self.args.save, results_csv), 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    f'{int(epoch):03d}',
-                    f'{float(metrics["train_loss"]):0.6f}',
-                    f'{float(metrics["val_loss"]):0.6f}',
-                    f'{float(metrics["dice"]):0.6f}',
-                    f'{float(metrics["jac"]):0.6f}',
-                    f'{float(metrics["cldice"]):0.6f}',
-                    f'{float(metrics.get("precision", float("nan"))):0.6f}',
-                    f'{float(metrics.get("accuracy", float("nan"))):0.6f}',
-                    f'{float(metrics["betti_error_0"]):0.6f}',
-                    f'{float(metrics["betti_error_1"]):0.6f}',
-                    elapsed_hms or '',
-                ]
-            )
+        _write_epoch_result_row(self.args.save, epoch, metrics, elapsed_hms)
 
     def _write_eval_summary(
         self,
@@ -256,87 +140,21 @@ class Solver(object):
         eval_epoch='',
         elapsed_hms='',
     ):
-        summary_csv = os.path.join(
-            self.args.save,
-            f'{split_name}_results.csv',
+        _write_eval_summary(
+            save_dir=self.args.save,
+            split_name=split_name,
+            metrics=metrics,
+            checkpoint_name=checkpoint_name,
+            evaluated_split=evaluated_split,
+            eval_epoch=eval_epoch,
+            elapsed_hms=elapsed_hms,
         )
-        with open(summary_csv, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    'result_type',
-                    'evaluated_split',
-                    'eval_epoch',
-                    'checkpoint',
-                    'train_loss',
-                    'eval_loss',
-                    'dice',
-                    'jac',
-                    'cldice',
-                    'precision',
-                    'accuracy',
-                    'betti_error_0',
-                    'betti_error_1',
-                    'elapsed_hms',
-                ]
-            )
-            writer.writerow(
-                [
-                    split_name,
-                    evaluated_split,
-                    eval_epoch,
-                    checkpoint_name,
-                    f'{float(metrics["train_loss"]):0.6f}',
-                    f'{float(metrics["val_loss"]):0.6f}',
-                    f'{float(metrics["dice"]):0.6f}',
-                    f'{float(metrics["jac"]):0.6f}',
-                    f'{float(metrics["cldice"]):0.6f}',
-                    f'{float(metrics.get("precision", float("nan"))):0.6f}',
-                    f'{float(metrics.get("accuracy", float("nan"))):0.6f}',
-                    f'{float(metrics["betti_error_0"]):0.6f}',
-                    f'{float(metrics["betti_error_1"]):0.6f}',
-                    elapsed_hms or '',
-                ]
-            )
 
     def _compute_binary_precision_accuracy(self, pred_mask, gt_mask, eps=1e-6):
-        pred_bin = (pred_mask > 0.5).float()
-        gt_bin = (gt_mask > 0.5).float()
-
-        tp = torch.sum(pred_bin * gt_bin, dim=(1, 2, 3))
-        fp = torch.sum(pred_bin * (1.0 - gt_bin), dim=(1, 2, 3))
-        tn = torch.sum((1.0 - pred_bin) * (1.0 - gt_bin), dim=(1, 2, 3))
-        fn = torch.sum((1.0 - pred_bin) * gt_bin, dim=(1, 2, 3))
-
-        precision = (tp + eps) / (tp + fp + eps)
-        accuracy = (tp + tn + eps) / (tp + tn + fp + fn + eps)
-        return precision, accuracy
+        return compute_binary_precision_accuracy(pred_mask, gt_mask, eps=eps)
 
     def _compute_multiclass_precision_accuracy(self, pred_label, true_label, num_class, eps=1e-6):
-        batch_size = pred_label.shape[0]
-        precision_vals = []
-        accuracy_vals = []
-
-        class_ids = list(range(1, num_class))
-        if len(class_ids) == 0:
-            class_ids = list(range(num_class))
-
-        for b_idx in range(batch_size):
-            pred_b = pred_label[b_idx]
-            true_b = true_label[b_idx]
-
-            class_precisions = []
-            for class_id in class_ids:
-                pred_pos = (pred_b == class_id)
-                true_pos = (true_b == class_id)
-                tp = torch.sum(pred_pos & true_pos).float()
-                fp = torch.sum(pred_pos & (~true_pos)).float()
-                class_precisions.append((tp + eps) / (tp + fp + eps))
-
-            precision_vals.append(torch.mean(torch.stack(class_precisions)))
-            accuracy_vals.append(torch.mean((pred_b == true_b).float()))
-
-        return torch.stack(precision_vals), torch.stack(accuracy_vals)
+        return compute_multiclass_precision_accuracy(pred_label, true_label, num_class, eps=eps)
 
     def save_checkpoint_batch_triplet(self, images, preds, masks, epoch, batch_idx):
         base_dir = os.path.join(
@@ -414,37 +232,6 @@ class Solver(object):
         sample_names = self._normalize_sample_names(sample_name_source, batch_size, batch_idx)
         return X_test, y_test_raw, sample_names, binary_gt
 
-    def get_density(self, pos_cnt, bins=50):
-        # only used for Retouch in this code
-        val_in_bin_ = [[], [], []]
-        density_ = [[], [], []]
-        bin_wide_ = []
-
-        for n in range(3):
-            density = []
-            val_in_bin = []
-            c1 = [i for i in pos_cnt[n] if i != 0]
-            c1_t = torch.tensor(c1)
-            bin_wide = (c1_t.max() + 50) / bins
-            bin_wide_.append(bin_wide)
-
-            edges = torch.arange(bins + 1).float() * bin_wide
-            for i in range(bins):
-                val = [c1[j] for j in range(len(c1)) if (
-                    (c1[j] >= edges[i]) & (c1[j] < edges[i + 1]))]
-                val_in_bin.append(val)
-                inds = (c1_t >= edges[i]) & (c1_t < edges[i + 1])
-                num_in_bin = inds.sum().item()
-                density.append(num_in_bin)
-
-            denominator = torch.tensor(density).sum()
-            density = torch.tensor(density) / denominator
-            density_[n] = density
-            val_in_bin_[n] = val_in_bin
-
-        print(density_)
-        return density_, val_in_bin_, bin_wide_
-
     def dist_to_binary(self, x, label_mode):
         """
         Convert a distance-label ground truth tensor to a binary mask.
@@ -514,7 +301,7 @@ class Solver(object):
                 missing = sorted(required - set(model_output.keys()))
                 if missing:
                     raise ValueError(f"Baseline model output is missing keys: {missing}")
-            
+
             return model_output
 
         if isinstance(model_output, (tuple, list)) and len(model_output) == 2:
@@ -565,7 +352,12 @@ class Solver(object):
             outer_terms=outer_terms,
         )
 
-        if getattr(self.args, 'conn_fusion', 'none') == 'decoder_guided':
+        active_conn_fusion = getattr(
+            self,
+            'conn_fusion',
+            normalize_conn_fusion_mode(getattr(self.args, 'conn_fusion', 'none')),
+        )
+        if active_conn_fusion in {'dg', 'dg_direct'}:
             base_fused_total = total
             c3_aux = inner_terms.get('total', inner_terms['affinity'])
             c5_aux = outer_terms.get('total', outer_terms['affinity'])
@@ -662,62 +454,13 @@ class Solver(object):
         tb_dir = os.path.join(self.args.save, 'tensorboard', f'exp')
         writer = SummaryWriter(log_dir=tb_dir)
 
-        if self.fusion_enabled and self.args.use_SDL:
-            raise ValueError("conn_fusion mode does not support --use_SDL in this implementation")
-
-        if self.fusion_enabled:
-            self.loss_func = connect_loss(
-                self.args,
-                self.hori_translation,
-                self.verti_translation,
-                label_mode=label_mode,
-                conn_num=8,
-                sigma=self.args.sigma,
-                conn_layout='standard8',
-            )
-            self.loss_func_outer = connect_loss(
-                self.args,
-                self.hori_translation,
-                self.verti_translation,
-                label_mode=label_mode,
-                conn_num=8,
-                sigma=self.args.sigma,
-                conn_layout='out8',
-            )
-        elif self.args.use_SDL:
-            assert 'retouch' in self.args.dataset, (
-                'Please input the calculated distribution data of your own dataset, '
-                'if you are now using Retouch'
-            )
-            device_name = self.args.dataset.split('retouch-')[1]
-            pos_cnt = np.load(
-                self.args.weights + device_name + '/training_positive_pixel.npy',
-                allow_pickle=True
-            )
-            density, val_in_bin, bin_wide = self.get_density(pos_cnt)
-            self.loss_func = connect_loss(
-                self.args,
-                self.hori_translation,
-                self.verti_translation,
-                density,
-                bin_wide,
-                label_mode=label_mode,
-                conn_num=self.args.conn_num,
-                sigma=self.args.sigma,
-                conn_layout=getattr(self.args, 'conn_layout', None),
-            )
-            self.loss_func_outer = None
-        else:
-            self.loss_func = connect_loss(
-                self.args,
-                self.hori_translation,
-                self.verti_translation,
-                label_mode=label_mode,
-                conn_num=self.args.conn_num,
-                sigma=self.args.sigma,
-                conn_layout=getattr(self.args, 'conn_layout', None),
-            )
-            self.loss_func_outer = None
+        self.loss_func, self.loss_func_outer = build_loss_functions(
+            args=self.args,
+            hori_translation=self.hori_translation,
+            verti_translation=self.verti_translation,
+            label_mode=label_mode,
+            fusion_enabled=self.fusion_enabled,
+        )
 
         net, optimizer = amp.initialize(model, optim, opt_level='O2')
 
@@ -744,24 +487,7 @@ class Solver(object):
             scheduled = False
 
         if self.args.test_only:
-            eval_split_name = 'test' if test_loader is not None else 'val'
-            print(f'START {eval_split_name.upper()}-ONLY EVAL.')
-            test_metrics = self.test_epoch(
-                net,
-                val_loader if test_loader is None else test_loader,
-                0,
-                split_name=eval_split_name,
-            )
-            self._write_epoch_result_row(1, test_metrics, elapsed_hms='')
-            self._write_eval_summary(
-                'final',
-                test_metrics,
-                checkpoint_name=os.path.basename(self.args.pretrained) if self.args.pretrained else '',
-                evaluated_split=eval_split_name,
-                eval_epoch=1,
-                elapsed_hms='',
-            )
-            writer.close()
+            run_test_only_eval(self, net, val_loader, test_loader, writer)
         else:
             global_step = 0
             train_start_time = time.perf_counter()
@@ -900,94 +626,19 @@ class Solver(object):
 
                 stop_training = False
                 if val_loader is not None:
-                    tqdm.write('RUN VALIDATION ON validation split.')
-
-                    epoch_metrics = self.test_epoch(
-                        net,
-                        val_loader,
-                        epoch,
-                        train_loss=mean_train_loss,
+                    epoch_metrics, stop_training = run_validation_epoch(
+                        solver=self,
+                        net=net,
+                        model=model,
+                        optimizer=optimizer,
+                        val_loader=val_loader,
+                        epoch=epoch,
+                        current_epoch=current_epoch,
+                        mean_train_loss=mean_train_loss,
                         save_batch_triplet=should_save_batch_triplet,
-                        split_name='val',
+                        monitor_metric=monitor_metric,
+                        early_stopper=early_stopper,
                     )
-                    prev_best_dice = float(early_stopper.best_val_dice)
-                    monitor_value = (
-                        epoch_metrics['dice']
-                        if monitor_metric == 'val_dice'
-                        else epoch_metrics['val_loss']
-                    )
-                    stop_state = early_stopper.step(
-                        monitor_value=monitor_value,
-                        val_dice=epoch_metrics['dice'],
-                        val_loss=epoch_metrics['val_loss'],
-                        epoch=current_epoch,
-                    )
-                    monitor_label = 'validation Dice' if monitor_metric == 'val_dice' else 'validation loss'
-
-                    if stop_state['improved']:
-                        best_model_dir = os.path.join(self.args.save, 'models')
-                        best_model_path = os.path.join(best_model_dir, 'best_model.pth')
-                        checkpoint_best_path = os.path.join(best_model_dir, 'checkpoint_best.pth')
-                        torch.save(model.state_dict(), best_model_path)
-                        torch.save(
-                            {
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'epoch': int(current_epoch),
-                                'best_val_dice': float(stop_state['best_val_dice']),
-                                'best_val_loss': float(stop_state['best_val_loss']),
-                                'monitor_metric': monitor_metric,
-                                'monitor_value': float(stop_state['best_monitor']),
-                                'tie_break_with_loss': bool(stop_state['used_tie_break']),
-                            },
-                            checkpoint_best_path,
-                        )
-                        with open(os.path.join(best_model_dir, 'best_model_meta.txt'), 'w') as f:
-                            f.write(f'best_epoch={current_epoch}\n')
-                            f.write(f'best_val_dice={stop_state["best_val_dice"]:.6f}\n')
-                            f.write(f'best_val_loss={stop_state["best_val_loss"]:.6f}\n')
-                            f.write(f'monitor_metric={monitor_metric}\n')
-                            f.write(f'best_monitor_value={stop_state["best_monitor"]:.6f}\n')
-                            f.write(f'used_tie_break_with_loss={bool(stop_state["used_tie_break"])}\n')
-                            f.write(f'best_train_loss={epoch_metrics["train_loss"]:.6f}\n')
-                            f.write(f'best_jac={epoch_metrics["jac"]:.6f}\n')
-                            f.write(f'best_clDice={epoch_metrics["cldice"]:.6f}\n')
-                            f.write(
-                                f'best_betti_error_0={epoch_metrics["betti_error_0"]:.6f}\n'
-                            )
-                            f.write(
-                                f'best_betti_error_1={epoch_metrics["betti_error_1"]:.6f}\n'
-                            )
-                        if stop_state['used_tie_break']:
-                            tqdm.write(
-                                'Validation Dice tie detected; lower validation loss selected best checkpoint '
-                                f'({stop_state["best_val_loss"]:.6f}).'
-                            )
-                        else:
-                            if math.isnan(prev_best_dice):
-                                tqdm.write(
-                                    'Best model updated based on validation Dice '
-                                    f'({stop_state["best_val_dice"]:.6f}).'
-                                )
-                            else:
-                                tqdm.write(
-                                    'Validation Dice improved from '
-                                    f'{prev_best_dice:.6f} to {stop_state["best_val_dice"]:.6f}. '
-                                    'Saving best checkpoint.'
-                                )
-
-                    if stop_state['waiting_for_boundary']:
-                        tqdm.write(
-                            f'Patience reached for {monitor_label}; waiting for stop boundary at every '
-                            f'{early_stopper.stop_interval} epochs. '
-                            f'Current epoch: {current_epoch}.'
-                        )
-                    if stop_state['should_stop']:
-                        tqdm.write(
-                            f'Early stopping triggered. No improvement in {monitor_label} for '
-                            f'{early_stopper.patience} epochs.'
-                        )
-                        stop_training = True
 
                 if (not save_best_only) and (current_epoch % save_per_epochs == 0):
                     torch.save(
@@ -1000,25 +651,25 @@ class Solver(object):
                 else:
                     dist_edge_stats = None
                 writer.add_scalar('epoch/train_loss', float(mean_train_loss), current_epoch)
-                if not math.isnan(float(epoch_metrics['val_loss'])):
+                if not is_nan_metric(epoch_metrics['val_loss']):
                     writer.add_scalar('epoch/val_loss', float(epoch_metrics['val_loss']), current_epoch)
-                if not math.isnan(float(epoch_metrics['dice'])):
+                if not is_nan_metric(epoch_metrics['dice']):
                     writer.add_scalar('epoch/dice', float(epoch_metrics['dice']), current_epoch)
-                if not math.isnan(float(epoch_metrics['jac'])):
+                if not is_nan_metric(epoch_metrics['jac']):
                     writer.add_scalar('epoch/jac', float(epoch_metrics['jac']), current_epoch)
-                if not math.isnan(float(epoch_metrics['cldice'])):
+                if not is_nan_metric(epoch_metrics['cldice']):
                     writer.add_scalar('epoch/cldice', float(epoch_metrics['cldice']), current_epoch)
-                if not math.isnan(float(epoch_metrics['precision'])):
+                if not is_nan_metric(epoch_metrics['precision']):
                     writer.add_scalar('epoch/precision', float(epoch_metrics['precision']), current_epoch)
-                if not math.isnan(float(epoch_metrics['accuracy'])):
+                if not is_nan_metric(epoch_metrics['accuracy']):
                     writer.add_scalar('epoch/accuracy', float(epoch_metrics['accuracy']), current_epoch)
-                if not math.isnan(float(epoch_metrics['betti_error_0'])):
+                if not is_nan_metric(epoch_metrics['betti_error_0']):
                     writer.add_scalar(
                         'epoch/betti_error_0',
                         float(epoch_metrics['betti_error_0']),
                         current_epoch,
                     )
-                if not math.isnan(float(epoch_metrics['betti_error_1'])):
+                if not is_nan_metric(epoch_metrics['betti_error_1']):
                     writer.add_scalar(
                         'epoch/betti_error_1',
                         float(epoch_metrics['betti_error_1']),
@@ -1027,28 +678,20 @@ class Solver(object):
                 for key, value in epoch_metrics.get('val_loss_terms', {}).items():
                     writer.add_scalar(f'val/{key}', float(value), current_epoch)
                 if early_stopper is not None and val_loader is not None:
-                    if not math.isnan(float(early_stopper.best_val_dice)):
+                    if not is_nan_metric(early_stopper.best_val_dice):
                         writer.add_scalar('epoch/best_val_dice', float(early_stopper.best_val_dice), current_epoch)
                     writer.add_scalar('epoch/early_stopping_counter', float(early_stopper.counter), current_epoch)
                 if dist_edge_stats is not None:
                     writer.add_scalar('train/edge_mean', float(dist_edge_stats['edge_mean']), current_epoch)
                     writer.add_scalar('train/edge_nonzero_ratio', float(dist_edge_stats['edge_nonzero_ratio']), current_epoch)
 
-                epoch_postfix = {'train_loss': f'{mean_train_loss:.6f}'}
-                if val_loader is not None:
-                    epoch_postfix['val_loss'] = f'{float(epoch_metrics["val_loss"]):.6f}'
-                    epoch_postfix['val_dice'] = f'{float(epoch_metrics["dice"]):.6f}'
-                    if early_stopper is not None and not math.isnan(float(early_stopper.best_val_dice)):
-                        epoch_postfix['best_val_dice'] = f'{float(early_stopper.best_val_dice):.6f}'
-                    else:
-                        epoch_postfix['best_val_dice'] = 'nan'
-                    if early_stopper is not None and early_stopper.enabled:
-                        epoch_postfix['es'] = f'{int(early_stopper.counter)}/{int(early_stopper.patience)}'
-                    else:
-                        epoch_postfix['es'] = 'disabled'
-                elif dist_edge_stats is not None:
-                    epoch_postfix['edge_mean'] = f'{float(dist_edge_stats["edge_mean"]):.6f}'
-                    epoch_postfix['edge_nonzero'] = f'{float(dist_edge_stats["edge_nonzero_ratio"]):.6f}'
+                epoch_postfix = build_epoch_postfix(
+                    mean_train_loss=mean_train_loss,
+                    val_loader=val_loader,
+                    epoch_metrics=epoch_metrics,
+                    early_stopper=early_stopper,
+                    dist_edge_stats=dist_edge_stats,
+                )
                 epoch_progress.set_postfix(epoch_postfix)
                 elapsed_hms = self._format_elapsed_hms(time.perf_counter() - train_start_time)
                 self._write_epoch_result_row(current_epoch, epoch_metrics, elapsed_hms)
@@ -1351,30 +994,11 @@ class Solver(object):
             }
 
     def per_class_dice(self, y_pred, y_true):
-        eps = 0.0001
-
-        FN = torch.sum((1 - y_pred) * y_true, dim=(2, 3))
-        FP = torch.sum((1 - y_true) * y_pred, dim=(2, 3))
-        Pred = y_pred
-        GT = y_true
-        inter = torch.sum(GT * Pred, dim=(2, 3))
-
-        union = torch.sum(GT, dim=(2, 3)) + torch.sum(Pred, dim=(2, 3))
-        dice = (2 * inter + eps) / (union + eps)
-        Jac = (inter + eps) / (inter + FP + FN + eps)
-
-        return dice, Jac
+        return compute_per_class_dice(y_pred, y_true)
 
     def one_hot(self, target, shape):
-        one_hot_mat = torch.zeros(
-            [shape[0], self.args.num_class, shape[2], shape[3]]
-        ).cuda()
-        target = target.cuda()
-        one_hot_mat.scatter_(1, target, 1)
-        return one_hot_mat
+        return one_hot_encode(target, shape, self.args.num_class)
 
 
 def get_mask(output):
-    output = F.softmax(output, dim=1)
-    _, pred = output.topk(1, dim=1)
-    return pred
+    return get_mask_from_logits(output)

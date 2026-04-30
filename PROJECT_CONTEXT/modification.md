@@ -2,6 +2,12 @@
 
 Last updated: 2026-04-27
 
+## 2026-04-30 Update: `decoder_guided` -> `dg`, `dg_direct` 추가
+
+- `conn_fusion=decoder_guided`는 legacy alias로만 유지하고 canonical 이름은 `dg`로 변경.
+- `dg_direct`를 추가하여 DGRF fusion은 유지하되 `SegAux` mask head 입력만 `final_feat` 단독으로 비교 가능하게 함.
+- 기존 `output/`와 `output_smoke/`의 `*_decoder_guided_*` 결과 폴더는 `*_dg_*`로 rename.
+
 ## Purpose
 
 - Upstream baseline 재현성을 유지한다.
@@ -38,6 +44,23 @@ Last updated: 2026-04-27
 
 - single-run / indexed run / mixed root를 모두 수용한다.
 - dataset별 평균표/요약 PDF 산출을 유지한다.
+
+## 2026-04-29 Update: 1차 구조 분리 + RETOUCH Active 지원 제거
+
+- `train.py`
+  - dataset/dataloader 분기를 `src/data/builders.py`로 분리했다.
+  - RETOUCH 분기와 관련 helper를 제거했고, RETOUCH dataset 인자는 parser 단계에서 unsupported 처리한다.
+  - `--use_SDL`, `--weights` CLI 옵션은 제거했다.
+- `solver.py`
+  - loss 초기화 로직을 `src/losses/factory.py`로 분리했다.
+  - fusion profile 조합 함수는 `src/losses/fusion.py`로 이동하고 기존 import 계약은 wrapper로 유지했다.
+  - `EarlyStopping`, NaN 체크, elapsed/postfix, CSV writer를 `src/utils/`로 위임했다.
+  - test-only/validation 분기를 `src/scripts/test.py`, `src/scripts/val.py` helper 호출로 분리했다.
+  - metric helper(`precision/accuracy`, `dice/Jac`, one-hot/get_mask)를 `src/metrics/segmentation.py`로 분리했다.
+- launcher/config/docs
+  - launcher 허용 dataset에서 RETOUCH를 제거하고 RETOUCH 입력 시 즉시 실패하도록 했다.
+  - RETOUCH 전용 config(`scripts/configs/retouch_*.yaml`) 5개를 제거했다.
+  - README/launcher 문서의 RETOUCH active 지원 안내를 제거/정리했다.
 
 ## 2026-04-29 Update: Explicit `decoder_fusion` Removal
 
@@ -174,10 +197,10 @@ Last updated: 2026-04-27
 ## 2026-04-27 Update: Show SegAux Weight in `Dec` Column
 
 - `scripts/aggregate_results.py`에서 실험명 suffix(`_segaux`, `_segaux_w...`)를 파싱해 `seg_aux_weight`를 메타로 보존한다.
-- 요약 테이블의 `Dec` 컬럼에 segaux 실험은 텍스트 대신 숫자만 표시한다.
-  - `_segaux` -> `0.3` (default)
+- 요약 테이블의 `Dec` 컬럼에서 segaux 실험은 명시 weight가 있으면 숫자, 없으면 `segaux`로 표시한다.
+  - `_segaux` -> `segaux`
   - `_segaux_w0.1` -> `0.1`
-- 규칙 일관성을 위해 `decoder_guided + segaux` 조합도 `Fusion=none`, `Dec=<숫자>`로 통일했다.
+- 규칙 일관성을 위해 `decoder_guided + segaux` 조합도 `Fusion=none`, `Dec=segaux|<숫자>` 기준으로 통일했다.
 - 후속으로 `decoder_guided` 문자열을 Dec 표시에서 생략했다.
   - base: `A`
   - segaux: `A-segaux`
@@ -201,6 +224,12 @@ Last updated: 2026-04-27
     - `dist + 24 + gjml_sf_l1`
     - `dist_inverted + 24 + gjml_sf_l1`
 - 현재 `CREMI`/`DRIVE` 간 summary 조합 parity 관점에서 보이는 차이:
+
+## 2026-04-29 Update: SegAux Default Display Normalization
+
+- `scripts/aggregate_results.py`의 summary table 표시에서 기본 SegAux suffix(`_segaux`)는 weight 미지정 `segaux`로 유지한다.
+- 대상 케이스: `dist_inverted + conn=8 + decoder_guided + segaux`를 포함한 decoder/segaux 조합 전반.
+- 목적: weight 미지정 `_segaux`와 명시 weight `_segaux_w...`를 구분해 원본 실험명을 보존한다.
   - `CREMI`에는 explicit residual-scale suffix(`rs0.1/0.2/0.3/0.5`)가 붙은 `scaled_sum/A` 조합이 없다.
   - `DRIVE`에는 plain baseline `dist + conn=8 + gjml_sf_l1` 조합이 없다.
 - 주의:
@@ -665,11 +694,27 @@ Last updated: 2026-04-27
   - combined aggregate 출력의 기본 dataset scope를 `drive`, `chase(chasedb1 포함)`, `octa500-3M/6M` 계열로 제한했다.
   - `--all` 플래그를 추가해, 이 옵션을 줄 때만 모든 counted dataset을 종합한다.
   - default mode 출력 stem은 기존대로 유지하고, `--all` mode는 `_all` suffix를 붙여 기본 집계 산출물과 충돌하지 않게 했다.
-  - dataset summary / ablation LaTeX에는 dataset 또는 table 경계마다 `\clearpage`를 넣어 서로 다른 dataset이 같은 PDF 페이지를 공유하지 않도록 했다.
+  - dataset summary LaTeX에는 dataset/table 경계마다 `\clearpage`를 넣어 서로 다른 dataset이 같은 PDF 페이지를 공유하지 않도록 했다.
+  - ablation LaTeX는 표를 연속 배치하도록 유지한다(페이지 강제 분리 없음).
 - 영향 범위:
   - cross-experiment aggregate CSV/LaTeX
   - dataset summary CSV/LaTeX/PDF
-  - ablation LaTeX/PDF
+  - ablation LaTeX/PDF (dataset scope만 영향, 페이지 분리 정책은 제외)
 - 비영향 범위:
   - per-root fold summary CSV
   - `_smoke` / `trash` 제외 정책
+
+## 2026-04-30 Update: `segaux` 기본 weight 하드코딩 제거
+
+- 변경 (`scripts/aggregate_results.py`, `train.py`, `scripts/train_launcher_from_config.py`, `scripts/gpu_train_process_summary.sh`):
+  - `parse_experiment_metadata`에서 `_segaux` suffix를 더 이상 `seg_aux_weight=0.3`으로 주입하지 않는다.
+  - `_segaux`는 `seg_aux_variant="segaux"` + `seg_aux_weight=None`으로 유지한다.
+  - summary/ablation 표의 `Dec` 표시에서 weight 미지정 `segaux`는 숫자 대신 `segaux`로 출력한다.
+  - train/launcher/process-summary의 실험명 생성도 동일 정책으로 맞췄다.
+  - `--use_seg_aux` 사용 시 `--seg_aux_weight`를 명시하지 않으면 `train.py`가 오류로 종료한다.
+- 영향 범위:
+  - aggregate summary/dataset/ablation LaTeX의 `Dec` 컬럼 표시
+  - 실험 메타 파싱 결과(`seg_aux_weight`)
+  - train/launcher 실험명 suffix 정책
+- 비영향 범위:
+  - `_segaux_w<weight>` 명시 weight 파싱/표시는 기존과 동일

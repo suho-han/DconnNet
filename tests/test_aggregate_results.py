@@ -198,7 +198,7 @@ def test_decoder_guided_is_parsed_as_fusion_objective():
     assert meta["conn_num"] == 8
     assert meta["conn_layout"] == "default"
     assert meta["loss"] == "gjml_sf_l1"
-    assert meta["conn_fusion"] == "decoder_guided"
+    assert meta["conn_fusion"] == "dg"
     assert meta["fusion_loss_profile"] == "A"
 
 
@@ -209,9 +209,9 @@ def test_ordered_name_with_segaux_suffix_keeps_conn_and_loss_metadata():
     assert meta["conn_num"] == 8
     assert meta["conn_layout"] == "default"
     assert meta["loss"] == "gjml_sf_l1"
-    assert meta["conn_fusion"] == "decoder_guided"
+    assert meta["conn_fusion"] == "dg"
     assert meta["fusion_loss_profile"] == "A"
-    assert meta["seg_aux_weight"] == 0.3
+    assert meta["seg_aux_weight"] is None
     assert meta["seg_aux_variant"] == "segaux"
 
 
@@ -221,13 +221,25 @@ def test_ordered_name_with_segaux_weight_suffix_parses_numeric_weight():
     assert meta["seg_aux_variant"] == "w0.1"
 
 
-def test_dataset_table_keeps_decoder_guided_in_fusion_column(tmp_path):
+def test_dg_direct_is_parsed_as_distinct_fusion_objective():
+    meta = parse_experiment_metadata("binary_dg_direct_A_8_bce_segaux_w0.5")
+    assert meta["experiment"] == "binary_dg_direct_A"
+    assert meta["label_mode"] == "binary"
+    assert meta["conn_num"] == 8
+    assert meta["loss"] == "bce"
+    assert meta["conn_fusion"] == "dg_direct"
+    assert meta["fusion_loss_profile"] == "A"
+    assert meta["seg_aux_weight"] == 0.5
+    assert meta["seg_aux_variant"] == "w0.5"
+
+
+def test_dataset_table_keeps_dg_in_fusion_column(tmp_path):
     rows_by_dataset = {
         "cremi": [
             _row(
                 "cremi",
                 "dist_inverted_decoder_guided_A",
-                conn_fusion="decoder_guided",
+                conn_fusion="dg",
                 fusion_loss_profile="A",
             )
         ],
@@ -241,7 +253,7 @@ def test_dataset_table_keeps_decoder_guided_in_fusion_column(tmp_path):
     )
 
     text = out_path.read_text()
-    assert r"dist\_inverted & 8 & decoder\_guided & none & bce" in text
+    assert r"dist\_inverted & 8 & dg & none & bce" in text
 
 
 def test_dataset_table_shows_segaux_weight_in_dec_column(tmp_path):
@@ -250,7 +262,7 @@ def test_dataset_table_shows_segaux_weight_in_dec_column(tmp_path):
             _row(
                 "drive",
                 "dist_inverted_decoder_guided_A",
-                conn_fusion="decoder_guided",
+                conn_fusion="dg",
                 fusion_loss_profile="A",
                 seg_aux_weight=0.1,
                 seg_aux_variant="w0.1",
@@ -266,7 +278,7 @@ def test_dataset_table_shows_segaux_weight_in_dec_column(tmp_path):
     )
 
     text = out_path.read_text()
-    assert r"dist\_inverted & 8 & decoder\_guided & w0.1 & bce" in text
+    assert r"dist\_inverted & 8 & dg & w0.1 & bce" in text
 
 
 def test_dataset_table_shows_default_segaux_in_dec_column(tmp_path):
@@ -275,9 +287,9 @@ def test_dataset_table_shows_default_segaux_in_dec_column(tmp_path):
             _row(
                 "drive",
                 "dist_inverted_decoder_guided_A",
-                conn_fusion="decoder_guided",
+                conn_fusion="dg",
                 fusion_loss_profile="A",
-                seg_aux_weight=0.3,
+                seg_aux_weight=None,
                 seg_aux_variant="segaux",
             )
         ],
@@ -291,15 +303,15 @@ def test_dataset_table_shows_default_segaux_in_dec_column(tmp_path):
     )
 
     text = out_path.read_text()
-    assert r"dist\_inverted & 8 & decoder\_guided & segaux & bce" in text
+    assert r"dist\_inverted & 8 & dg & segaux & bce" in text
 
 
-def test_ablation_table_hides_decoder_guided_profile_a(tmp_path):
+def test_ablation_table_hides_dg_profile_a(tmp_path):
     rows = [
         _row(
             "drive",
             "dist_inverted_decoder_guided_A",
-            conn_fusion="decoder_guided",
+            conn_fusion="dg",
             fusion_loss_profile="A",
         )
     ]
@@ -309,8 +321,8 @@ def test_ablation_table_hides_decoder_guided_profile_a(tmp_path):
 
     text = out_path.read_text()
     assert r"\multirow{2}{*}{No.}" in text
-    assert r"decoder\_guided &  & none" in text
-    assert r"decoder\_guided & A & none" not in text
+    assert r"dg &  & none" in text
+    assert r"dg & A & none" not in text
 
 
 def test_dataset_table_hides_scaled_sum_profile_a_but_keeps_rs(tmp_path):
@@ -803,7 +815,7 @@ def test_default_scope_ablation_excludes_cremi_and_isic(tmp_path):
     assert r"\multicolumn{2}{c}{octa500--3M}" in text
     assert r"\multicolumn{2}{c}{cremi}" not in text
     assert r"\multicolumn{2}{c}{isic}" not in text
-    assert r"\clearpage" in text
+    assert r"\clearpage" not in text
 
 
 def test_cross_experiment_latex_ignores_trash_dataset(tmp_path):

@@ -1,27 +1,15 @@
 import argparse
-import glob
 import os
 import random
 
 import autorootcwd
-# from GetDataset import MyDataset
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from skimage.io import imread, imsave
-from torch.autograd import Variable
-from torchvision import datasets, transforms
 
 from connect_loss import is_default_connectivity_layout, normalize_conn_layout, resolve_connectivity_layout
-from data_loader.GetDataset_CHASE import MyDataset_CHASE, MyDataset_DRIVE, MyDataset_OCTA500
-from data_loader.GetDataset_CREMI import getdataset_cremi
-from data_loader.GetDataset_ISIC2018 import ISIC2018_dataset
-from data_loader.GetDataset_Retouch import MyDataset
-from model.DconnNet import DconnNet
+from model.DconnNet import DconnNet, normalize_conn_fusion_mode
 from solver import Solver
+from src.data import build_dataloaders, build_datasets
 
 
 def get_experiment_output_name(args):
@@ -29,7 +17,7 @@ def get_experiment_output_name(args):
     if not is_default_connectivity_layout(args.conn_num, args.conn_layout):
         layout_suffix = f'_{args.conn_layout}'
 
-    conn_fusion = str(getattr(args, 'conn_fusion', 'none'))
+    conn_fusion = normalize_conn_fusion_mode(getattr(args, 'conn_fusion', 'none'))
     if conn_fusion == 'none':
         if args.label_mode == 'binary':
             base_name = f'binary_{args.conn_num}{layout_suffix}_bce'
@@ -48,8 +36,8 @@ def get_experiment_output_name(args):
             base_name = f"{args.label_mode}_{fusion_tag}_{args.conn_num}{layout_suffix}_{args.dist_aux_loss}"
 
     if getattr(args, 'use_seg_aux', False):
-        weight = getattr(args, 'seg_aux_weight', 0.3)
-        if weight != 0.3:
+        weight = getattr(args, 'seg_aux_weight', None)
+        if weight is not None:
             base_name = f"{base_name}_segaux_w{weight}"
         else:
             base_name = f"{base_name}_segaux"
@@ -77,46 +65,6 @@ def seed_worker(worker_id):
     torch.manual_seed(worker_seed)
 
 
-def _resolve_retouch_case_roots(data_root, device_name):
-    device_root = os.path.join(data_root, device_name)
-    candidate_roots = [
-        os.path.join(device_root, 'all'),
-        os.path.join(device_root, 'train'),
-        device_root,
-    ]
-
-    for candidate in candidate_roots:
-        case_dirs = sorted(glob.glob(os.path.join(candidate, 'TRAIN*')))
-        case_dirs = [p for p in case_dirs if os.path.isdir(p)]
-        if case_dirs:
-            return case_dirs
-
-    searched = ', '.join(candidate_roots)
-    raise FileNotFoundError(
-        f'Could not find RETOUCH TRAIN* case folders for {device_name}. '
-        f'Searched: {searched}'
-    )
-
-
-def _get_retouch_fold_indices(device_name, exp_id):
-    if device_name in ('Cirrus', 'Spectrailis'):
-        total = 24
-        start = exp_id * 8
-        end = (exp_id + 1) * 8
-        test_id = list(range(start, end))
-    elif device_name == 'Topcon':
-        total = 22
-        if exp_id < 2:
-            test_id = list(range(exp_id * 7, (exp_id + 1) * 7))
-        else:
-            test_id = list(range(14, 22))
-    else:
-        raise ValueError(f'Unsupported RETOUCH device: {device_name}')
-
-    train_id = sorted(set(range(total)) - set(test_id))
-    return total, train_id, test_id
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description='DconnNet Training With Pytorch')
@@ -126,10 +74,10 @@ def parse_args():
                         help='global random seed for reproducible training/evaluation')
 
     # dataset info
-    parser.add_argument('--dataset', type=str, default='retouch-Spectrailis',
-                        help='retouch-Spectrailis,retouch-Cirrus,retouch-Topcon, isic, chase, drive, octa500, cremi')
+    parser.add_argument('--dataset', type=str, default='drive',
+                        help='isic, chase, drive, octa500-3M, octa500-6M, cremi')
 
-    parser.add_argument('--data_root', type=str, default='/retouch',
+    parser.add_argument('--data_root', type=str, default='data/DRIVE',
                         help='dataset directory (e.g. data/CREMI for --dataset cremi)')
     parser.add_argument('--resize', type=int, default=[256, 256], nargs='+',
                         help='image size: [height, width]')
@@ -153,8 +101,6 @@ def parse_args():
     parser.add_argument('--gamma', type=float, default=0.5,
                         help='define only when you select step lr optimization: what is the annealing rate for reducing your lr (lr = lr*gamma)')
 
-    parser.add_argument('--use_SDL', action='store_true', default=False,
-                        help='set as True if use SDL loss; only for Retouch dataset in this code. If you use it with other dataset please define your own path of label distribution in solver.py')
     parser.add_argument('--folds', type=int, default=1,
                         help='define folds number K for K-fold validation')
     parser.add_argument('--target_fold', type=int, default=None,
@@ -165,7 +111,7 @@ def parse_args():
                         choices=['standard8', 'full24', 'out8'],
                         help='connectivity layout: default is standard8 for conn_num=8 and full24 for conn_num=24')
     parser.add_argument('--conn_fusion', type=str, default='none',
-                        choices=['none', 'gate', 'scaled_sum', 'conv_residual', 'decoder_guided'],
+                        choices=['none', 'gate', 'scaled_sum', 'conv_residual', 'decoder_guided', 'dg', 'dg_direct'],
                         help='fork-specific directional fusion mode; none keeps legacy path')
     parser.add_argument('--fusion_loss_profile', type=str, default='A',
                         choices=['A', 'B', 'C'],
@@ -182,7 +128,7 @@ def parse_args():
     # New options for SegAux and DGRF
     parser.add_argument('--use_seg_aux', action='store_true', default=False,
                         help='Enable Segmentation Auxiliary Supervision')
-    parser.add_argument('--seg_aux_weight', type=float, default=0.3,
+    parser.add_argument('--seg_aux_weight', type=float, default=None,
                         help='weight for SegAux BCE loss')
     parser.add_argument('--fusion_gate_reg_weight', type=float, default=0.01,
                         help='weight for DGRF gate regularization loss')
@@ -204,8 +150,6 @@ def parse_args():
     # checkpoint and log
     parser.add_argument('--pretrained', type=str, default=None,
                         help='put the path to resuming file if needed')
-    parser.add_argument('--weights', type=str, default='/data_loader/retouch_weights/',
-                        help='path of SDL weights')
     parser.add_argument('--save', default='save',
                         help='Directory for saving checkpoint models')
     parser.add_argument('--output_dir', type=str, default='output/',
@@ -246,6 +190,7 @@ def parse_args():
         args.conn_layout = normalize_conn_layout(args.conn_num, args.conn_layout)
     except ValueError as exc:
         parser.error(str(exc))
+    args.conn_fusion = normalize_conn_fusion_mode(args.conn_fusion)
 
     if args.output_dir:
         args.save = os.path.join(
@@ -259,6 +204,14 @@ def parse_args():
     if args.target_fold is not None:
         if args.target_fold < 1 or args.target_fold > args.folds:
             parser.error('--target_fold must be within [1, --folds]')
+
+    if str(args.dataset).startswith('retouch'):
+        parser.error('RETOUCH dataset is no longer supported in active training workflow')
+
+    if args.use_seg_aux and args.seg_aux_weight is None:
+        parser.error('--use_seg_aux requires explicit --seg_aux_weight')
+    if args.conn_fusion == 'dg_direct' and not args.use_seg_aux:
+        parser.error('conn_fusion=dg_direct requires --use_seg_aux')
 
     if args.num_class != 1 and args.conn_layout != 'standard8':
         parser.error('multi-class mode currently supports only conn_layout=standard8')
@@ -308,113 +261,26 @@ def main(args):
     torch.cuda.set_device(args.device)  # GPU id
     seed_everything(args.seed)
 
-    ## K-fold cross validation ##
-    if args.target_fold is None:
-        exp_indices = range(args.folds)
-    else:
-        exp_indices = [args.target_fold - 1]
-
     seed_everything(args.seed)
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
 
-    validset = None
-    testset = None
-    val_loader = None
-    test_loader = None
-
-    if args.dataset == 'isic':
-        trainset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='train', with_name=False)
-        validset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='validation', with_name=False)
-        testset = ISIC2018_dataset(dataset_folder=args.data_root, folder='0', train_type='test', with_name=False)
-
-    elif 'retouch' in args.dataset:
-        if len(exp_indices) != 1:
-            raise ValueError(
-                'RETOUCH uses fixed 3-fold patient splits and currently supports one fold per run. '
-                'Please set --folds=3 and provide --target_fold.'
-            )
-
-        device_name = args.dataset.split('-', 1)[1]
-        exp_id = exp_indices[0]
-        case_roots = _resolve_retouch_case_roots(args.data_root, device_name)
-        total_cases, train_id, test_id = _get_retouch_fold_indices(device_name, exp_id)
-
-        if len(case_roots) < total_cases:
-            raise ValueError(
-                f'Found only {len(case_roots)} RETOUCH cases for {device_name}, '
-                f'but expected at least {total_cases}.'
-            )
-
-        case_roots = case_roots[:total_cases]
-        train_root = [case_roots[i] for i in train_id]
-        test_root = [case_roots[i] for i in test_id]
-
-        trainset = MyDataset(args, train_root=train_root, mode='train')
-        validset = MyDataset(args, train_root=test_root, mode='test')
-
-    elif args.dataset == 'chase':
-        overall_id = ['01', '02', '03', '04', '05', '06',
-                      '07', '08', '09', '10', '11', '12', '13', '14']
-        train_id = overall_id[:10]
-        test_id = overall_id[10:]
-        # print(train_id)
-        trainset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=train_id, mode='train', label_mode=args.label_mode)
-        # CHASE uses the held-out fold as the evaluation split during training
-        # and for the final post-training evaluation.
-        testset = MyDataset_CHASE(args, train_root=args.data_root, pat_ls=test_id, mode='test', label_mode=args.label_mode)
-
-    elif args.dataset == 'drive':
-        trainset = MyDataset_DRIVE(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
-        testset = MyDataset_DRIVE(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
-    elif args.dataset == 'octa500-6M' or args.dataset == 'octa500-3M':
-        trainset = MyDataset_OCTA500(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
-        validset = MyDataset_OCTA500(args, train_root=args.data_root, mode='val', label_mode=args.label_mode)
-        testset = MyDataset_OCTA500(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
-    elif args.dataset == 'cremi':
-        trainset = getdataset_cremi(args, train_root=args.data_root, mode='train', label_mode=args.label_mode)
-        testset = getdataset_cremi(args, train_root=args.data_root, mode='test', label_mode=args.label_mode)
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-        pass
-
-    train_loader = torch.utils.data.DataLoader(
-        dataset=trainset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=8,
-        worker_init_fn=seed_worker,
-        generator=loader_generator,
+    trainset, validset, testset = build_datasets(args)
+    train_loader, val_loader, test_loader = build_dataloaders(
+        args=args,
+        trainset=trainset,
+        validset=validset,
+        testset=testset,
+        seed_worker=seed_worker,
+        loader_generator=loader_generator,
     )
+
     print("Train batch number: %i" % len(train_loader))
     if validset is not None:
-        val_loader = torch.utils.data.DataLoader(
-            dataset=validset,
-            batch_size=1,
-            shuffle=False,
-            pin_memory=True,
-            num_workers=8,
-            worker_init_fn=seed_worker,
-            generator=loader_generator,
-        )
         print("Validation batch number: %i" % len(val_loader))
     if testset is not None:
-        test_loader = torch.utils.data.DataLoader(
-            dataset=testset,
-            batch_size=1,
-            shuffle=False,
-            pin_memory=True,
-            num_workers=8,
-            worker_init_fn=seed_worker,
-            generator=loader_generator,
-        )
         print("Test batch number: %i" % len(test_loader))
-    elif val_loader is not None:
-        # Backward-compatible fallback for datasets that expose only one held-out split.
-        test_loader = val_loader
 
-        #### Above: define how you get the data on your own dataset ######
     model = DconnNet(
         num_class=args.num_class,
         conn_num=args.conn_num,

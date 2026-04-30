@@ -35,6 +35,7 @@ scripts/train_launcher.sh --config scripts/configs/drive_fusion_scaled_sum_multi
 scripts/train_launcher.sh --config scripts/configs/drive_cremi_dgrf_binary.yaml --dry_run
 scripts/train_launcher.sh --config scripts/configs/cremi_dgrf_binary.yaml --dry_run
 scripts/train_launcher.sh --config scripts/configs/cremi_dgrf_dist_smooth_l1.yaml --dry_run
+scripts/train_launcher.sh --config scripts/configs/cremi_dg_direct_binary_segaux_w0.5.yaml --dry_run
 scripts/train_launcher.sh --config scripts/configs/drive_dgrf_binary_segaux_w0.5.yaml --dry_run
 scripts/train_launcher.sh --config scripts/configs/other_datasets_dgrf_binary_segaux_w0.5.yaml --dry_run
 ```
@@ -98,9 +99,12 @@ multi:
 - `direction_grouping`, `direction_fusion` 키는 제거되어 더 이상 지원되지 않습니다.
 - `decoder_fusion`, `decoder_fusions`, `lambda_vote_aux` 키는 제거되어 더 이상 지원되지 않습니다.
 - `conn_fusion != none`은 현재 single-class/`conn_num=8`/`conn_layout=standard8` 조합만 지원합니다.
-- RETOUCH 계열은 현재 `folds: 3` 정책과 `conn_num: 8` 정책을 유지합니다.
-- `scripts/configs/drive_cremi_dgrf_binary.yaml`은 `binary + decoder_guided/A`를 `drive, cremi`에만 별도 스케줄링하는 fork-specific config입니다.
-- `scripts/configs/cremi_dgrf_binary.yaml`은 `cremi` 전용 `binary + decoder_guided/A` 단일 run config입니다.
-- `scripts/configs/cremi_dgrf_dist_smooth_l1.yaml`은 `cremi` 전용 `dist + decoder_guided/A + smooth_l1` 단일 run config입니다.
-- `scripts/configs/drive_dgrf_binary_segaux_w0.5.yaml`은 `drive` 전용 `binary + decoder_guided/A + segaux_w0.5` 단일 run config입니다.
-- `scripts/configs/other_datasets_dgrf_binary_segaux_w0.5.yaml`은 `chase`, `cremi`, `isic2018`, `octa500-3M`, `octa500-6M`에 같은 `binary + decoder_guided/A + segaux_w0.5` 규칙을 적용하는 config입니다.
+- RETOUCH 계열은 현재 launcher에서 지원하지 않습니다.
+- `decoder_guided`는 launcher 입력에서 legacy alias로 허용되지만, 새 canonical 이름은 `dg`입니다.
+- `dg_direct`는 `SegAux`를 켠 상태에서만 허용되며, `SegAux` mask head에 `final_feat`만 사용합니다.
+- `scripts/configs/drive_cremi_dgrf_binary.yaml`은 `binary + dg/A`를 `drive, cremi`에만 별도 스케줄링하는 fork-specific config입니다.
+- `scripts/configs/cremi_dgrf_binary.yaml`은 `cremi` 전용 `binary + dg/A` 단일 run config입니다.
+- `scripts/configs/cremi_dgrf_dist_smooth_l1.yaml`은 `cremi` 전용 `dist + dg/A + smooth_l1` 단일 run config입니다.
+- `scripts/configs/cremi_dg_direct_binary_segaux_w0.5.yaml`은 `cremi` 전용 `binary + dg_direct/A + segaux_w0.5` 단일 run config입니다.
+- `scripts/configs/drive_dgrf_binary_segaux_w0.5.yaml`은 `drive` 전용 `binary + dg/A + segaux_w0.5` 단일 run config입니다.
+- `scripts/configs/other_datasets_dgrf_binary_segaux_w0.5.yaml`은 `chase`, `cremi`, `isic2018`, `octa500-3M`, `octa500-6M`에 같은 `binary + dg/A + segaux_w0.5` 규칙을 적용하는 config입니다.

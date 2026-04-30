@@ -1,6 +1,6 @@
 # Testing Notes (Condensed)
 
-Last updated: 2026-04-29
+Last updated: 2026-04-30
 
 ## Scope
 
@@ -10,7 +10,7 @@ Last updated: 2026-04-29
 ## Current Test Suite
 
 - `tests/test_conn_layout_out8.py`: out8 layout, offsets, voting shape, CLI/launcher validation, stdin import fallback
-- `tests/test_conn_fusion.py`: gate/scaled_sum/conv_residual/decoder_guided fusion formulas, loss profile terms, decoder fusion shape/formula, experiment naming
+- `tests/test_conn_fusion.py`: gate/scaled_sum/conv_residual/`dg` fusion formulas, `dg_direct` SegAux path, loss profile terms, decoder fusion shape/formula, experiment naming
 - `tests/test_aggregate_results.py`: dataset grouping order, Fusion/Dec column parsing, drop-one delta logic, trash exclusion, drop-one default-axis rules, CHASE/ISIC section split
 
 2026-04-28 기준 전체 suite: **47 passed**.
@@ -25,6 +25,21 @@ Last updated: 2026-04-29
 - smoke run에서 `cldice/precision/accuracy`가 `nan`을 반환하는 RuntimeWarning이 있으나, 학습 자체는 정상 종료함.
 
 ## Key Validations
+
+### 2026-04-29: 1차 구조 분리/RETOUCH 제거 변경 검증
+
+- `pytest tests/test_conn_layout_out8.py -q`: **12 passed**
+- `pytest tests/test_conn_fusion.py -q`: **16 passed**
+- `pytest tests/test_dist_aux_loss_selection.py -q`: **10 passed**
+- `py_compile`:
+  - `train.py`
+  - `solver.py`
+  - `scripts/train_launcher_from_config.py`
+  - `src/**/*.py`
+- launcher dry-run:
+  - `scripts/configs/drive_train.yaml`
+  - `scripts/configs/cremi_train.yaml`
+  - 두 경우 모두 정상적으로 1-run 명령 생성 확인.
 
 ### 2026-04-27: DRIVE multi-train smoke run
 
@@ -59,3 +74,11 @@ Last updated: 2026-04-29
 - dataset PDF loss-split 테이블 (loss별 별도 캡션) 확인.
 - ambiguous `scaled_sum/A` (rs 미지정) 13개 폴더 `output/trash/ambiguous_scaled_sum_no_rs_2026-04-29/`로 이동 및 집계 제외 확인.
 - `gpu_train_process_summary.sh` bad array subscript 오류 수정 확인.
+
+### 2026-04-30: `dg` / `dg_direct` rename and migration
+
+- `decoder_guided` 입력 alias가 `dg`로 normalize되는 CLI/launcher/aggregate 경로 추가.
+- `dg_direct`는 `use_seg_aux=true`일 때만 허용하도록 검증 추가.
+- 기존 `output/` 및 `output_smoke/`의 `*_decoder_guided_*` 실험 폴더는 `*_dg_*`로 rename 예정/대상 확인 완료.
+- `scripts/aggregate_results.py`, `scripts/gpu_train_process_summary.sh`도 `dg_direct`/legacy alias 표기와 파싱을 반영.
+- `scripts/configs/cremi_dg_direct_binary_segaux_w0.5.yaml` 추가.

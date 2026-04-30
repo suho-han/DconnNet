@@ -10,7 +10,9 @@ multi:
   experiments:
     - conn_num: 8
       conn_layout: standard8
-      label_mode: dist
+      label_mode: binary
       dist_aux_loss: smooth_l1
-      conn_fusion: dg
+      conn_fusion: dg_direct
       fusion_loss_profile: A
+      use_seg_aux: true
+      seg_aux_weight: 0.5

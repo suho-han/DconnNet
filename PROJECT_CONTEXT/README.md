@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT README
 
-Last updated: 2026-04-25
+Last updated: 2026-04-30
 
 ## 목적
 
@@ -49,7 +49,9 @@ Last updated: 2026-04-25
   - `OCTA3M&6M`
   - `Other datasets`
 - 각 dataset table은 여전히 개별 표로 유지됩니다.
-- aggregate PDF에서는 dataset/table 경계마다 `\clearpage`를 넣어 서로 다른 dataset이 같은 페이지에 섞이지 않도록 합니다.
+- aggregate PDF에서 dataset summary 계열은 dataset/table 경계마다 `\clearpage`를 넣어 분리하고, ablation PDF는 연속 배치(페이지 강제 분리 없음) 정책을 사용합니다.
+- `segaux` suffix 파싱 시 기본 weight를 더 이상 주입하지 않습니다. `_segaux`는 weight 미지정 상태로 유지되고 표에는 `segaux`로 표시됩니다.
+- `--use_seg_aux`를 사용하는 학습/런처 경로에서는 `seg_aux_weight`를 명시해야 합니다.
 - `out8` connectivity는 table의 `Conn` 열에서 `8'`로 축약 표기됩니다.
   - launcher configs:
     - `scripts/configs/drive_out8_multi_train.yaml`
@@ -79,7 +81,8 @@ Last updated: 2026-04-25
   - `--lambda_vote_aux`
 - 유지되는 관련 경로:
   - `conn_fusion`
-  - `conn_fusion=decoder_guided`
+  - `conn_fusion=dg` (legacy alias: `decoder_guided`)
+  - `conn_fusion=dg_direct` (`SegAux` decoder-only variant)
   - `SegAux`
 
 ## 참고 문서

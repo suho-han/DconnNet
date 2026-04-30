@@ -111,17 +111,16 @@ ALLOWED_DATASETS = {
     "drive",
     "isic2018",
     "octa500",
-    "retouch",
-    "retouch-Cirrus",
-    "retouch-Spectrailis",
-    "retouch-Topcon",
 }
 ALLOWED_MODES = {"single", "multi"}
 ALLOWED_OCTA_VARIANTS = {"3M", "6M"}
 ALLOWED_RETOUCH_DEVICES = {"Cirrus", "Spectrailis", "Topcon"}
 ALLOWED_MONITOR_METRICS = {"val_dice", "val_loss"}
 ALLOWED_LABEL_MODES = {"binary", "dist", "dist_inverted"}
-ALLOWED_CONN_FUSIONS = {"none", "gate", "scaled_sum", "conv_residual", "decoder_guided"}
+ALLOWED_CONN_FUSIONS = {"none", "gate", "scaled_sum", "conv_residual", "decoder_guided", "dg", "dg_direct"}
+LEGACY_CONN_FUSION_ALIASES = {
+    "decoder_guided": "dg",
+}
 ALLOWED_FUSION_LOSS_PROFILES = {"A", "B", "C"}
 DATASET_PRESETS = {
     "chase": {
@@ -153,6 +152,7 @@ DATASET_PRESETS = {
 
 def normalize_conn_fusion(value: Any) -> str:
     conn_fusion = str(value if value is not None else "none")
+    conn_fusion = LEGACY_CONN_FUSION_ALIASES.get(conn_fusion, conn_fusion)
     if conn_fusion not in ALLOWED_CONN_FUSIONS:
         raise ValueError(
             f"Unsupported conn_fusion: {conn_fusion} "
@@ -469,7 +469,7 @@ def build_experiment_output_name(
     fusion_loss_profile: str = "A",
     fusion_residual_scale: float = 0.2,
     use_seg_aux: bool = False,
-    seg_aux_weight: float = 0.3,
+    seg_aux_weight: float | None = None,
 ) -> str:
     layout_name = normalize_conn_layout(conn_num, conn_layout)
     layout_suffix = "" if is_default_conn_layout(conn_num, layout_name) else f"_{layout_name}"
@@ -491,7 +491,7 @@ def build_experiment_output_name(
             base_name = f"{label_mode}_{fusion_tag}_{conn_num}{layout_suffix}_{dist_aux_loss}"
     
     if use_seg_aux:
-        if abs(seg_aux_weight - 0.3) > 1e-6:
+        if seg_aux_weight is not None:
             base_name = f"{base_name}_segaux_w{seg_aux_weight}"
         else:
             base_name = f"{base_name}_segaux"
@@ -511,7 +511,7 @@ def resolve_pretrained_path(
     fusion_loss_profile: str = "A",
     fusion_residual_scale: float = 0.2,
     use_seg_aux: bool = False,
-    seg_aux_weight: float = 0.3,
+    seg_aux_weight: float | None = None,
 ) -> str:
     exp_name = build_experiment_output_name(
         conn_num=conn_num,
@@ -584,7 +584,7 @@ def build_train_cmd(
     fusion_lambda_fused: float = 0.3,
     fusion_residual_scale: float = 0.2,
     use_seg_aux: bool = False,
-    seg_aux_weight: float = 0.3,
+    seg_aux_weight: float | None = None,
     fusion_gate_reg_weight: float = 0.01,
     conn_aux_c3_weight: float = 0.3,
     conn_aux_c5_weight: float = 0.2,
@@ -639,13 +639,12 @@ def build_train_cmd(
     ]
     if use_seg_aux:
         cmd.append("--use_seg_aux")
-        cmd.extend(["--seg_aux_weight", str(seg_aux_weight)])
-    if conn_fusion == "decoder_guided":
+        if seg_aux_weight is not None:
+            cmd.extend(["--seg_aux_weight", str(seg_aux_weight)])
+    if conn_fusion in {"dg", "dg_direct"}:
         cmd.extend(["--fusion_gate_reg_weight", str(fusion_gate_reg_weight)])
         cmd.extend(["--conn_aux_c3_weight", str(conn_aux_c3_weight)])
         cmd.extend(["--conn_aux_c5_weight", str(conn_aux_c5_weight)])
-    if preset.get("use_sdl", False):
-        cmd.append("--use_SDL")
     if target_fold is not None:
         cmd.extend(["--target_fold", str(target_fold)])
     if output_dir:
@@ -711,7 +710,11 @@ def is_run_completed(run: dict[str, Any]) -> bool:
         fusion_loss_profile=str(run.get("fusion_loss_profile", "A")),
         fusion_residual_scale=float(run.get("fusion_residual_scale", 0.2)),
         use_seg_aux=bool(run.get("use_seg_aux", False)),
-        seg_aux_weight=float(run.get("seg_aux_weight", 0.3)),
+        seg_aux_weight=(
+            None
+            if run.get("seg_aux_weight") is None
+            else float(run.get("seg_aux_weight"))
+        ),
     )
     exp_dir = Path(output_dir) / dataset / exp_name
 
@@ -764,6 +767,8 @@ def send_telegram_alert(
 
 def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str, Any]]:
     dataset = config["dataset"]
+    if dataset == "retouch" or str(dataset).startswith("retouch-"):
+        raise ValueError("RETOUCH dataset is no longer supported by launcher")
     single_cfg = config.get("single") or {}
     if not isinstance(single_cfg, dict):
         raise ValueError("single block must be a mapping")
@@ -824,6 +829,8 @@ def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str,
                 raise ValueError("conn_fusion supports only conn_num=8")
             if conn_layout != "standard8":
                 raise ValueError("conn_fusion supports only conn_layout=standard8")
+        if conn_fusion == "dg_direct" and not use_seg_aux:
+            raise ValueError("conn_fusion=dg_direct requires use_seg_aux=true")
 
     if dataset == "octa500":
         target_folds = [None]
@@ -932,6 +939,8 @@ def build_single_schedule(config: dict[str, Any], device: int) -> list[dict[str,
 
 
 def build_multi_schedule(config: dict[str, Any], device: int, datasets: list[str]) -> list[dict[str, Any]]:
+    if any(dataset == "retouch" or str(dataset).startswith("retouch-") for dataset in datasets):
+        raise ValueError("RETOUCH dataset is no longer supported by launcher")
     multi_cfg = config.get("multi") or {}
     if not isinstance(multi_cfg, dict):
         raise ValueError("multi block must be a mapping")
@@ -1214,7 +1223,18 @@ def build_multi_schedule(config: dict[str, Any], device: int, datasets: list[str
                         raise ValueError("multi.experiments with conn_fusion requires conn_layout=standard8")
 
                 exp_use_seg_aux = bool(exp_cfg.get("use_seg_aux", False))
-                exp_seg_aux_weight = float(exp_cfg.get("seg_aux_weight", 0.3))
+                exp_seg_aux_weight = (
+                    None
+                    if exp_cfg.get("seg_aux_weight") is None
+                    else float(exp_cfg.get("seg_aux_weight"))
+                )
+                if exp_conn_fusion == "dg_direct" and not exp_use_seg_aux:
+                    raise ValueError("multi.experiments with conn_fusion=dg_direct requires use_seg_aux=true")
+                if exp_use_seg_aux and exp_seg_aux_weight is None:
+                    raise ValueError(
+                        f"multi.experiments[{exp_idx}] uses use_seg_aux=true "
+                        "but does not set seg_aux_weight"
+                    )
                 exp_device = int(exp_cfg.get("device", device))
 
                 runs.append(
@@ -1387,7 +1407,11 @@ def main() -> int:
                 fusion_lambda_fused=float(run.get("fusion_lambda_fused", 0.3)),
                 fusion_residual_scale=float(run.get("fusion_residual_scale", 0.2)),
                 use_seg_aux=bool(run.get("use_seg_aux", False)),
-                seg_aux_weight=float(run.get("seg_aux_weight", 0.3)),
+                seg_aux_weight=(
+                    None
+                    if run.get("seg_aux_weight") is None
+                    else float(run.get("seg_aux_weight"))
+                ),
                 fusion_gate_reg_weight=float(run.get("fusion_gate_reg_weight", 0.01)),
                 conn_aux_c3_weight=float(run.get("conn_aux_c3_weight", 0.3)),
                 conn_aux_c5_weight=float(run.get("conn_aux_c5_weight", 0.2)),

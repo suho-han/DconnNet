@@ -2,6 +2,12 @@
 
 Last updated: 2026-04-29
 
+## 2026-04-30 naming update
+
+- legacy `decoder_guided`는 canonical 이름 `dg`로 정리합니다.
+- 새 `dg_direct`는 fused connectivity는 `dg`와 같고, `SegAux` mask head만 `final_feat` 단독 입력을 사용합니다.
+- 기존 `*_decoder_guided_*` 결과 폴더는 `*_dg_*`로 rename 대상입니다.
+
 ## 범위
 
 - 기준 커밋: `c33561ded94368a51a741bbb105b40d533051a2a`
@@ -375,3 +381,11 @@ Profile C:
 - `C_fused`: 포크에서 새로 정의한 최종 connectivity 결합 결과입니다.
 - `aux(mapped_c5)`: `final_feat` 이후가 아니라 깊은 `c5` branch에서 오는 기존 auxiliary 표현입니다.
 - `mask_logit`: `SegAux`가 켜졌을 때만 생기는 보조 segmentation 출력입니다.
+
+## 2026-04-29 Update: CHASE scaled_sum residual ablation pending-only config
+
+- `scripts/configs/drive_chase_scaled_sum_residual_ablation.yaml`를 미완료 조합만 남기도록 정리했다.
+- 완료된 `drive` 조합과 완료된 `chase` 조합을 제외하고, 아래 9개만 남긴 상태다.
+  - `chase`: `dist + gjml_sf_l1 + rs0.5` (1개)
+  - `chase`: `dist_inverted + smooth_l1 + rs{0.1,0.2,0.3,0.5}` (4개)
+  - `chase`: `dist_inverted + gjml_sf_l1 + rs{0.1,0.2,0.3,0.5}` (4개)

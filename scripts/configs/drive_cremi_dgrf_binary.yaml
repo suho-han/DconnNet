@@ -10,5 +10,5 @@ multi:
   conn_layouts: [ standard8 ]
   label_modes: [ binary ]
   fusion_matrix:
-    - conn_fusion: decoder_guided
+    - conn_fusion: dg
       fusion_loss_profiles: [ A ]

@@ -22,6 +22,15 @@ from model.resnet import resnet34
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 
+LEGACY_CONN_FUSION_ALIASES = {
+    'decoder_guided': 'dg',
+}
+
+
+def normalize_conn_fusion_mode(mode):
+    normalized = str(mode if mode is not None else 'none')
+    return LEGACY_CONN_FUSION_ALIASES.get(normalized, normalized)
+
 OUTER_8_NATIVE_ORDER = [
     (-2, -2),
     (-2, 0),
@@ -149,6 +158,20 @@ class ConnectivitySegHead(nn.Module):
         return self.head(x)
 
 
+class DecoderOnlySegHead(nn.Module):
+    def __init__(self, dec_ch, hidden_ch=64):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(dec_ch, hidden_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, 1, kernel_size=1),
+        )
+
+    def forward(self, D):
+        return self.head(D)
+
+
 class DconnNet(nn.Module):
     def __init__(
         self,
@@ -165,16 +188,17 @@ class DconnNet(nn.Module):
         self.num_class = num_class
         self.connectivity_layout = resolve_connectivity_layout(conn_num, conn_layout)
         self.conn_num = self.connectivity_layout['channel_count']
-        self.conn_fusion = str(conn_fusion)
+        self.conn_fusion = normalize_conn_fusion_mode(conn_fusion)
         self.fusion_residual_scale = float(fusion_residual_scale)
         self.use_seg_aux = use_seg_aux
 
-        allowed_fusion_modes = {'none', 'gate', 'scaled_sum', 'conv_residual', 'decoder_guided'}
+        allowed_fusion_modes = {'none', 'gate', 'scaled_sum', 'conv_residual', 'dg', 'dg_direct'}
         if self.conn_fusion not in allowed_fusion_modes:
             raise ValueError(
                 f"Unsupported conn_fusion mode: {self.conn_fusion} "
                 f"(supported: {sorted(allowed_fusion_modes)})"
             )
+        self.seg_aux_mode = 'decoder_only' if self.conn_fusion == 'dg_direct' else 'connectivity'
 
         out_planes = num_class * self.conn_num
         self.backbone = resnet34(pretrained=True)
@@ -227,11 +251,14 @@ class DconnNet(nn.Module):
                 self.fusion_gate_conv = nn.Conv2d(out_planes * 2, out_planes, 1)
             elif self.conn_fusion == 'conv_residual':
                 self.fusion_residual_conv = nn.Conv2d(out_planes, out_planes, 1)
-            elif self.conn_fusion == 'decoder_guided':
+            elif self.conn_fusion in {'dg', 'dg_direct'}:
                 self.decoder_guided_fusion = DecoderGuidedResidualFusion(dec_ch=32, conn_ch=out_planes, hidden_ch=64)
 
         if self.use_seg_aux:
-            self.seg_head = ConnectivitySegHead(dec_ch=32, conn_ch=out_planes, hidden_ch=64)
+            if self.seg_aux_mode == 'decoder_only':
+                self.seg_head = DecoderOnlySegHead(dec_ch=32, hidden_ch=64)
+            else:
+                self.seg_head = ConnectivitySegHead(dec_ch=32, conn_ch=out_planes, hidden_ch=64)
 
     def forward(self, x):
 
@@ -283,7 +310,7 @@ class DconnNet(nn.Module):
             c5_logits_native = self.upsample4x_op(c5_logits_native)
             c5_logits_aligned = reorder_outer8_to_standard8(c5_logits_native)
 
-            if self.conn_fusion == 'decoder_guided':
+            if self.conn_fusion in {'dg', 'dg_direct'}:
                 final_feat_up = self.upsample4x_op(final_feat)
                 c_fused_logits, beta = self.decoder_guided_fusion(final_feat_up, c3_logits, c5_logits_aligned)
             else:
@@ -303,12 +330,15 @@ class DconnNet(nn.Module):
                 'outer_aligned': c5_logits_aligned,
                 'aux': mapped_c5,
             }
-            if self.conn_fusion == 'decoder_guided':
+            if self.conn_fusion in {'dg', 'dg_direct'}:
                 output_dict['fusion_gate'] = beta
 
             if getattr(self, 'use_seg_aux', False):
                 final_feat_up = self.upsample4x_op(final_feat)
-                output_dict['mask_logit'] = self.seg_head(final_feat_up, c_fused_logits)
+                if self.seg_aux_mode == 'decoder_only':
+                    output_dict['mask_logit'] = self.seg_head(final_feat_up)
+                else:
+                    output_dict['mask_logit'] = self.seg_head(final_feat_up, c_fused_logits)
 
             return output_dict
 

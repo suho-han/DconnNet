@@ -23,6 +23,17 @@ trim() {
   printf '%s' "${value}"
 }
 
+normalize_conn_fusion() {
+  local conn_fusion="${1:-none}"
+  if [[ -z "${conn_fusion}" ]]; then
+    conn_fusion="none"
+  fi
+  if [[ "${conn_fusion}" == "decoder_guided" ]]; then
+    conn_fusion="dg"
+  fi
+  printf '%s' "${conn_fusion}"
+}
+
 normalize_output_dir() {
   local output_dir="$1"
   if [[ -z "${output_dir}" ]]; then
@@ -49,7 +60,7 @@ build_experiment_name() {
   local conn_fusion="$5"
   local fusion_loss_profile="$6"
   local use_seg_aux="${7:-0}"
-  local seg_aux_weight="${8:-0.3}"
+  local seg_aux_weight="${8:-}"
   local fusion_residual_scale="${9:-0.2}"
   local base_name
   local layout_suffix=""
@@ -65,9 +76,7 @@ build_experiment_name() {
     layout_suffix="_${conn_layout}"
   fi
 
-  if [[ -z "${conn_fusion}" ]]; then
-    conn_fusion="none"
-  fi
+  conn_fusion="$(normalize_conn_fusion "${conn_fusion}")"
   if [[ -z "${fusion_loss_profile}" ]]; then
     fusion_loss_profile="A"
   fi
@@ -93,13 +102,10 @@ build_experiment_name() {
   fi
 
   if [[ "${use_seg_aux}" == "1" ]]; then
-    # Keep suffix policy consistent with train.py/get_experiment_output_name():
-    # - default (0.3): _segaux
-    # - non-default:   _segaux_w<weight>
-    if awk -v w="${seg_aux_weight}" 'BEGIN { d=w-0.3; if (d<0) d=-d; exit (d <= 1e-6) ? 0 : 1 }'; then
-      base_name="${base_name}_segaux"
-    else
+    if [[ -n "${seg_aux_weight}" ]]; then
       base_name="${base_name}_segaux_w${seg_aux_weight}"
+    else
+      base_name="${base_name}_segaux"
     fi
   fi
 
@@ -126,6 +132,7 @@ parse_experiment_name_fields() {
   if [[ "${base_name}" =~ ^binary_([A-Za-z0-9_]+)_([ABC])_rs([0-9]*\.?[0-9]+)_([0-9]+)(_([A-Za-z0-9]+))?_bce$ ]]; then
     label_mode="binary"
     conn_fusion="${BASH_REMATCH[1]}"
+    conn_fusion="$(normalize_conn_fusion "${conn_fusion}")"
     fusion_loss_profile="${BASH_REMATCH[2]}"
     conn_num="${BASH_REMATCH[4]}"
     conn_layout="${BASH_REMATCH[6]}"
@@ -140,6 +147,7 @@ parse_experiment_name_fields() {
   if [[ "${base_name}" =~ ^binary_([A-Za-z0-9_]+)_([ABC])_([0-9]+)(_([A-Za-z0-9]+))?_bce$ ]]; then
     label_mode="binary"
     conn_fusion="${BASH_REMATCH[1]}"
+    conn_fusion="$(normalize_conn_fusion "${conn_fusion}")"
     fusion_loss_profile="${BASH_REMATCH[2]}"
     conn_num="${BASH_REMATCH[3]}"
     conn_layout="${BASH_REMATCH[5]}"
@@ -168,6 +176,7 @@ parse_experiment_name_fields() {
   if [[ "${base_name}" =~ ^(dist|dist_inverted)_([A-Za-z0-9_]+)_([ABC])_rs([0-9]*\.?[0-9]+)_([0-9]+)(_([A-Za-z0-9]+))?_(.+)$ ]]; then
     label_mode="${BASH_REMATCH[1]}"
     conn_fusion="${BASH_REMATCH[2]}"
+    conn_fusion="$(normalize_conn_fusion "${conn_fusion}")"
     fusion_loss_profile="${BASH_REMATCH[3]}"
     conn_num="${BASH_REMATCH[5]}"
     conn_layout="${BASH_REMATCH[7]}"
@@ -186,6 +195,7 @@ parse_experiment_name_fields() {
   if [[ "${base_name}" =~ ^(dist|dist_inverted)_([A-Za-z0-9_]+)_([ABC])_([0-9]+)(_([A-Za-z0-9]+))?_(.+)$ ]]; then
     label_mode="${BASH_REMATCH[1]}"
     conn_fusion="${BASH_REMATCH[2]}"
+    conn_fusion="$(normalize_conn_fusion "${conn_fusion}")"
     fusion_loss_profile="${BASH_REMATCH[3]}"
     conn_num="${BASH_REMATCH[4]}"
     conn_layout="${BASH_REMATCH[6]}"
@@ -624,7 +634,7 @@ try:
             fusion_loss_profile=run.get("fusion_loss_profile", "A"),
             fusion_residual_scale=float(run.get("fusion_residual_scale", 0.2)),
             use_seg_aux=bool(run.get("use_seg_aux", False)),
-            seg_aux_weight=float(run.get("seg_aux_weight", 0.3)),
+            seg_aux_weight=run.get("seg_aux_weight"),
         )
         output_dir = str(run.get("output_dir", config.get("output_dir", "output")))
         target_fold = run.get("target_fold")
@@ -876,7 +886,7 @@ while IFS=',' read -r raw_pid raw_gpu_uuid raw_mem; do
   if has_flag "use_seg_aux" "${argv[@]}"; then
     use_seg_aux="1"
   fi
-  seg_aux_weight="$(extract_flag "seg_aux_weight" "0.3" "${argv[@]}")"
+  seg_aux_weight="$(extract_flag "seg_aux_weight" "" "${argv[@]}")"
   target_fold="$(extract_flag "target_fold" "" "${argv[@]}")"
   epochs="$(extract_flag "epochs" "45" "${argv[@]}")"
   output_dir_raw="$(extract_flag "output_dir" "output/" "${argv[@]}")"

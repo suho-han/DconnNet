@@ -197,7 +197,7 @@ def test_dgrf_additive_profile_loss_includes_branch_aux_and_gate():
     solver.fusion_lambda_outer = 0.05
     solver.fusion_lambda_fused = 0.3
     solver.args = SimpleNamespace(
-        conn_fusion='decoder_guided',
+        conn_fusion='dg',
         conn_aux_c3_weight=0.3,
         conn_aux_c5_weight=0.2,
         fusion_gate_reg_weight=0.01,
@@ -393,6 +393,89 @@ def test_experiment_name_is_legacy_stable_and_fusion_specific(tmp_path, monkeypa
     fusion_args = train.parse_args()
     assert train.get_experiment_output_name(fusion_args) == 'binary_gate_A_8_bce'
 
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'train.py',
+            '--dataset', 'chase',
+            '--data_root', 'data/chase',
+            '--num-class', '1',
+            '--conn_num', '8',
+            '--conn_fusion', 'decoder_guided',
+            '--fusion_loss_profile', 'A',
+            '--output_dir', str(tmp_path),
+        ],
+    )
+    dg_args = train.parse_args()
+    assert dg_args.conn_fusion == 'dg'
+    assert train.get_experiment_output_name(dg_args) == 'binary_dg_A_8_bce'
+
+
+def test_segaux_requires_explicit_weight_and_keeps_suffix_unweighted(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'train.py',
+            '--dataset', 'chase',
+            '--data_root', 'data/chase',
+            '--num-class', '1',
+            '--conn_num', '8',
+            '--use_seg_aux',
+            '--output_dir', str(tmp_path),
+        ],
+    )
+    with pytest.raises(SystemExit):
+        train.parse_args()
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'train.py',
+            '--dataset', 'chase',
+            '--data_root', 'data/chase',
+            '--num-class', '1',
+            '--conn_num', '8',
+            '--conn_fusion', 'dg_direct',
+            '--output_dir', str(tmp_path),
+        ],
+    )
+    with pytest.raises(SystemExit):
+        train.parse_args()
+
+    assert launcher.build_experiment_output_name(
+        conn_num=8,
+        label_mode='binary',
+        dist_aux_loss='smooth_l1',
+        use_seg_aux=True,
+        seg_aux_weight=None,
+    ) == 'binary_8_bce_segaux'
+    assert launcher.build_experiment_output_name(
+        conn_num=8,
+        label_mode='binary',
+        dist_aux_loss='smooth_l1',
+        use_seg_aux=True,
+        seg_aux_weight=0.5,
+    ) == 'binary_8_bce_segaux_w0.5'
+    assert launcher.build_experiment_output_name(
+        conn_num=8,
+        label_mode='binary',
+        dist_aux_loss='smooth_l1',
+        conn_fusion='decoder_guided',
+        fusion_loss_profile='A',
+    ) == 'binary_dg_A_8_bce'
+    assert launcher.build_experiment_output_name(
+        conn_num=8,
+        label_mode='binary',
+        dist_aux_loss='smooth_l1',
+        conn_fusion='dg_direct',
+        fusion_loss_profile='A',
+        use_seg_aux=True,
+        seg_aux_weight=0.5,
+    ) == 'binary_dg_direct_A_8_bce_segaux_w0.5'
+
 
 def test_launcher_supports_fusion_names_and_scaled_sum_sweep():
     assert launcher.build_experiment_output_name(
@@ -580,3 +663,22 @@ def test_model_output_contract_legacy_vs_fusion(monkeypatch):
         conn_fusion='none',
     )
     legacy_model_2.load_state_dict(legacy_state)
+
+
+def test_dg_direct_uses_decoder_only_segaux_head(monkeypatch):
+    monkeypatch.setattr(dconn_module, 'resnet34', lambda pretrained=True: _DummyBackbone())
+    x = torch.randn((1, 3, 64, 64), dtype=torch.float32)
+
+    dg_direct_model = DconnNet(
+        num_class=1,
+        conn_num=8,
+        conn_layout='standard8',
+        conn_fusion='dg_direct',
+        use_seg_aux=True,
+    )
+    dg_direct_model.eval()
+    with torch.no_grad():
+        output = dg_direct_model(x)
+
+    assert {'fused', 'inner', 'outer', 'outer_aligned', 'aux', 'fusion_gate', 'mask_logit'} <= set(output.keys())
+    assert output['mask_logit'].shape[1] == 1

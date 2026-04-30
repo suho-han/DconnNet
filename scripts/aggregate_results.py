@@ -17,17 +17,27 @@ matplotlib.use("Agg")
 
 
 LATEX_TABLE_ARRAYSTRETCH = "1.5"
-# NOTE: "decoder_guided" is a fork-specific fusion objective used in
-# experiment names like "..._decoder_guided_A...".
-KNOWN_CONN_FUSIONS = ("conv_residual", "scaled_sum", "gate", "decoder_guided")
+# NOTE: "decoder_guided" is kept as a legacy alias for old result folders.
+KNOWN_CONN_FUSIONS = ("conv_residual", "scaled_sum", "gate", "dg_direct", "dg", "decoder_guided")
 ALLOWED_LABEL_MODES = ("binary", "dist", "dist_inverted")
 CONN_FUSION_SORT_ORDER = {
     "none": 0,
     "conv_residual": 1,
     "gate": 2,
     "scaled_sum": 3,
+    "dg": 4,
+    "dg_direct": 5,
     "decoder_guided": 4,
 }
+
+LEGACY_CONN_FUSION_ALIASES = {
+    "decoder_guided": "dg",
+}
+
+
+def normalize_conn_fusion_name(conn_fusion: object) -> str:
+    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    return LEGACY_CONN_FUSION_ALIASES.get(conn_fusion_name, conn_fusion_name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1426,14 +1436,13 @@ def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
             seg_aux_weight = float(segaux_match.group(1))
             seg_aux_variant = f"w{segaux_match.group(1)}"
         else:
-            seg_aux_weight = 0.3
             seg_aux_variant = "segaux"
 
     # Preferred fork naming convention:
     #   <label_mode>[_<fusion_tag>]_ <conn_num> [_<conn_layout>] _<loss> [_suffix...]
     # Example:
-    #   dist_inverted_decoder_guided_A_8_gjml_sf_l1
-    #   dist_inverted_decoder_guided_A_8_gjml_sf_l1_segaux
+    #   dist_inverted_dg_A_8_gjml_sf_l1
+    #   dist_inverted_dg_A_8_gjml_sf_l1_segaux
     ordered_name_match = re.fullmatch(
         r"(binary|dist|dist_inverted)(?:_(.+?))?_(\d+)(?:_(standard8|full24|out8))?_(bce|smooth_l1|cl_dice|gjml_sf_l1|gjml_sj_l1)(?:_.+)?",
         root_name,
@@ -1506,7 +1515,7 @@ def parse_experiment_metadata(root_name: str) -> Dict[str, object]:
             if not parts or parts[0] not in {"A", "B", "C"}:
                 continue
 
-            conn_fusion = fusion_name
+            conn_fusion = normalize_conn_fusion_name(fusion_name)
             fusion_loss_profile = parts[0]
             next_idx = 1
             if len(parts) >= 2:
@@ -1549,7 +1558,7 @@ def infer_label_mode_from_experiment(experiment_name: object) -> str:
 def _format_fusion_table_label(
     conn_fusion: object, fusion_loss_profile: object, fusion_residual_scale: object = None
 ) -> str:
-    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    conn_fusion_name = normalize_conn_fusion_name(conn_fusion)
     if conn_fusion_name == "none":
         return "none"
     profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
@@ -1572,11 +1581,14 @@ def _format_seg_aux_table_label(seg_aux_weight: object) -> Optional[str]:
 
 def _format_segaux_column_value(seg_aux_weight: object, seg_aux_variant: object) -> Optional[str]:
     seg_aux_label = _format_seg_aux_table_label(seg_aux_weight)
+    seg_aux_variant_name = str(seg_aux_variant if seg_aux_variant is not None else "none")
+    if seg_aux_variant_name == "segaux" and seg_aux_label is None:
+        return "segaux"
     if seg_aux_label is None:
         return None
-    seg_aux_variant_name = str(seg_aux_variant if seg_aux_variant is not None else "none")
     if seg_aux_variant_name == "segaux":
-        return "segaux"
+        # SegAux is enabled with an explicit numeric weight.
+        return seg_aux_label
     if seg_aux_variant_name.startswith("w"):
         return seg_aux_variant_name
     return seg_aux_label
@@ -1589,7 +1601,7 @@ def _table_fusion_and_decoder_labels(
     seg_aux_weight: object = None,
     seg_aux_variant: object = "none",
 ) -> Tuple[str, str]:
-    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    conn_fusion_name = normalize_conn_fusion_name(conn_fusion)
     profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
     seg_aux_label = _format_segaux_column_value(seg_aux_weight, seg_aux_variant)
 
@@ -1609,7 +1621,7 @@ def _latex_summary_fusion_and_decoder_labels(
     seg_aux_weight: object = None,
     seg_aux_variant: object = "none",
 ) -> Tuple[str, str]:
-    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    conn_fusion_name = normalize_conn_fusion_name(conn_fusion)
     profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
 
     if conn_fusion_name == "scaled_sum" and profile_name == "A":
@@ -1631,8 +1643,8 @@ def _latex_summary_fusion_and_decoder_labels(
         seg_aux_weight,
         seg_aux_variant,
     )
-    if conn_fusion_name == "decoder_guided" and profile_name == "A":
-        return "decoder_guided", decoder_label
+    if conn_fusion_name in {"dg", "dg_direct"} and profile_name == "A":
+        return conn_fusion_name, decoder_label
     return fusion_label, decoder_label
 
 
@@ -1641,9 +1653,9 @@ def _latex_ablation_fusion_spec(
     fusion_loss_profile: object,
     fusion_residual_scale: object = None,
 ) -> str:
-    conn_fusion_name = str(conn_fusion if conn_fusion is not None else "none")
+    conn_fusion_name = normalize_conn_fusion_name(conn_fusion)
     profile_name = str(fusion_loss_profile if fusion_loss_profile is not None else "A")
-    if conn_fusion_name == "decoder_guided" and profile_name == "A":
+    if conn_fusion_name in {"dg", "dg_direct"} and profile_name == "A":
         return ""
     if conn_fusion_name == "scaled_sum" and profile_name == "A":
         if fusion_residual_scale is not None:
@@ -1672,7 +1684,7 @@ def _fusion_profile_sort_value(profile_name: object) -> int:
 
 
 def _conn_fusion_sort_value(conn_fusion_name: object) -> int:
-    conn_fusion = str(conn_fusion_name)
+    conn_fusion = normalize_conn_fusion_name(conn_fusion_name)
     return CONN_FUSION_SORT_ORDER.get(conn_fusion, 9)
 
 
@@ -2221,7 +2233,7 @@ def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
             "sort_key": lambda tup: (
                 _conn_fusion_sort_value(tup[0]),
                 _fusion_profile_sort_value(
-                    "A" if tup[0] == "decoder_guided" and tup[1] == "" else str(tup[1]).split("/", 1)[0]
+                    "A" if normalize_conn_fusion_name(tup[0]) in {"dg", "dg_direct"} and tup[1] == "" else str(tup[1]).split("/", 1)[0]
                 ),
                 natural_sort_key(str(tup[0])),
                 natural_sort_key(str(tup[1])),
@@ -2241,8 +2253,6 @@ def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
         rf"\renewcommand{{\arraystretch}}{{{LATEX_TABLE_ARRAYSTRETCH}}}",
         r"\section*{Ablation Studies (Category-grouped Best Runs)}",
     ]
-    has_previous_table = False
-
     def get_ranks(values: List[float], higher_is_better: bool = True) -> Tuple[Set[int], Set[int]]:
         valid_vals = [v for v in values if not math.isnan(v)]
         if not valid_vals:
@@ -2308,7 +2318,6 @@ def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
                 iou_b, iou_s = get_ranks(dataset_metrics[ds]["iou"], True)
                 dataset_ranks[ds] = {"dice_best": dice_b, "dice_second": dice_s, "iou_best": iou_b, "iou_second": iou_s}
 
-            has_previous_table = _append_page_break(lines, has_previous_table)
             lines.extend([
                 r"\begin{table}[H]",
                 r"\centering",
@@ -2647,7 +2656,6 @@ def write_ablation_latex(path: str, rows: List[Dict[str, object]]) -> None:
             if len(rows_out) == 0:
                 continue
 
-            has_previous_table = _append_page_break(lines, has_previous_table)
             lines.extend([
                 r"\begin{table}[H]",
                 r"\centering",

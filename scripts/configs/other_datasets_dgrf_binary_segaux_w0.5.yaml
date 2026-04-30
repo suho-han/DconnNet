@@ -13,7 +13,7 @@ multi:
       conn_layout: standard8
       label_mode: binary
       dist_aux_loss: smooth_l1
-      conn_fusion: decoder_guided
+      conn_fusion: dg
       fusion_loss_profile: A
       use_seg_aux: true
       seg_aux_weight: 0.5
@@ -24,7 +24,7 @@ multi:
       conn_layout: standard8
       label_mode: binary
       dist_aux_loss: smooth_l1
-      conn_fusion: decoder_guided
+      conn_fusion: dg
       fusion_loss_profile: A
       use_seg_aux: true
       seg_aux_weight: 0.5
@@ -35,7 +35,7 @@ multi:
       conn_layout: standard8
       label_mode: binary
       dist_aux_loss: smooth_l1
-      conn_fusion: decoder_guided
+      conn_fusion: dg
       fusion_loss_profile: A
       use_seg_aux: true
       seg_aux_weight: 0.5
