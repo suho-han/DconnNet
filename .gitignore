@@ -25,6 +25,7 @@ node_modules/
 
 # Local tooling
 .codex
+GEMINI.md
 
 # Project artifacts
 data/
